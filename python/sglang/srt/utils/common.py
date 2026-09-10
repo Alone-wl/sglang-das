@@ -4801,6 +4801,139 @@ def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
     reserve_rope_cache_recursive(model)
 
 
+class W8a8GetCacheJSON:
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            cls._instance = super(W8a8GetCacheJSON, cls).__new__(cls, *args, **kwargs)
+            cls._instance._initialize()
+        return cls._instance
+
+    def _initialize(self):
+        current_folder_path = os.path.dirname(os.path.abspath(__file__))
+        json_folder_path = os.path.join(
+            current_folder_path, "../../lmslim/configs/w8a8"
+        )
+
+        self.triton_json_dir = os.getenv("TRITON_JSON_DIR", json_folder_path)
+        self.triton_json_dict = {}
+        self.triton_moejson_dict = {}
+        self.triton_json_list = []
+        self.weight_shapes = []
+        self.moe_weight_shapes = []
+        arch_name = torch.cuda.get_device_properties("cuda").gcnArchName.split(":")[0]
+        arch_cu = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+
+        self.device_name = f"{arch_name}_{arch_cu}cu"
+        self.topk = 1
+        self.quant_method = None
+
+    def gen_model_json(self, E: Optional[int] = 0, block_size: Optional[list] = None):
+        json_dir = os.getenv("LMSLIM_TUNING_JSON", "None")
+        if json_dir == "None" or not os.path.exists(json_dir):
+            return
+
+        config = {
+            "layers": {
+                "linear": {
+                    "shapes": [],
+                    "m_range": "None",
+                },
+                "moe": {
+                    "shapes": [],
+                    "m_range": "None",
+                    "topk": self.topk,
+                },
+            },
+            "quantization_config": {
+                "quant_method": self.quant_method,
+                "weight_block_size": "None",
+            },
+        }
+
+        for shape in self.moe_weight_shapes:
+            if len(shape) == 4:
+                moe_config = {
+                    "E": shape[0],
+                    "N1": shape[1],
+                    "N2": shape[2],
+                    "K": shape[3],
+                }
+                config["layers"]["moe"]["shapes"].append(moe_config)
+
+        for shape in self.weight_shapes:
+            config["layers"]["linear"]["shapes"].append(shape)
+
+        if block_size is not None:
+            config["quantization_config"]["weight_block_size"] = block_size
+
+        with open(os.path.join(json_dir, "model.json"), "w") as f:
+            json.dump(config, f, indent=4)
+
+    def getspec_config(self, configs_dict, M, N, K):
+        return configs_dict.get(f"{M}_{N}_{K}")
+
+    def get_triton_cache(self, file_path, n, k):
+        if not os.path.exists(file_path):
+            return None
+
+        with open(file_path, "r") as file:
+            cachedata = json.load(file)
+
+        configs_dict = {}
+        for key, value in cachedata.items():
+            for sub_key, sub_value in value.items():
+                configs_dict[f"{sub_key}_{key}"] = sub_value
+        return configs_dict
+
+    def get_w8a8json_name(self, n, k):
+        return os.path.join(
+            self.triton_json_dir, f"W8A8_{n}_{k}_{self.device_name}.json"
+        )
+
+    def get_blockint8_triton_cache(self, file_path, n, k, block_n, block_k):
+        return self.get_triton_cache(file_path, n, k)
+
+    def get_blockint8json_name(self, n, k, block_n, block_k):
+        return os.path.join(
+            self.triton_json_dir,
+            f"linear_{n}_{k}_block[{block_n},{block_k}]_{self.device_name}.json",
+        )
+
+    def get_moeint8json_name(
+        self,
+        E,
+        N1,
+        N2,
+        K,
+        TOPK,
+        block_size: Optional[list] = None,
+        use_int4_w4a8: Optional[bool] = False,
+    ):
+        if use_int4_w4a8:
+            prefix = (
+                f"MOE_W4A8INT8[{block_size[0]},{block_size[1]}]"
+                if block_size is not None
+                else "MOE_W4A8INT8"
+            )
+        else:
+            prefix = (
+                f"MOE_BLOCKINT8[{block_size[0]},{block_size[1]}]"
+                if block_size is not None
+                else "MOE_W8A8INT8"
+            )
+        return os.path.join(
+            self.triton_json_dir,
+            f"{prefix}_E={E}_N1={N1}_N2={N2}_K={K}_TOPK{TOPK}_{self.device_name}.json",
+        )
+
+    def get_moeint8_triton_cache(self, file_path, E, N1, N2, K, TOPK):
+        return self.get_triton_cache(file_path, N1 + N2, K)
+
+
 # Copy from: https://github.com/deepseek-ai/DeepGEMM/blob/main/deep_gemm/utils.py
 def calc_diff(x, y):
     x, y = x.double(), y.double()
