@@ -283,6 +283,10 @@ def hc_split_sinkhorn_torch(
     return pre, post, comb
 
 
+def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
+    return x.unflatten(-1, (n, -1)).mean(dim=-2)
+
+
 def mhc_pre_torch(
     residual: torch.Tensor,
     fn: torch.Tensor,
