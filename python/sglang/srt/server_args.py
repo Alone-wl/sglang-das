@@ -49,6 +49,7 @@ from sglang.srt.arg_groups.overrides import (
     mamba_extra_buffer_of,
     remote_instance_transfer_engine_of,
     resolved_view,
+    resolving_view,
 )
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
@@ -4849,6 +4850,7 @@ class ServerArgs:
     def _handle_cuda_graph_config(self):
         from sglang.srt.arg_groups.kimi_k3_hook import disable_kimi_k3_symm_mem
 
+        cfg = resolving_view(self)
         self._parse_cuda_graph_config()
         # Reads the resolved per-phase backends; must precede the compat rules
         # below and _handle_gpu_memory_settings, which key off enable_symm_mem.
@@ -4860,7 +4862,7 @@ class ServerArgs:
         # Warn on the final resolved config (not inside the compat cascade —
         # that path is skipped when the user explicitly sets the backend,
         # which is the only way to get 'full' for prefill today).
-        if self.cuda_graph_config.prefill.backend == Backend.FULL:
+        if cfg.cuda_graph_config.prefill.backend == Backend.FULL:
             logger.warning(
                 "cuda_graph_config[prefill].backend='full' is experimental. "
                 "Use breakable or tc_piecewise for production workloads."
@@ -4868,16 +4870,17 @@ class ServerArgs:
 
     def _apply_deepep_adjustments(self):
         """Config adjustments required by the DeepEP a2a backend."""
+        cfg = resolving_view(self)
         if resolved_view(self).moe_a2a_backend != "deepep":
             return
 
         # Non-multiple-of-8 prefill buckets can hang DeepEP a2a capture under
         # breakable CUDA graph
-        if self.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
-            bs = self.cuda_graph_config.prefill.bs
+        if cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
+            bs = cfg.cuda_graph_config.prefill.bs
             if bs is None:
                 # 2048 = documented prefill default; max_bs unresolved here.
-                max_bs = self.cuda_graph_config.prefill.max_bs or 2048
+                max_bs = cfg.cuda_graph_config.prefill.max_bs or 2048
                 bs = self._generate_prefill_cuda_graph_batch_sizes(max_bs)
             aligned = sorted({((b + 7) // 8) * 8 for b in bs})
             if aligned != sorted(bs):
@@ -4887,8 +4890,8 @@ class ServerArgs:
                     sorted(bs),
                     aligned,
                 )
-                self.cuda_graph_config.prefill.bs = aligned
-                self.cuda_graph_config.prefill.max_bs = aligned[-1]
+                cfg.cuda_graph_config.prefill.bs = aligned
+                cfg.cuda_graph_config.prefill.max_bs = aligned[-1]
 
     def _parse_cuda_graph_config(self):
         """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -4899,7 +4902,8 @@ class ServerArgs:
         auto-disable cascade respects this lock (the old
         --enforce-piecewise-cuda-graph semantics generalized).
         """
-        raw_input = self.cuda_graph_config
+        cfg = resolving_view(self)
+        raw_input = cfg.cuda_graph_config
         if isinstance(raw_input, CudaGraphConfig):
             explicit_input = raw_input.to_dict()
         else:
@@ -4912,36 +4916,36 @@ class ServerArgs:
             locked.add((phase, key))
 
         # ---- Legacy global flags (lowest precedence above defaults) ----
-        if self.disable_cuda_graph:
+        if cfg.disable_cuda_graph:
             _set(Phase.DECODE, "backend", Backend.DISABLED)
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
 
         # ---- Boolean per-phase off-switches ----
         # Below the explicit backend selectors so --cuda-graph-backend-*
         # wins if both are given.
-        if self.disable_prefill_cuda_graph:
+        if cfg.disable_prefill_cuda_graph:
             _set(Phase.PREFILL, "backend", Backend.DISABLED)
-        if self.disable_decode_cuda_graph:
+        if cfg.disable_decode_cuda_graph:
             _set(Phase.DECODE, "backend", Backend.DISABLED)
 
         # ---- Per-phase convenience flags ----
-        if self.cuda_graph_backend_decode is not None:
-            _set(Phase.DECODE, "backend", self.cuda_graph_backend_decode)
-        if self.cuda_graph_backend_prefill is not None:
-            _set(Phase.PREFILL, "backend", self.cuda_graph_backend_prefill)
-        if self.cuda_graph_max_bs_decode is not None:
-            _set(Phase.DECODE, "max_bs", self.cuda_graph_max_bs_decode)
-        if self.cuda_graph_max_bs_prefill is not None:
-            _set(Phase.PREFILL, "max_bs", self.cuda_graph_max_bs_prefill)
-        if self.cuda_graph_bs_decode is not None:
-            _set(Phase.DECODE, "bs", self.cuda_graph_bs_decode)
-        if self.cuda_graph_bs_prefill is not None:
-            _set(Phase.PREFILL, "bs", self.cuda_graph_bs_prefill)
-        if self.cuda_graph_tc_compiler is not None:
+        if cfg.cuda_graph_backend_decode is not None:
+            _set(Phase.DECODE, "backend", cfg.cuda_graph_backend_decode)
+        if cfg.cuda_graph_backend_prefill is not None:
+            _set(Phase.PREFILL, "backend", cfg.cuda_graph_backend_prefill)
+        if cfg.cuda_graph_max_bs_decode is not None:
+            _set(Phase.DECODE, "max_bs", cfg.cuda_graph_max_bs_decode)
+        if cfg.cuda_graph_max_bs_prefill is not None:
+            _set(Phase.PREFILL, "max_bs", cfg.cuda_graph_max_bs_prefill)
+        if cfg.cuda_graph_bs_decode is not None:
+            _set(Phase.DECODE, "bs", cfg.cuda_graph_bs_decode)
+        if cfg.cuda_graph_bs_prefill is not None:
+            _set(Phase.PREFILL, "bs", cfg.cuda_graph_bs_prefill)
+        if cfg.cuda_graph_tc_compiler is not None:
             # Written to both phases so the value is in place when TC_PIECEWISE
             # decode is implemented; today decode ignores it.
-            _set(Phase.DECODE, "tc_compiler", self.cuda_graph_tc_compiler)
-            _set(Phase.PREFILL, "tc_compiler", self.cuda_graph_tc_compiler)
+            _set(Phase.DECODE, "tc_compiler", cfg.cuda_graph_tc_compiler)
+            _set(Phase.PREFILL, "tc_compiler", cfg.cuda_graph_tc_compiler)
 
         # ---- Explicit JSON config (highest precedence) ----
         for phase, phase_config in explicit_input.items():
@@ -4963,6 +4967,7 @@ class ServerArgs:
         prefill backend (this folds in the old
         --enforce-piecewise-cuda-graph contract).
         """
+        cfg = resolving_view(self)
         if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
             return
 
@@ -4971,7 +4976,7 @@ class ServerArgs:
         # there instead. Archs also on the breakable allowlist keep it --
         # this runs first, so piecewise would otherwise silently win.
         if (
-            self.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+            cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
             and self.get_model_config().is_multimodal_piecewise_cuda_graph_supported
             and not self.get_model_config().is_multimodal_breakable_cuda_graph_supported
             # Keep trtllm_mla on the preferred breakable path, which now serves
@@ -4982,27 +4987,29 @@ class ServerArgs:
                 "Using tc_piecewise CUDA graph for validated multimodal "
                 "decoder prefill."
             )
-            self.cuda_graph_config.prefill.backend = Backend.TC_PIECEWISE
+            cfg.cuda_graph_config.prefill.backend = Backend.TC_PIECEWISE
 
-        if self.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
+        if cfg.cuda_graph_config.prefill.backend == Backend.TC_PIECEWISE:
             self._disable_tc_piecewise_cudagraph_if_incompatible()
-        elif self.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
+        elif cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE:
             self._disable_breakable_cudagraph_if_incompatible()
-        elif self.cuda_graph_config.prefill.backend == Backend.FULL:
+        elif cfg.cuda_graph_config.prefill.backend == Backend.FULL:
             self._disable_full_prefill_cudagraph_if_incompatible()
 
     def _apply_cuda_graph_disaggregation_roles(self):
-        if self.disaggregation_mode == "prefill":
+        cfg = resolving_view(self)
+        if cfg.disaggregation_mode == "prefill":
             if (Phase.DECODE, "backend") not in self._cuda_graph_config_locked:
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
-        elif self.disaggregation_mode == "decode":
+                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+        elif cfg.disaggregation_mode == "decode":
             if (Phase.PREFILL, "backend") not in self._cuda_graph_config_locked:
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_tc_piecewise_cudagraph_if_incompatible(self):
         """TcPiecewise (torch.compile + piecewise) is incompatible with
         these configurations. Most are torch.compile / dynamo limitations.
         """
+        cfg = resolving_view(self)
 
         rules = [
             (
@@ -5072,7 +5079,7 @@ class ServerArgs:
         ]
         for _name, predicate in rules:
             if predicate():
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _disable_breakable_cudagraph_if_incompatible(self):
         """Breakable (segmented capture, no torch.compile). Breakable enforces
@@ -5082,6 +5089,7 @@ class ServerArgs:
         from sglang.srt.configs.model_config import is_deepseek_v4
         from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
 
+        cfg = resolving_view(self)
         rules = [
             # DSV4 is BCG-compatible but introduces heavy memory pressure: the
             # c4 indexer scratch is pinned in the capture pool and OOMs. Disable.
@@ -5124,11 +5132,12 @@ class ServerArgs:
                     "disabling prefill CUDA graph.",
                     name,
                 )
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
                 return
 
     def _disable_full_prefill_cudagraph_if_incompatible(self):
         """Full prefill CG: empty rule list today; see the experimental warning."""
+        cfg = resolving_view(self)
         rules = []
         for name, predicate in rules:
             if predicate():
@@ -5137,7 +5146,7 @@ class ServerArgs:
                     "disabling prefill CUDA graph.",
                     name,
                 )
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
                 return
 
     def _disable_prefill_cuda_graph_for_deepseek_trtllm_mla(self):
@@ -5149,7 +5158,8 @@ class ServerArgs:
 
         if (Phase.PREFILL, "backend") in self._cuda_graph_config_locked:
             return
-        if self.cuda_graph_config.prefill.backend == Backend.DISABLED:
+        cfg = resolving_view(self)
+        if cfg.cuda_graph_config.prefill.backend == Backend.DISABLED:
             return
         if (
             "DeepseekV3ForCausalLM"
@@ -5164,15 +5174,16 @@ class ServerArgs:
             "the trtllm_mla attention backend (a captured prefill graph forces a "
             "FlashAttention fallback that regresses prefill). Set the prefill cuda graph "
             "backend explicitly (e.g. --cuda-graph-backend-prefill tc_piecewise) to override.",
-            self.cuda_graph_config.prefill.backend,
+            cfg.cuda_graph_config.prefill.backend,
         )
-        self.cuda_graph_config.prefill.backend = Backend.DISABLED
+        cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
 
     def _validate_cuda_graph_config(self):
-        if self.cuda_graph_config is None:
+        cfg = resolving_view(self)
+        if cfg.cuda_graph_config is None:
             return
         for phase in Phase.ALL:
-            backend = getattr(self.cuda_graph_config, phase).backend
+            backend = getattr(cfg.cuda_graph_config, phase).backend
             if backend not in ALLOWED_BACKENDS_PER_PHASE[phase]:
                 raise ValueError(
                     f"--cuda-graph-config[{phase}].backend={backend!r} not allowed; "
