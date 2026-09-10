@@ -1102,6 +1102,12 @@ def get_context() -> RuntimeContext:
     return _CONTEXT
 
 
+def get_platform():
+    from sglang.srt.platforms import current_platform
+
+    return current_platform
+
+
 def get_parallel() -> ParallelContext:
     return _PARALLEL
 
