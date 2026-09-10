@@ -744,13 +744,21 @@ class TransformersBase(nn.Module):
     def _normalize_tp_plan(self, tp_plan: Mapping[str, str]) -> dict[str, Style]:
         normalized = {}
         for pattern, style in tp_plan.items():
+            normalized_style = style.lower().replace("-", "_")
+            if normalized_style in {"mla_kv_a_proj"}:
+                logger.debug(
+                    "Skipping unsupported Transformers TP plan style '%s' for pattern '%s'.",
+                    style,
+                    pattern,
+                )
+                continue
             if pattern.startswith("^model\\."):
                 pattern = "^" + pattern[len("^model\\.") :]
             elif pattern.startswith("model\\."):
                 pattern = pattern[len("model\\.") :]
             elif pattern.startswith("model."):
                 pattern = pattern[len("model.") :]
-            normalized[pattern] = _normalize_tp_style(style)
+            normalized[pattern] = _normalize_tp_style(normalized_style)
         return normalized
 
     # -- Recursive module replacement (Linear + RMSNorm) --------------------
