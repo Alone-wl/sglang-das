@@ -1098,14 +1098,108 @@ _PARALLEL = ParallelContext()
 _CONTEXT = RuntimeContext(parallel=_PARALLEL)
 
 
+class _PlatformFacts:
+    def __getattr__(self, name: str) -> Any:
+        from sglang.srt.platforms import current_platform
+
+        return getattr(current_platform, name)
+
+    @staticmethod
+    def _call_platform_bool(name: str) -> bool:
+        from sglang.srt.platforms import current_platform
+
+        value = getattr(current_platform, name, False)
+        return bool(value() if callable(value) else value)
+
+    @property
+    def is_cuda(self) -> bool:
+        return self._call_platform_bool("is_cuda")
+
+    @property
+    def is_hip(self) -> bool:
+        import torch
+
+        return torch.version.hip is not None
+
+    @property
+    def is_npu(self) -> bool:
+        return self._call_platform_bool("is_npu")
+
+    @property
+    def is_xpu(self) -> bool:
+        return self._call_platform_bool("is_xpu")
+
+    @property
+    def is_musa(self) -> bool:
+        return self._call_platform_bool("is_musa")
+
+    @property
+    def is_sm90(self) -> bool:
+        return self._cuda_capability_major() == 9
+
+    @property
+    def is_sm100(self) -> bool:
+        return self._cuda_capability_major() == 10
+
+    @property
+    def is_sm100_or_sm110(self) -> bool:
+        return self._cuda_capability_major() in (10, 11)
+
+    @property
+    def is_sm120(self) -> bool:
+        import torch
+
+        return self.is_cuda and torch.cuda.get_device_capability()[0:2] == (12, 0)
+
+    @property
+    def is_blackwell(self) -> bool:
+        return self.is_sm100
+
+    @property
+    def is_hopper_with_cuda_12_3(self) -> bool:
+        import torch
+
+        if not self.is_sm90 or torch.version.cuda is None:
+            return False
+        return tuple(map(int, torch.version.cuda.split("."))) >= (12, 3)
+
+    @property
+    def has_flashinfer(self) -> bool:
+        import importlib.util
+
+        return self.is_cuda and importlib.util.find_spec("flashinfer") is not None
+
+    @property
+    def has_amx(self) -> bool:
+        import torch
+
+        try:
+            import sgl_kernel  # noqa: F401
+
+            has_kernel = hasattr(torch.ops.sgl_kernel, "convert_weight_packed")
+        except Exception:
+            has_kernel = False
+        is_amx_supported = getattr(torch.cpu, "_is_amx_tile_supported", lambda: False)
+        return bool(is_amx_supported() and has_kernel)
+
+    @staticmethod
+    def _cuda_capability_major() -> int | None:
+        import torch
+
+        if not (torch.cuda.is_available() and torch.version.cuda is not None):
+            return None
+        return torch.cuda.get_device_capability()[0]
+
+
+_PLATFORM_FACTS = _PlatformFacts()
+
+
 def get_context() -> RuntimeContext:
     return _CONTEXT
 
 
 def get_platform():
-    from sglang.srt.platforms import current_platform
-
-    return current_platform
+    return _PLATFORM_FACTS
 
 
 def get_parallel() -> ParallelContext:
