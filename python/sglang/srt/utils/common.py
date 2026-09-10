@@ -378,6 +378,10 @@ def use_intel_amx_backend(layer):
     return getattr(layer, "use_intel_amx_backend", False)
 
 
+def use_intel_xpu_backend():
+    return get_bool_env_var("SGLANG_USE_SGL_XPU") and is_xpu()
+
+
 def xpu_has_xmx_support():
     # TODO: update with XPU capability query
     if is_xpu():
