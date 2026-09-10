@@ -3930,8 +3930,7 @@ def require_gathered_buffer():
     return require_mlp_tp_gather() or require_attn_tp_gather()
 
 
-def require_mlp_sync():
-
+def require_mlp_sync(*_legacy_args):
     return get_parallel().enable_dp_attention or require_gathered_buffer()
 
 
