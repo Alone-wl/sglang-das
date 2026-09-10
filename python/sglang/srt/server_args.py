@@ -4607,15 +4607,17 @@ class ServerArgs:
                 "_handle_missing_default_values",
                 served_model_name=self.model_path,
             )
-        if self.device is None:
+        device = self.device
+        if device is None:
+            device = get_device()
             self._declare(
                 "_handle_missing_default_values",
-                device=get_device(),
+                device=device,
             )
         # strip device index from user if any (e.g. "cuda:0" -> "cuda")
         self._declare(
             "_handle_missing_default_values",
-            device=self.device.split(":")[0],
+            device=device.split(":")[0],
         )
         if self.random_seed is None:
             self._declare(
