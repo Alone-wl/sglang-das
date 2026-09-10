@@ -3844,7 +3844,7 @@ class Withable(Generic[T]):
             self._value = None
 
 
-def require_mlp_tp_gather():
+def require_mlp_tp_gather(*_legacy_args):
     """
     Check if the input of MLP is obtained by all-gather rather than all-reduce. This only happens when each MLP TP group contains multiple attention DP groups.
     """
@@ -3900,7 +3900,7 @@ def require_mlp_tp_gather():
         return False
 
 
-def require_attn_tp_gather():
+def require_attn_tp_gather(*_legacy_args):
     """
     Check if the input of attention is scattered.
     """
@@ -3926,7 +3926,7 @@ def require_attn_tp_gather():
         return False
 
 
-def require_gathered_buffer():
+def require_gathered_buffer(*_legacy_args):
     return require_mlp_tp_gather() or require_attn_tp_gather()
 
 
