@@ -38,7 +38,13 @@ class IndexKeyCache:
         )
 
     def _layer_num_pages(self, layer_idx: int, num_pages: int) -> int:
-        return num_pages
+        layer_id = self.pool.indexer_layer_ids[layer_idx]
+        local_layer_idx = layer_id - self.pool.start_layer
+        return (
+            num_pages
+            if self.pool._should_allocate_index_layer(local_layer_idx)
+            else 0
+        )
 
     def clear(self) -> None:
         del self.buffer
