@@ -166,6 +166,7 @@ class Glm5NextTextConfig(PretrainedConfig):
         self.attention_bias = attention_bias
         self.attention_dropout = attention_dropout
         self.n_routed_experts = n_routed_experts
+        self.num_local_experts = n_routed_experts
         self.num_experts_per_tok = num_experts_per_tok
         self.n_shared_experts = n_shared_experts
         self.n_group = n_group
