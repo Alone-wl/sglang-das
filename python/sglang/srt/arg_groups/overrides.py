@@ -216,6 +216,14 @@ def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> Non
     stash.append((source, dict(fields)))
 
 
+def materialize_declarations(server_args: Any) -> None:
+    """Apply accumulated resolution declarations in gate order."""
+    for _source, declared in getattr(server_args, "_resolved_overrides", None) or ():
+        for field, value in declared.items():
+            setattr(server_args, field, value)
+    server_args._declarations_materialized = True
+
+
 def declare_direct_writes(
     server_args: Any, source: str, resolve: Callable[[Any], Any]
 ) -> Any:
