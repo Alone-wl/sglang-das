@@ -1787,3 +1787,109 @@ def npu_hc_pre(
     # not fold input_layernorm. Return norm_fused=False so the caller
     # applies the layernorm itself, matching the deepgemm/torch paths.
     return y.to(dtype), post, comb, False
+
+
+@torch._dynamo.disable
+def _mhc_pre_dispatch(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+    norm_weight: torch.Tensor | None = None,
+    norm_eps: float | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    post_mix, comb_mix, layer_input = mhc_pre(
+        residual=residual,
+        fn=fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_pre_eps,
+        hc_sinkhorn_eps=hc_sinkhorn_eps,
+        hc_post_mult_value=hc_post_mult_value,
+        sinkhorn_repeat=sinkhorn_repeat,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+    )
+    return post_mix, comb_mix, layer_input, norm_weight is not None
+
+
+@torch._dynamo.disable
+def _mhc_post_dispatch(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post_layer_mix: torch.Tensor,
+    comb_res_mix: torch.Tensor,
+) -> torch.Tensor:
+    return mhc_post(x, residual, post_layer_mix, comb_res_mix)
+
+
+def hc_pre(
+    x: torch.Tensor,
+    hc_fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    hc_mult: int,
+    rms_eps: float,
+    hc_eps: float,
+    sinkhorn_iters: int,
+    post_mult_value: float = 2.0,
+    hc_norm_weight: torch.Tensor | None = None,
+    out_norm_weight: torch.Tensor | None = None,
+    out_norm_eps: float | None = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
+    num_tokens, total = x.shape
+    hidden_size = total // hc_mult
+    if x.numel() == 0:
+        return (
+            x.new_zeros((num_tokens, hidden_size)),
+            torch.zeros(
+                (num_tokens, hc_mult * hc_mult), device=x.device, dtype=torch.float32
+            ),
+            torch.zeros((num_tokens, hc_mult), device=x.device, dtype=torch.float32),
+            False,
+        )
+
+    fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
+    post_mix, comb_mix, layer_input, norm_fused = _mhc_pre_dispatch(
+        residual=x.view(num_tokens, hc_mult, hidden_size),
+        fn=fn,
+        hc_scale=hc_scale,
+        hc_base=hc_base,
+        rms_eps=rms_eps,
+        hc_pre_eps=hc_eps,
+        hc_sinkhorn_eps=hc_eps,
+        hc_post_mult_value=post_mult_value,
+        sinkhorn_repeat=sinkhorn_iters,
+        norm_weight=out_norm_weight,
+        norm_eps=out_norm_eps,
+    )
+    return (
+        layer_input,
+        comb_mix.reshape(num_tokens, hc_mult * hc_mult),
+        post_mix.reshape(num_tokens, hc_mult),
+        norm_fused,
+    )
+
+
+def hc_post(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    h_post: torch.Tensor,
+    h_res: torch.Tensor,
+    hc_mult: int,
+) -> torch.Tensor:
+    num_tokens, hidden_size = x.shape
+    if num_tokens == 0:
+        return x.new_zeros((num_tokens, hc_mult * hidden_size))
+    return _mhc_post_dispatch(
+        x,
+        residual.view(num_tokens, hc_mult, hidden_size),
+        h_post.view(num_tokens, hc_mult, 1),
+        h_res.view(num_tokens, hc_mult, hc_mult),
+    ).view(num_tokens, -1)
