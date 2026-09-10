@@ -7498,6 +7498,7 @@ class ServerArgs:
             _a2a_fusion_adjustments,
             run_post_process_pass,
         )
+        cfg = resolving_view(self)
 
         run_post_process_pass(self, _a2a_backend_overrides)
         run_post_process_pass(self, _a2a_ep_size)
@@ -7534,8 +7535,8 @@ class ServerArgs:
                     )
             if self.deepep_mode == "normal":
                 logger.warning("Cuda graph is disabled because deepep_mode=`normal`")
-                self.cuda_graph_config.decode.backend = Backend.DISABLED
-                self.cuda_graph_config.prefill.backend = Backend.DISABLED
+                cfg.cuda_graph_config.decode.backend = Backend.DISABLED
+                cfg.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         # The resolving view, not the field: `_a2a_backend_overrides` may have
         # moved this already (waterfill forces `deepep`).
