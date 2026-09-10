@@ -184,7 +184,6 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 is_draft_worker=True,
                 # The draft runs at absolute target positions.
                 context_length=target_worker.model_runner.model_config.context_len,
-                random_seed=target_worker.random_seed,
             )
 
         # Alias for better readability
