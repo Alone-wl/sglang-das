@@ -196,6 +196,32 @@ def is_npu() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_hcu() -> bool:
+    if not is_hip():
+        return False
+    try:
+        props = torch.cuda.get_device_properties(0)
+        gcn_arch = getattr(props, "gcnArchName", "")
+        supported_archs = ["gfx936", "gfx938", "gfx928"]
+        return any(gfx in gcn_arch for gfx in supported_archs)
+    except Exception as e:
+        logger.warning("HCU detection failed (not a HCU or HIP misconfigured): %s", e)
+        return False
+
+
+@lru_cache(maxsize=1)
+def is_hcu_native_fp8_supported() -> bool:
+    if not is_hcu():
+        return False
+    try:
+        gcn_arch = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+        return "gfx938" in gcn_arch
+    except Exception as e:
+        logger.warning("HCU native FP8 detection failed: %s", e)
+        return False
+
+
+@lru_cache(maxsize=1)
 def is_host_cpu_x86() -> bool:
     machine = platform.machine().lower()
     return (
