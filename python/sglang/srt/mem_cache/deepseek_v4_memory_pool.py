@@ -55,6 +55,13 @@ _is_hip = is_hip()
 ONLINE_C128 = not _is_hip and envs.SGLANG_OPT_USE_ONLINE_COMPRESS.get()
 
 
+def get_dsv4_indexer_bytes_per_token(index_head_dim: int, use_fp4_indexer: bool) -> int:
+    """Return payload and quant-scale bytes for one compressed indexer token."""
+    if use_fp4_indexer:
+        return index_head_dim // 2 + index_head_dim // 32
+    return index_head_dim + index_head_dim // 128 * 4
+
+
 def get_compress_state_ring_size(
     compress_ratio: int, is_speculative: bool = False
 ) -> int:
