@@ -145,11 +145,14 @@ def set_mla_kv_buffer_masked_kernel(
 _TMA_BULK_STORE_MIN_LOCS = 768
 
 
-def set_mla_kv_buffer_triton(
+def _set_mla_kv_buffer_impl(
     kv_buffer: torch.Tensor,
     loc: torch.Tensor,
     cache_k_nope: torch.Tensor,
     cache_k_rope: torch.Tensor,
+    *,
+    dcp_world_size: int,
+    dcp_rank: int,
 ):
     """Dispatch MLA paged-KV scatter writes to the fastest available path.
 
@@ -188,7 +191,7 @@ def set_mla_kv_buffer_triton(
         n_loc >= _TMA_BULK_STORE_MIN_LOCS
         and is_arch_support_pdl()
         and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
-        and not get_parallel().dcp_enabled
+        and dcp_world_size == 1
     ):
         jit_set_mla_kv_buffer(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return
@@ -215,9 +218,44 @@ def set_mla_kv_buffer_triton(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
-        DCP_RANK=get_parallel().attn_dcp_rank,
-        DCP_WORLD_SIZE=get_parallel().attn_dcp_size,
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
         **pdl_kwargs,
+    )
+
+
+def set_mla_kv_buffer_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+):
+    """Scatter rows whose locations are already resolved for this DCP rank."""
+    _set_mla_kv_buffer_impl(
+        kv_buffer,
+        loc,
+        cache_k_nope,
+        cache_k_rope,
+        dcp_world_size=1,
+        dcp_rank=0,
+    )
+
+
+def set_mla_kv_buffer_dcp_sharded_triton(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+):
+    """Scatter widened DCP locations owned by this rank."""
+    parallel = get_parallel()
+    _set_mla_kv_buffer_impl(
+        kv_buffer,
+        loc,
+        cache_k_nope,
+        cache_k_rope,
+        dcp_world_size=parallel.attn_dcp_size,
+        dcp_rank=parallel.attn_dcp_rank,
     )
 
 
