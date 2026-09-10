@@ -16,7 +16,6 @@ from typing import (
 )
 
 import numpy as np
-import msgspec
 import torch
 import torch.distributed as dist
 
@@ -580,34 +579,6 @@ class TransferBackend(Enum):
     NIXL = "nixl"
     ASCEND = "ascend"
     FAKE = "fake"
-
-
-class DisaggMetadataConfig(msgspec.Struct, frozen=True):
-    hidden_size: int
-    hidden_states_dtype: torch.dtype
-    metadata_buffer_kwargs: dict
-
-
-def resolve_disagg_metadata_config(
-    *,
-    hidden_size: int,
-    hidden_states_dtype: torch.dtype,
-    disaggregation_mode: DisaggregationMode,
-    transfer_backend: TransferBackend,
-    spec_algorithm,
-    model_config,
-    server_args,
-    model_runner,
-    pp_rank: int,
-    pp_size: int,
-    gpu_id: int,
-    max_prefill_tokens: int,
-) -> DisaggMetadataConfig:
-    return DisaggMetadataConfig(
-        hidden_size=hidden_size,
-        hidden_states_dtype=hidden_states_dtype,
-        metadata_buffer_kwargs={},
-    )
 
 
 class KVClassType(Enum):
