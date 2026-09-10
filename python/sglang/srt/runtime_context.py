@@ -422,18 +422,26 @@ class DpFlags(_FlagGroupBase):
 
 
 @dataclasses.dataclass
+class SpFlags(_FlagGroupBase):
+    """LayerNorm sequence-parallelism runtime flags."""
+
+    enabled: bool = False
+
+
+@dataclasses.dataclass
 class Flags(_FlagGroupBase):
     """Root of the runtime-flags tier.
 
     Resolved configuration lives on ``server_args`` fields (materialized at
     the end of ``__post_init__``) — this tier only carries genuine runtime
     state whose value is not a function of the configuration alone, grouped
-    by lifecycle (``capture``) or subsystem (``moe`` / ``dp``).
+    by lifecycle (``capture``) or subsystem (``moe`` / ``dp`` / ``sp``).
     """
 
     capture: CaptureFlags = dataclasses.field(default_factory=CaptureFlags)
     moe: MoeFlags = dataclasses.field(default_factory=MoeFlags)
     dp: DpFlags = dataclasses.field(default_factory=DpFlags)
+    sp: SpFlags = dataclasses.field(default_factory=SpFlags)
 
 
 @dataclasses.dataclass
@@ -505,6 +513,7 @@ class ForwardFlags:
         "fuse_mlp_allreduce": False,
         "mlp_reduce_scatter": False,
         "flashinfer_trtllm_bypass": False,
+        "sp_active": False,
     }
 
     # Read/written inside compiled graphs (vocab embedding, communicator,
@@ -519,6 +528,7 @@ class ForwardFlags:
             "fuse_mlp_allreduce",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
+            "sp_active",
         }
     )
 
