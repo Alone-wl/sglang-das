@@ -46,12 +46,15 @@ RCP_LN2 = 1.4426950216293335
 
 _USE_KDA_HCU = get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
 
-if is_hcu():
-    from boltops.fla.kda.triton import (
-        chunk_gla_fwd_o_gk as chunk_gla_fwd_o_gk_hcu,
-        fused_kda_gate_chunk_cumsum as fused_kda_gate_chunk_cumsum_hcu,
-        recompute_w_u_fwd as recompute_w_u_fwd_hcu,
-    )
+if _USE_KDA_HCU and is_hcu():
+    try:
+        from boltops.fla.kda.triton import (
+            chunk_gla_fwd_o_gk as chunk_gla_fwd_o_gk_hcu,
+            fused_kda_gate_chunk_cumsum as fused_kda_gate_chunk_cumsum_hcu,
+            recompute_w_u_fwd as recompute_w_u_fwd_hcu,
+        )
+    except ImportError:
+        _USE_KDA_HCU = False
 
 
 def cdiv(a: int, b: int) -> int:

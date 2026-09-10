@@ -57,6 +57,24 @@ def _get_flashinfer_kda_kernel():
     return _flashinfer_kda_available, _flashinfer_recurrent_kda
 
 
+def build_fused_accept_indices(
+    *,
+    slots: torch.Tensor,
+    scratch_steps: int,
+    draft_token_num: int,
+    accept_lens_pool: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build slot-indexed verify rows and accepted-token counts."""
+    step = torch.arange(draft_token_num, device=slots.device, dtype=torch.int32)
+    ssm_state_indices = (
+        slots.to(torch.int32)[:, None] * scratch_steps + step[None, :]
+    ).contiguous()
+    num_accepted_tokens = accept_lens_pool.index_select(
+        0, slots.clamp(min=0).to(torch.int64)
+    )
+    return ssm_state_indices, num_accepted_tokens
+
+
 class FlashInferKDAKernel(LinearAttnKernelBase):
     """FlashInfer KDA kernel: SM100 decode + MTP (target_verify), topk=1.
 

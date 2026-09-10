@@ -450,6 +450,7 @@ class Envs:
     # ===================================================================
     SGLANG_DETECT_SLOW_RANK = EnvBool(False)
     SGLANG_DEBUG_MEMORY_POOL = EnvBool(False)
+    SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES = EnvBool(False)
     # Use the LightOp kernel for paged KV-cache extend allocation.
     SGLANG_LIGHTOP_KVALLOC_KERNEL = EnvBool(False)
     # NaN-fill the unified memory pool at boot (debug repro switch).
@@ -1210,6 +1211,7 @@ class Envs:
     # Speculative decoding
     # ===================================================================
     SGLANG_ENABLE_OVERLAP_PLAN_STREAM = EnvBool(False)
+    SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")

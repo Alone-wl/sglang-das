@@ -35,7 +35,11 @@ class DSATopKBackend(Enum):
     @classmethod
     def resolve(cls, model_runner: ModelRunner) -> DSATopKBackend:
         if model_runner.is_draft_worker:
-            return cls(get_spec().speculative_dsa_topk_backend)
+            speculative_backend = getattr(
+                get_spec(), "speculative_dsa_topk_backend", None
+            )
+            if speculative_backend is not None:
+                return cls(speculative_backend)
         return cls(get_exec().kernel.dsa_topk_backend)
 
     def is_sgl_kernel(self) -> bool:

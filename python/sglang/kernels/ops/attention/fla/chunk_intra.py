@@ -22,11 +22,14 @@ from sglang.srt.utils import get_bool_env_var, is_hcu
 # Same switch as fla/kda.py: gates KDA kernels provided by boltops.
 _USE_KDA_HCU = get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
 
-if is_hcu():
-    from boltops.fla.kda.triton import (
-        chunk_kda_fwd_intra as chunk_kda_fwd_intra_hcu,
-        recompute_w_u_fwd as recompute_w_u_fwd_hcu,
-    )
+if _USE_KDA_HCU and is_hcu():
+    try:
+        from boltops.fla.kda.triton import (
+            chunk_kda_fwd_intra as chunk_kda_fwd_intra_hcu,
+            recompute_w_u_fwd as recompute_w_u_fwd_hcu,
+        )
+    except ImportError:
+        _USE_KDA_HCU = False
 
 if is_tf32_supported:
     SOLVE_TRIL_DOT_PRECISION = tl.constexpr("tf32")
