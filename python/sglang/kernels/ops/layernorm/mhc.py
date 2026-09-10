@@ -287,6 +287,10 @@ def hc_contract(x: torch.Tensor, n: int) -> torch.Tensor:
     return x.unflatten(-1, (n, -1)).mean(dim=-2)
 
 
+def hc_expand(x: torch.Tensor, n: int) -> torch.Tensor:
+    return x.repeat(1, n)
+
+
 def mhc_pre_torch(
     residual: torch.Tensor,
     fn: torch.Tensor,
