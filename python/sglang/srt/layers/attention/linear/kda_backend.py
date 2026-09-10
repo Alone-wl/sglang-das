@@ -3,7 +3,12 @@ from typing import Optional, Tuple, Union
 
 import torch
 
-from sglang.kernels.ops.attention import kda_fused_decode, kda_fused_decode_aiter_hip
+from sglang.kernels.ops.attention import kda_fused_decode
+
+try:
+    from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
+except ImportError:
+    kda_fused_decode_aiter_hip = None
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -578,7 +583,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 out = mixed_qkv.new_empty(
                     (1, mixed_qkv.shape[0], layer.num_v_heads, layer.head_v_dim)
                 )
-                if fused_backend == "aiter" and kda_fused_decode_aiter_hip.covered(
+                if (
+                    fused_backend == "aiter"
+                    and kda_fused_decode_aiter_hip is not None
+                    and kda_fused_decode_aiter_hip.covered(
                     a,
                     f_b_weight,
                     mixed_qkv,
@@ -588,6 +596,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     cache_indices,
                     output_gate,
                     norm_weight,
+                    )
                 ):
                     core_attn_out = kda_fused_decode_aiter_hip.run(
                         f_a=a,
