@@ -5251,14 +5251,15 @@ class ServerArgs:
 
           The coefficient 1.5 is a heuristic value, in the future, we can do better estimation by looking at the model types, hidden sizes or even do a dummy run.
         """
-        decode_cuda_graph_config = self.cuda_graph_config.decode
-        prefill_cuda_graph_config = self.cuda_graph_config.prefill
+        cfg = resolving_view(self)
+        decode_cuda_graph_config = cfg.cuda_graph_config.decode
+        prefill_cuda_graph_config = cfg.cuda_graph_config.prefill
 
         if gpu_mem is not None:
             if gpu_mem < 20 * 1024:
                 # T4, 4080
                 # (chunked_prefill_size 2k, max_bs 8)
-                if self.chunked_prefill_size is None:
+                if cfg.chunked_prefill_size is None:
                     self._declare(
                         "_handle_gpu_memory_settings",
                         chunked_prefill_size=2048,
@@ -5268,59 +5269,59 @@ class ServerArgs:
             elif gpu_mem < 35 * 1024:
                 # A10, 4090, 5090
                 # (chunked_prefill_size 2k, max_bs 24 if tp < 4 else 80)
-                if self.chunked_prefill_size is None:
+                if cfg.chunked_prefill_size is None:
                     self._declare(
                         "_handle_gpu_memory_settings",
                         chunked_prefill_size=2048,
                     )
                 if decode_cuda_graph_config.max_bs is None:
-                    if self.tp_size < 4:
+                    if cfg.tp_size < 4:
                         decode_cuda_graph_config.max_bs = 24
                     else:
                         decode_cuda_graph_config.max_bs = 80
             elif gpu_mem < 60 * 1024:
                 # A100 (40GB), L40,
                 # (chunked_prefill_size 4k, max_bs 32 if tp < 4 else 160)
-                if self.chunked_prefill_size is None:
+                if cfg.chunked_prefill_size is None:
                     self._declare(
                         "_handle_gpu_memory_settings",
                         chunked_prefill_size=4096,
                     )
                 if decode_cuda_graph_config.max_bs is None:
-                    if self.tp_size < 4:
+                    if cfg.tp_size < 4:
                         decode_cuda_graph_config.max_bs = 32
                     else:
                         decode_cuda_graph_config.max_bs = 160
             elif gpu_mem < 90 * 1024:
                 # H100, A100
                 # (chunked_prefill_size 8k, max_bs 256 if tp < 4 else 512)
-                if self.chunked_prefill_size is None:
+                if cfg.chunked_prefill_size is None:
                     self._declare(
                         "_handle_gpu_memory_settings",
                         chunked_prefill_size=8192,
                     )
                 if decode_cuda_graph_config.max_bs is None:
-                    if self.tp_size < 4:
+                    if cfg.tp_size < 4:
                         decode_cuda_graph_config.max_bs = 256
                     else:
                         decode_cuda_graph_config.max_bs = 512
             elif gpu_mem < 160 * 1024:
                 # H20, H200
                 # (chunked_prefill_size 8k, max_bs 256 if tp < 4 else 512)
-                if self.chunked_prefill_size is None:
+                if cfg.chunked_prefill_size is None:
                     self._declare(
                         "_handle_gpu_memory_settings",
                         chunked_prefill_size=8192,
                     )
                 if decode_cuda_graph_config.max_bs is None:
-                    if self.tp_size < 4:
+                    if cfg.tp_size < 4:
                         decode_cuda_graph_config.max_bs = 256
                     else:
                         decode_cuda_graph_config.max_bs = 512
             else:
                 # B200, MI300
                 # (chunked_prefill_size 16k, max_bs 512)
-                if self.chunked_prefill_size is None:
+                if cfg.chunked_prefill_size is None:
                     self._declare(
                         "_handle_gpu_memory_settings",
                         chunked_prefill_size=16384,
@@ -5329,7 +5330,7 @@ class ServerArgs:
                     decode_cuda_graph_config.max_bs = 512
         else:
             # Fallback defaults when gpu_mem is None
-            if self.chunked_prefill_size is None:
+            if cfg.chunked_prefill_size is None:
                 self._declare(
                     "_handle_gpu_memory_settings",
                     chunked_prefill_size=4096,
@@ -5338,7 +5339,7 @@ class ServerArgs:
                 decode_cuda_graph_config.max_bs = 160
 
         # Set cuda graph batch sizes
-        if self.device != "cpu":
+        if cfg.device != "cpu":
             if decode_cuda_graph_config.bs is None:
                 decode_cuda_graph_config.bs = (
                     self._generate_decode_cuda_graph_batch_sizes(
@@ -5360,34 +5361,34 @@ class ServerArgs:
                 # to generate decode_cuda_graph_config.bs
                 self._declare(
                     "_handle_gpu_memory_settings",
-                    torch_compile_max_bs=self.torch_compile_max_bs
+                    torch_compile_max_bs=cfg.torch_compile_max_bs
                     or decode_cuda_graph_config.max_bs,
                 )
                 decode_cuda_graph_config.bs = self._generate_cpu_graph_batch_sizes()
 
             assert (
-                self.torch_compile_max_bs > 0
+                cfg.torch_compile_max_bs > 0
             ), "cuda_graph_config[decode].bs should contain positive batch sizes"
-            decode_cuda_graph_config.max_bs = self.torch_compile_max_bs
+            decode_cuda_graph_config.max_bs = cfg.torch_compile_max_bs
 
         if prefill_cuda_graph_config.max_bs is None:
             # Refer to pr #15927, by default we set the prefill max_bs to the chunked prefill size.
             # For MLA backend, the introduction of piecewise cuda graph will influence the kernel dispatch difference compared to the original mode.
             # To avoid the performance regression, we set max_bs to 2048 by default.
             if not self.use_mla_backend():
-                prefill_cuda_graph_config.max_bs = self.chunked_prefill_size
+                prefill_cuda_graph_config.max_bs = cfg.chunked_prefill_size
             else:
                 prefill_cuda_graph_config.max_bs = 2048
 
             # If max_total_tokens is set, cap prefill max_bs to not exceed max_total_tokens.
-            if self.max_total_tokens is not None:
+            if cfg.max_total_tokens is not None:
                 prefill_cuda_graph_config.max_bs = min(
-                    prefill_cuda_graph_config.max_bs, self.max_total_tokens
+                    prefill_cuda_graph_config.max_bs, cfg.max_total_tokens
                 )
 
             # For Llama2 series models, max_bs is limited to 4096.
             # TODO(yuwei): remove this after the issue is fixed
-            if "llama-2" in self.model_path.lower():
+            if "llama-2" in cfg.model_path.lower():
                 prefill_cuda_graph_config.max_bs = min(
                     prefill_cuda_graph_config.max_bs, 4096
                 )
@@ -5399,31 +5400,31 @@ class ServerArgs:
                 )
             )
 
-        if self.mem_fraction_static is None:
+        if cfg.mem_fraction_static is None:
             if self.post_capture_kv_sizing_planned():
                 # Post-capture sizing measures free memory after graph capture, so
                 # skip the graph/activation reserve; keep only the floor + parallel slack.
                 reserved_mem = 1536
-                reserved_mem += self.tp_size * self.pp_size / 8 * 1024
+                reserved_mem += cfg.tp_size * cfg.pp_size / 8 * 1024
             else:
                 # Tokens the activation working set scales with (per serving mode).
-                if self.disaggregation_mode == "decode":
+                if cfg.disaggregation_mode == "decode":
                     running_requests = (
-                        self.max_running_requests
+                        cfg.max_running_requests
                         or decode_cuda_graph_config.max_bs
                         or 1
                     )
-                    draft_tokens = self.speculative_num_draft_tokens or 1
+                    draft_tokens = cfg.speculative_num_draft_tokens or 1
                     activation_tokens = max(running_requests * draft_tokens, 2048)
-                elif self.chunked_prefill_size > 0:
-                    activation_tokens = max(self.chunked_prefill_size, 2048)
+                elif cfg.chunked_prefill_size > 0:
+                    activation_tokens = max(cfg.chunked_prefill_size, 2048)
                 else:
-                    activation_tokens = max(self.max_prefill_tokens, 2048)
+                    activation_tokens = max(cfg.max_prefill_tokens, 2048)
                 # Constant meta data (e.g., from attention backend) + activation slack.
                 reserved_mem = 512
                 reserved_mem += activation_tokens * 1.5
                 # Some adjustments for large parallel size
-                reserved_mem += self.tp_size * self.pp_size / 8 * 1024
+                reserved_mem += cfg.tp_size * cfg.pp_size / 8 * 1024
                 reserved_mem += self.reserve_for_graph_mb()
                 if gpu_mem is not None and gpu_mem > 60 * 1024:
                     reserved_mem = max(reserved_mem, 10 * 1024)
@@ -5446,14 +5447,14 @@ class ServerArgs:
             model_config = self.get_model_config()
             if (
                 model_config.is_multimodal
-                and not self.language_only
-                and not self.language_model_only
-                and self.disaggregation_mode != "decode"
+                and not cfg.language_only
+                and not cfg.language_model_only
+                and cfg.disaggregation_mode != "decode"
             ):
                 self.adjust_mem_fraction_for_vlm(model_config)
 
         # If symm mem is enabled and prealloc size is not set, set it to 4GB
-        if self.enable_symm_mem and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set():
+        if cfg.enable_symm_mem and not envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.is_set():
             envs.SGLANG_SYMM_MEM_PREALLOC_GB_SIZE.set(4)
             logger.warning(
                 "Symmetric memory is enabled, setting symmetric memory prealloc size to 4GB as default."
