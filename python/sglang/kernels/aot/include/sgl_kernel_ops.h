@@ -162,6 +162,20 @@ void silu_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_tanh_and_mul(at::Tensor& out, at::Tensor& input);
 void gelu_and_mul(at::Tensor& out, at::Tensor& input);
 
+void kpool_write_plan(
+    const torch::Tensor& write_start,
+    const torch::Tensor& req_pool_indices,
+    const torch::Tensor& real_page_table,
+    torch::Tensor& req_out,
+    torch::Tensor& write_start_out,
+    torch::Tensor& tail_logical_start_out,
+    torch::Tensor& write_loc_out,
+    std::optional<torch::Tensor> pool_seqlens_per_q_out,
+    std::optional<torch::Tensor> seqlens_per_q_out,
+    int64_t pool_size,
+    int64_t num_draft_tokens,
+    int64_t slots_per_page);
+
 void rotary_embedding(
     torch::Tensor& positions,
     torch::Tensor& query,
