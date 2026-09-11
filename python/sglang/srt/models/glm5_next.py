@@ -1634,6 +1634,8 @@ class ModelNextForCausalLM(nn.Module):
         params_dict: Optional[Dict[str, torch.nn.Parameter]] = None,
         is_eagle: bool = False,
     ):
+        # NextN reuses this loader without inheriting ModelNextForCausalLM.
+        loader_cls = ModelNextForCausalLM
         config = self.config
         n_routed = config.n_routed_experts
         num_fused_shared = self.num_fused_shared_experts
@@ -1654,7 +1656,7 @@ class ModelNextForCausalLM(nn.Module):
                 weights: Iterable[Tuple[str, torch.Tensor]],
             ) -> Iterable[Tuple[str, torch.Tensor]]:
                 for name, weight in weights:
-                    match = self._SHARED_EXPERTS_PATTERN.match(name)
+                    match = loader_cls._SHARED_EXPERTS_PATTERN.match(name)
                     if match:
                         layer_id = int(match.group(1))
                         suffix = match.group(2)
@@ -1679,7 +1681,7 @@ class ModelNextForCausalLM(nn.Module):
         qc = self.quant_config
         if (
             qc is not None
-            and qc.get_name() in self._AWQ_LIKE_QUANT_METHOD
+            and qc.get_name() in loader_cls._AWQ_LIKE_QUANT_METHOD
             and not any("attn" in m for m in qc.modules_to_not_convert)
         ):
             fused_cat_dim = 1
@@ -1698,7 +1700,7 @@ class ModelNextForCausalLM(nn.Module):
                 if nextn_prefix is not None:
                     if "shared_head.head" in name or "embed_tokens" in name:
                         continue
-                    if any(w in name for w in self._NEXTN_SPEC_NAMES):
+                    if any(w in name for w in loader_cls._NEXTN_SPEC_NAMES):
                         name = name.replace(nextn_prefix, "model")
                     else:
                         name = name.replace(nextn_prefix, "model.decoder")
@@ -1721,7 +1723,7 @@ class ModelNextForCausalLM(nn.Module):
 
             # ---- for stacked params ----
             matched = False
-            for param_name, weight_name, shard_id in self._STACKED_PARAMS_MAPPING:
+            for param_name, weight_name, shard_id in loader_cls._STACKED_PARAMS_MAPPING:
                 if weight_name not in name or "mlp.experts" in name:
                     continue
                 mapped = name.replace(weight_name, param_name)
@@ -1757,7 +1759,7 @@ class ModelNextForCausalLM(nn.Module):
             # ---- for other params ----
             if name.endswith(".bias") and name not in params_dict:
                 continue
-            if is_eagle and name in self._EAGLE_IGNORE_NAMES:
+            if is_eagle and name in loader_cls._EAGLE_IGNORE_NAMES:
                 continue
 
             if fuse_qkv_a_proj and ("q_a_proj" in name or "kv_a_proj_with_mqa" in name):
