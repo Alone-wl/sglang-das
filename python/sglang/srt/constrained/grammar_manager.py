@@ -86,6 +86,12 @@ class GrammarManager:
         self.grammar_sync_size = scheduler.dp_tp_group.world_size
         self.grammar_sync_entry = scheduler.dp_tp_group.first_rank
         self.is_grammar_sync_entry = scheduler.dp_tp_group.is_first_rank
+        self.grammar_cp_sync_group = scheduler.attn_cp_cpu_group
+        # With DP attention, dp_tp_group contains only attention-TP ranks.
+        # CP ranks share requests too and must admit compiled grammars together.
+        self.grammar_cp_sync_size = (
+            scheduler.ps.attn_cp_size if scheduler.enable_dp_attention else 1
+        )
         self.pp_rank = scheduler.ps.pp_rank
         self.pp_size = scheduler.ps.pp_size
         self.pp_group = scheduler.pp_group
@@ -258,10 +264,9 @@ class GrammarManager:
         """
         Move requests whose grammar objects are ready from grammar_queue to waiting_queue.
 
-        For PP0, DP/TP group rank i returns two sets ready_reqs_i,
-        failed_reqs_i. ready_reqs_all = all_gather(ready_reqs_i) within
-        PP0's DP/TP group. failed_reqs_all = all_gather(failed_reqs_i)
-        within PP0's DP/TP group.
+        For PP0, each attention TP/CP rank i returns two sets ready_reqs_i,
+        failed_reqs_i. Gather both sets across the ranks sharing each request,
+        first within the attention TP group, then within the CP group.
 
         ready_reqs = intersect(ready_reqs_all)
         failed_reqs = union(failed_reqs_all)
@@ -311,16 +316,20 @@ class GrammarManager:
                         # The actual waiting time is SGLANG_GRAMMAR_MAX_POLL_ITERATIONS * max(SGLANG_GRAMMAR_POLL_INTERVAL, GPU_forward_batch_latency)
                         failed_req_idxs.add(i)
 
-            # Sync ready and failed requests across all TP ranks in PP0.
-            if self.grammar_sync_size == 1:
-                synced_ready_req_idxs = ready_req_idxs
-                synced_failed_req_idxs = failed_req_idxs
-            else:
-                all_gather_output = [None] * self.grammar_sync_size
+            # Sync within each request's TP/CP shard without crossing DP replicas.
+            synced_ready_req_idxs = ready_req_idxs
+            synced_failed_req_idxs = failed_req_idxs
+            for group, size in (
+                (self.grammar_sync_group, self.grammar_sync_size),
+                (self.grammar_cp_sync_group, self.grammar_cp_sync_size),
+            ):
+                if size == 1:
+                    continue
+                all_gather_output = [None] * size
                 torch.distributed.all_gather_object(
                     all_gather_output,
-                    (ready_req_idxs, failed_req_idxs),
-                    group=self.grammar_sync_group,
+                    (synced_ready_req_idxs, synced_failed_req_idxs),
+                    group=group,
                 )
                 synced_ready_req_idxs = set.intersection(
                     *[x[0] for x in all_gather_output]
