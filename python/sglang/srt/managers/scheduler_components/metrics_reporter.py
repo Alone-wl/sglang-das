@@ -808,6 +808,12 @@ class SchedulerMetricsReporter:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
                 )
+                self.stats.pre_allocated_token_usage = (
+                    self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated
+                    / self.scheduler.max_total_num_tokens
+                    if self.scheduler.max_total_num_tokens > 0
+                    else 0.0
+                )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
                 )
@@ -817,6 +823,10 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
+            (
+                self.stats.num_grammar_cache_entries,
+                self.stats.grammar_backend_cache_bytes,
+            ) = self.scheduler.grammar_manager.get_cache_stats()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
@@ -1033,6 +1043,12 @@ class SchedulerMetricsReporter:
                 self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
                 )
+                self.stats.pre_allocated_token_usage = (
+                    self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated
+                    / self.scheduler.max_total_num_tokens
+                    if self.scheduler.max_total_num_tokens > 0
+                    else 0.0
+                )
                 self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                     self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
                 )
@@ -1065,6 +1081,10 @@ class SchedulerMetricsReporter:
             self.stats.fwd_occupancy = self.fwd_occupancy
             self._update_lora_metrics()
             self._log_hicache_stats()
+            (
+                self.stats.num_grammar_cache_entries,
+                self.stats.grammar_backend_cache_bytes,
+            ) = self.scheduler.grammar_manager.get_cache_stats()
             self.metrics_collector.log_stats(self.stats)
             self.scheduler.kv_events_publisher.emit_kv_metrics()
         self.scheduler.kv_events_publisher.publish_kv_events()
@@ -1354,7 +1374,17 @@ class SchedulerMetricsReporter:
             self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.disagg_decode_prealloc_queue.queue, priority_enabled
             )
+            self.stats.pre_allocated_token_usage = (
+                self.scheduler.disagg_decode_prealloc_queue.num_tokens_pre_allocated
+                / self.scheduler.max_total_num_tokens
+                if self.scheduler.max_total_num_tokens > 0
+                else 0.0
+            )
             self.stats.num_decode_transfer_queue_reqs = QueueCount.from_reqs(
                 self.scheduler.disagg_decode_transfer_queue.queue, priority_enabled
             )
+        (
+            self.stats.num_grammar_cache_entries,
+            self.stats.grammar_backend_cache_bytes,
+        ) = self.scheduler.grammar_manager.get_cache_stats()
         self.metrics_collector.log_stats(self.stats)

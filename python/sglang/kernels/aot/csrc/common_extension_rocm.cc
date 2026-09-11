@@ -22,6 +22,15 @@ limitations under the License.
 #include "sgl_kernel_ops.h"
 
 TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
+  m.def(
+      "transfer_kv_per_layer_mla_lf_lf_H2D_hcu(Tensor src, Tensor dst, Tensor src_indices, Tensor dst_indices, "
+      "int item_size, int page_size, int num_warps_per_block) -> ()");
+  m.impl("transfer_kv_per_layer_mla_lf_lf_H2D_hcu", torch::kCUDA, &transfer_kv_per_layer_mla_lf_lf_H2D_hcu);
+  m.def(
+      "transfer_kv_all_layer_mla_lf_lf_D2H_hcu(Tensor src_layers, Tensor dst_layers, Tensor src_indices, "
+      "Tensor dst_indices, int item_size, int num_layers, int block_quota, int num_warps_per_block) -> ()");
+  m.impl("transfer_kv_all_layer_mla_lf_lf_D2H_hcu", torch::kCUDA, &transfer_kv_all_layer_mla_lf_lf_D2H_hcu);
+
   /*
    * From FlashMLA
    */

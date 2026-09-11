@@ -371,6 +371,10 @@ class UnifiedTreeCoreInterface(ABC):
         """Match a key against the tree; returns device indices + boundary NodeIds."""
         ...
 
+    def probe_prefix_len(self, key: RadixKey) -> Optional[int]:
+        """Read-only device-prefix estimate, or None if unsupported."""
+        return None
+
     def supports_fast_match_prefix(self) -> bool:
         """Whether matching every waiting request is cheap enough for scheduling."""
         return False

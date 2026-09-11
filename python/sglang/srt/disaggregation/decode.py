@@ -2640,7 +2640,8 @@ class SchedulerDisaggregationDecodeMixin:
         if self.grammar_manager.has_waiting_grammars():
             ready_grammar_requests = self.grammar_manager.get_ready_grammar_requests()
             for req in ready_grammar_requests:
-                self._add_request_to_queue(req)
+                if not req.grammar_overlap_queued:
+                    self._add_request_to_queue(req)
 
         if len(self.waiting_queue) == 0:
             return None
@@ -2660,8 +2661,22 @@ class SchedulerDisaggregationDecodeMixin:
 
         for i in range(len(self.waiting_queue)):
             req = self.waiting_queue[i]
+            if req.grammar_overlap_queued:
+                if req.finished():
+                    self.output_streamer.stream_output([req], req.return_logprob)
+                    release_kv_cache(req, self.tree_cache)
+                    continue
+                if isinstance(req.grammar, Future):
+                    req.grammar_overlap_exposed = True
+                    waiting_queue.append(req)
+                    continue
+                if self.metrics_reporter.enable_metrics:
+                    self.metrics_reporter.metrics_collector.increment_grammar_overlap(
+                        exposed=req.grammar_overlap_exposed
+                    )
+                req.grammar_overlap_queued = False
             # we can only add at least `num_not_used_batch` new batch to the running queue
-            if i < num_not_used_batch:
+            if len(can_run_list) < num_not_used_batch:
                 can_run_list.append(req)
                 # Decode-radix path: new requests already matched in
                 # `pop_preallocated`. Retracted requests reset `last_node`,

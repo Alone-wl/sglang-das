@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import concurrent.futures
 import dataclasses
 import logging
@@ -10,6 +11,7 @@ import time
 from collections import defaultdict
 from typing import List, Optional, Set, Tuple, Union
 
+import aiohttp
 import numpy as np
 import numpy.typing as npt
 import zmq
@@ -205,7 +207,16 @@ class KVArgsRegisterInfo:
         )
 
 
-class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
+from sglang.srt.disaggregation.mooncake.layer_pipeline import (
+    LayerTransferKVChunk,
+    LayerTransferManagerMixin,
+    LayerTransferSenderMixin,
+)
+
+
+class MooncakeKVManager(
+    LayerTransferManagerMixin, StagingManagerMixin, CommonKVManager
+):
     AUX_DATA_HEADER = b"AUX_DATA"
 
     def __init__(
@@ -216,6 +227,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        self.init_layer_transfer_leases()
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -1277,6 +1289,73 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         return skip_kv, skip_state
 
+    def _should_skip_cp_replicated_state_transfer(self):
+        if getattr(self.kv_args, "hcu_kda_state_sharded", False):
+            return False
+        return super()._should_skip_cp_replicated_state_transfer()
+
+    def _send_hcu_kda_state(
+        self,
+        req,
+        indices,
+        src_ptrs,
+        src_items,
+        src_dims,
+        dst_ptrs,
+        dst_indices,
+        dst_items,
+        dst_dims,
+        info,
+        conv_groups,
+        outer_counts,
+        src_ids,
+        dst_ids,
+    ):
+        src_size, src_rank = (
+            (self.attn_cp_size, self.attn_cp_rank)
+            if self.attn_cp_size > 1
+            else (self.attn_tp_size, self.attn_tp_rank)
+        )
+        dst_size = info.dst_attn_tp_size
+        dst_rank = info.dst_tp_rank % dst_size
+        overlaps = (
+            (src_rank * dst_size // src_size == dst_rank)
+            if src_size >= dst_size
+            else (dst_rank * src_size // dst_size == src_rank)
+        )
+        if not overlaps:
+            return 0
+        if src_size == dst_size:
+            return self._send_mamba_state(
+                req,
+                indices,
+                src_ptrs,
+                src_items,
+                dst_ptrs,
+                dst_indices,
+                src_ids,
+                dst_ids,
+            )
+        return self._send_mamba_state_slice(
+            req,
+            indices,
+            src_ptrs,
+            src_items,
+            src_dims,
+            dst_ptrs,
+            dst_indices,
+            dst_items,
+            dst_dims,
+            info.dst_tp_rank,
+            dst_size,
+            conv_groups,
+            outer_counts,
+            src_ids,
+            dst_ids,
+            src_shard_size=src_size,
+            src_shard_rank=src_rank,
+        )
+
     def _is_generic_kvcache_state_type(self, st: StateType) -> bool:
         """State types sent via the page-indexed ``_send_kvcache_generic`` path
         (not the mamba-state path); subclasses extend for hardware components."""
@@ -1370,6 +1449,29 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         "attention TP sizes."
                     )
                 if (
+                    getattr(self.kv_args, "hcu_kda_state_sharded", False)
+                    and target_rank_registration_info is not None
+                ):
+                    rc = (
+                        self._send_hcu_kda_state(
+                            req,
+                            indices,
+                            src_data_ptrs,
+                            src_item_lens,
+                            src_dim_per_tensor,
+                            dst_data_ptrs,
+                            dst_indices,
+                            dst_item_lens,
+                            dst_dim_per_tensor,
+                            target_rank_registration_info,
+                            src_conv_shard_groups,
+                            src_slice_outer_counts,
+                            src_state_layer_ids,
+                            dst_state_layer_ids,
+                        )
+                        or rc
+                    )
+                elif (
                     target_rank_registration_info is not None
                     and self.attn_tp_size
                     != target_rank_registration_info.dst_attn_tp_size
@@ -1419,6 +1521,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         list(indices),
                         list(dst_indices),
                         st.value,
+                        src_state_layer_ids,
+                        dst_state_layer_ids,
                     )
                     or rc
                 )
@@ -1468,6 +1572,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_data_indices=np.array(dst_indices_local, dtype=np.int32),
                         executor=executor,
                         state_type=st,
+                        src_layer_ids=src_state_layer_ids,
+                        dst_layer_ids=dst_state_layer_ids,
                     )
                     or rc
                 )
@@ -1518,20 +1624,35 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         src_indices: list[int],
         dst_indices: list[int],
         label: str,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
     ) -> int:
         try:
-            dst_ptrs = slice_dsa_tail_dst_ptrs_for_pp(
-                src_ptrs,
-                dst_ptrs,
-                self.kv_args.prefill_start_layer,
-                self.kv_args.prefill_end_layer,
-            )
-            dst_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
-                src_ptrs,
-                dst_item_lens,
-                self.kv_args.prefill_start_layer,
-                self.kv_args.prefill_end_layer,
-            )
+            if src_layer_ids or dst_layer_ids:
+                pairs = build_transfer_entry_pairs(
+                    src_layer_ids or [],
+                    dst_layer_ids or [],
+                    len(src_ptrs),
+                    len(dst_ptrs),
+                    allow_positional_fallback=False,
+                )
+                src_ptrs = [src_ptrs[i] for i, _ in pairs]
+                src_item_lens = [src_item_lens[i] for i, _ in pairs]
+                dst_ptrs = [dst_ptrs[j] for _, j in pairs]
+                dst_item_lens = [dst_item_lens[j] for _, j in pairs]
+            else:
+                dst_ptrs = slice_dsa_tail_dst_ptrs_for_pp(
+                    src_ptrs,
+                    dst_ptrs,
+                    self.kv_args.prefill_start_layer,
+                    self.kv_args.prefill_end_layer,
+                )
+                dst_item_lens = slice_dsa_tail_dst_ptrs_for_pp(
+                    src_ptrs,
+                    dst_item_lens,
+                    self.kv_args.prefill_start_layer,
+                    self.kv_args.prefill_end_layer,
+                )
             transfer_blocks = build_dsa_tail_transfer_blocks(
                 src_ptrs,
                 src_item_lens,
@@ -1592,6 +1713,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         src_state_slice_outer_counts: list[int] = None,
         src_layer_ids: Optional[List[int]] = None,
         dst_layer_ids: Optional[List[int]] = None,
+        *,
+        src_shard_size: Optional[int] = None,
+        src_shard_rank: Optional[int] = None,
     ):
         """Transfer Mamba states with TP slice support.
 
@@ -1626,7 +1750,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 dst_layer_ids,
             )
 
-        local_tp_rank_in_group = self.kv_args.engine_rank % self.attn_tp_size
+        source_size = self.attn_tp_size if src_shard_size is None else src_shard_size
+        local_tp_rank_in_group = (
+            self.kv_args.engine_rank % source_size
+            if src_shard_rank is None
+            else src_shard_rank
+        )
         dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
 
         transfer_blocks = []
@@ -1665,7 +1794,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_dim=src_dim,
                 dst_dim=dst_dim,
                 outer_count=outer_count,
-                src_attn_tp_size=self.attn_tp_size,
+                src_attn_tp_size=source_size,
                 dst_attn_tp_size=dst_attn_tp_size,
                 dst_tp_rank_in_group=dst_tp_rank_in_group,
                 local_tp_rank_in_group=local_tp_rank_in_group,
@@ -1713,6 +1842,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
 
         while True:
+            kv_chunk = None
+            layer_transfer_terminal = True
             try:
                 kv_chunk: TransferKVChunk = queue.get()
                 if self.enable_trace:
@@ -1760,6 +1891,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     if kv_chunk.room in self.transfer_infos
                     else []
                 )
+                if (event := getattr(kv_chunk, "cuda_event", None)) is not None:
+                    event.synchronize()
                 polls = []
                 dst_ranks_infos = []
                 # Unique id per prefill sender so decode's response set size matches expected_response_num.
@@ -1843,6 +1976,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             or skip_kv
                         ):
                             ret = 0
+                        elif getattr(kv_chunk, "layer_ids", None) is not None:
+                            ret = self.send_kvcache_layers(
+                                kv_chunk,
+                                req,
+                                target_rank_registration_info,
+                                chunked_dst_kv_indice,
+                                executor,
+                            )
                         elif is_dcp_transfer:
                             dcp_token_item_lens = (
                                 target_rank_registration_info.dcp_token_item_lens
@@ -2020,6 +2161,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
 
                 if staging_deferred:
+                    layer_transfer_terminal = False
                     continue
 
                 self._staging_outstanding[kv_chunk.room] -= 1
@@ -2053,10 +2195,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         self._staging_ctx.prefetched_rooms.discard(kv_chunk.room)
 
             except Exception as e:
-                # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
-                raise RuntimeError(
+                layer_transfer_terminal = False
+                error = RuntimeError(
                     f"Transfer thread failed because of {e}. Prefill instance with bootstrap_port={self.bootstrap_port} is dead."
                 )
+                self._transfer_worker_errors.put(error)
+                raise error from e
+            finally:
+                if kv_chunk is not None and layer_transfer_terminal:
+                    self._finish_layer_transfer_chunk(
+                        getattr(kv_chunk, "layer_transfer_token", None)
+                    )
 
     def start_prefill_thread(self):
         def bootstrap_thread():
@@ -2276,8 +2425,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         trace_ctx: Optional[Union[TraceReqContext, TraceNullContext]] = None,
+        layer_ids: Optional[Tuple[int, ...]] = None,
+        cuda_event: object = None,
+        layer_transfer_token: Optional[int] = None,
     ):
         assert self.disaggregation_mode == DisaggregationMode.PREFILL
+        if (layer_ids is None) != (layer_transfer_token is None):
+            raise ValueError("Layer groups require a page-lease token")
         assert not is_last_chunk or (is_last_chunk and aux_index is not None)
 
         if (
@@ -2305,8 +2459,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
+        self._enqueue_layer_transfer_chunk(
+            self.transfer_queues[shard_idx],
+            LayerTransferKVChunk(
                 room=bootstrap_room,
                 prefill_kv_indices=kv_indices,
                 index_slice=index_slice,
@@ -2315,11 +2470,56 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 trace_ctx=trace_ctx,
-            )
+                layer_ids=layer_ids,
+                cuda_event=cuda_event,
+                layer_transfer_token=layer_transfer_token,
+            ),
         )
 
     def get_session_id(self):
         return self.engine.get_session_id()
+
+    def _start_heartbeat_checker_thread(self):
+        if not envs.GLM_USE_DISAGG_ASYNC_HEARTBEAT.get():
+            return super()._start_heartbeat_checker_thread()
+
+        async def check_one(session, bootstrap_addr):
+            ok = False
+            try:
+                async with session.get(
+                    f"http://{bootstrap_addr}/health",
+                    headers={"Connection": "keep-alive"},
+                ) as response:
+                    ok = response.status == 200
+            except Exception:
+                pass
+            if ok:
+                self.heartbeat_failures[bootstrap_addr] = 0
+                self._on_heartbeat_success(bootstrap_addr)
+            else:
+                self.heartbeat_failures[bootstrap_addr] = (
+                    self.heartbeat_failures.get(bootstrap_addr, 0) + 1
+                )
+            if self.heartbeat_failures.get(bootstrap_addr, 0) >= self.max_failures:
+                self._handle_node_failure(bootstrap_addr)
+                with self.session_pool_lock:
+                    self.session_pool.pop(bootstrap_addr, None)
+
+        async def run():
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(sock_connect=2, total=3),
+                connector=aiohttp.TCPConnector(limit=0, ttl_dns_cache=300),
+            ) as session:
+                while True:
+                    await asyncio.sleep(self.heartbeat_interval)
+                    with self.connection_lock:
+                        addresses = list(self.prefill_info_table)
+                    await asyncio.gather(
+                        *(check_one(session, addr) for addr in addresses),
+                        return_exceptions=True,
+                    )
+
+        threading.Thread(target=lambda: asyncio.run(run()), daemon=True).start()
 
     def _on_heartbeat_success(self, bootstrap_addr: str):
         current_rooms = self.addr_to_rooms_tracker[bootstrap_addr].copy()
@@ -2393,7 +2593,9 @@ class MooncakeFailureExceptionMixin:
         )
 
 
-class MooncakeKVSender(MooncakeFailureExceptionMixin, CommonKVSender):
+class MooncakeKVSender(
+    LayerTransferSenderMixin, MooncakeFailureExceptionMixin, CommonKVSender
+):
     def __init__(
         self,
         mgr: MooncakeKVManager,

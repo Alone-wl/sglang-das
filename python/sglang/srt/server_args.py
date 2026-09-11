@@ -612,6 +612,13 @@ class ServerArgs:
             help="[Deprecated] Use --enable-linear-replayssm-spec instead.",
         )
         parser.add_argument(
+            "--enable-kda-replayssm-spec",
+            dest="enable_linear_replayssm_spec",
+            action=DeprecatedStoreTrueAction,
+            new_flag="--enable-linear-replayssm-spec",
+            help="[Deprecated] Use --enable-linear-replayssm-spec instead.",
+        )
+        parser.add_argument(
             "--enable-prefill-context-parallel",
             dest="enable_prefill_context_parallel",
             action=DeprecatedStoreTrueAction,
@@ -942,6 +949,9 @@ class PortArgs:
     # Stable token shared by all processes in one server instance, used to
     # derive the /dev/shm path for load snapshots.
     instance_id: str = ""
+
+    # Completed-request acknowledgements for detokenizer load balancing.
+    detokenizer_ack_ipc_name: str | None = None
 
     @staticmethod
     def init_new(

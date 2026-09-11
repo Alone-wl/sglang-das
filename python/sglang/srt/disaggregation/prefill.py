@@ -36,6 +36,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
     compute_grid_segments,
     staging_grid_tokens,
 )
+from sglang.srt.disaggregation.hcu_layer_pipeline import _drain_pipelined_kv_page_leases
 from sglang.srt.disaggregation.utils import (
     FAKE_BOOTSTRAP_HOST,
     DisaggregationMode,
@@ -542,6 +543,19 @@ class SchedulerDisaggregationPrefillMixin:
     Mixin for Scheduler to handle disaggregation prefill
     """
 
+    def _observe_grammar_first_mask_fill(self: Scheduler, req: Req) -> None:
+        # GLM NOTE: the prefill engine samples exactly one token per request,
+        # so this is the per-request cost of one (possibly JIT) mask fill.
+        stats = req.grammar.grammar_stats
+        if (
+            self.metrics_reporter.enable_metrics
+            and stats is not None
+            and stats.first_mask_fill_time is not None
+        ):
+            self.metrics_reporter.metrics_collector.observe_grammar_first_mask_fill(
+                stats.first_mask_fill_time
+            )
+
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
         kv_mgr = self.disagg_prefill_bootstrap_queue.kv_manager
@@ -625,6 +639,7 @@ class SchedulerDisaggregationPrefillMixin:
     def event_loop_normal_disagg_prefill(self: Scheduler) -> None:
         """A normal scheduler loop for prefill worker in disaggregation mode."""
         while True:
+            _drain_pipelined_kv_page_leases(self)
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -665,6 +680,7 @@ class SchedulerDisaggregationPrefillMixin:
         self.result_queue = deque()
 
         while True:
+            _drain_pipelined_kv_page_leases(self)
             # Receive requests
             recv_reqs = self.request_receiver.recv_requests()
             self.process_input_requests(recv_reqs)
@@ -810,6 +826,7 @@ class SchedulerDisaggregationPrefillMixin:
                             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                         )
                     req.grammar.finished = req.finished()
+                    self._observe_grammar_first_mask_fill(req)
                     if is_aborted(req):
                         if self._retire_aborted_prefill_result(req):
                             req.time_stats.set_completion_time()
@@ -852,7 +869,13 @@ class SchedulerDisaggregationPrefillMixin:
                         i, req, logits_output
                     )
                 if not req.pending_bootstrap:
-                    self.send_kv_chunk(req, last_chunk=True)
+                    self.send_kv_chunk(
+                        req,
+                        last_chunk=True,
+                        layer_pipeline_final=getattr(
+                            result, "pipelined_kv_finalize_infos", {}
+                        ).get(req.rid),
+                    )
                 req.time_stats.set_prefill_transfer_queue_entry_time()
 
             else:
@@ -900,7 +923,11 @@ class SchedulerDisaggregationPrefillMixin:
 
                 # In non-overlap-mode, KV is sent in process_prefill_chunk
                 # Only send when req's sender is initialized
-                if self.enable_overlap and not req.pending_bootstrap:
+                if (
+                    self.enable_overlap
+                    and not req.pending_bootstrap
+                    and req.rid not in getattr(result, "pipelined_kv_rids", ())
+                ):
                     assert req.metadata_buffer_index >= 0, (
                         f"Req {req.rid} does not have metadata buffer allocated"
                     )
@@ -1251,6 +1278,7 @@ class SchedulerDisaggregationPrefillMixin:
         req: Req,
         last_chunk: bool = False,
         end_idx: Optional[int] = None,
+        layer_pipeline_final: Optional[tuple] = None,
     ) -> None:
         """
         Send a prefilled chunk to the decode server
@@ -1398,6 +1426,16 @@ class SchedulerDisaggregationPrefillMixin:
             state_indices = [
                 payloads[st]() if st in payloads else None for st in state_types
             ]
+
+        if layer_pipeline_final is not None:
+            pages, event = layer_pipeline_final
+            req.disagg_kv_sender.finalize_layer_transfer(
+                pages,
+                cuda_event=event,
+                state_indices=state_indices,
+            )
+            self.disagg_prefill_pending_chunk_rids.discard(req.rid)
+            return
 
         if self.enable_staging:
             # One sender.send per grid slot; the sender's cumulative page

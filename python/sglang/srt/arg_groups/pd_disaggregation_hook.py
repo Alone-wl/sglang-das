@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 def handle_pd_disaggregation(server_args: ServerArgs) -> None:
     """Validate and normalize PD-disaggregation server args."""
     cfg = resolving_view(server_args)
+    validate_auto_chunking_args(cfg)
 
     # "mooncake_tcp" is mooncake with the TCP transport forced: set MC_FORCE_TCP
     # so mooncake installs TcpTransport instead of RDMA, rewrite the backend to
@@ -257,9 +258,64 @@ def handle_encoder_disaggregation(server_args: Any):
         "KimiK3ForConditionalGeneration",
         "MiMoV2ForCausalLM",
         "Glm5NextForConditionalGeneration",
+        "Glm5NextForCausalLM",
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
             f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
             f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next."
+        )
+
+
+def validate_auto_chunking_args(cfg):
+    """Validate static constraints for GLM5-Next PD-prefill auto chunking."""
+    if not cfg.prefill_short_req_reserve:
+        return
+
+    if cfg.disaggregation_mode != "prefill":
+        raise ValueError(
+            "--prefill-short-req-reserve is supported only on a PD "
+            "prefill server (--disaggregation-mode prefill)."
+        )
+
+    if not 0.0 < cfg.prefill_short_req_max_reserve_ratio < 1.0:
+        raise ValueError("prefill_short_req_max_reserve_ratio must be in (0, 1)")
+    for name in (
+        "prefill_short_req_threshold",
+        "prefill_short_req_scan_depth",
+        "prefill_long_req_starve_threshold",
+    ):
+        if getattr(cfg, name) <= 0:
+            raise ValueError(f"{name} must be positive")
+    if cfg.prefill_short_req_max_total_len < 0:
+        raise ValueError("prefill_short_req_max_total_len must be non-negative")
+    incompatible = []
+    if cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size <= 0:
+        incompatible.append("disabled chunked prefill")
+    if cfg.schedule_policy != "fcfs":
+        incompatible.append("non-FCFS scheduling")
+    if cfg.enable_priority_scheduling:
+        incompatible.append("priority scheduling")
+    if cfg.enable_dynamic_chunking:
+        incompatible.append("dynamic chunking")
+    if cfg.dllm_algorithm is not None:
+        incompatible.append("diffusion LLM scheduling")
+    if cfg.enable_prefill_delayer:
+        incompatible.append("prefill delaying")
+    if cfg.enable_lora or cfg.lora_paths:
+        incompatible.append("LoRA serving")
+    if cfg.enable_prefill_context_parallel:
+        incompatible.append("general prefill context parallelism")
+    if (
+        cfg.enable_dsa_prefill_context_parallel
+        and cfg.dsa_prefill_cp_mode != "round-robin-split"
+    ):
+        incompatible.append(f"DSA prefill CP mode {cfg.dsa_prefill_cp_mode!r}")
+
+    if incompatible:
+        raise ValueError(
+            "--prefill-short-req-reserve is incompatible with: "
+            + ", ".join(incompatible)
+            + ". PD-prefill auto chunking supports DSA CP only in "
+            "round-robin-split mode."
         )

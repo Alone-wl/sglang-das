@@ -16,12 +16,14 @@
 import json
 import logging
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Dict, List, NamedTuple, Optional, Tuple
+from typing import List, NamedTuple, Optional, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import (
     get_context,
@@ -46,6 +48,7 @@ class GrammarStats:
     tree_traversal_time: List[float] = field(default_factory=list)
     dispatch_type: Optional[str] = None
     num_timeout: int = 0
+    first_mask_fill_time: Optional[float] = None
 
 
 class GrammarRow(NamedTuple):
@@ -198,12 +201,42 @@ class InvalidGrammarObject(BaseGrammarObject):
         return f"InvalidGrammarObject(error_message={self.error_message!r})"
 
 
+class _GrammarCache:
+    def __init__(self, max_entries: int):
+        self.max_entries = max_entries
+        self.entries: OrderedDict[Tuple[str, str], BaseGrammarObject] = OrderedDict()
+
+    def get(self, key: Tuple[str, str]) -> Optional[BaseGrammarObject]:
+        value = self.entries.get(key)
+        if value is not None:
+            self.entries.move_to_end(key)
+        return value
+
+    def __setitem__(self, key: Tuple[str, str], value: BaseGrammarObject) -> None:
+        if self.max_entries == 0:
+            return
+
+        self.entries.pop(key, None)
+        self.entries[key] = value
+        self._evict()
+
+    def clear(self) -> None:
+        self.entries.clear()
+
+    def _evict(self) -> None:
+        if self.max_entries <= 0:
+            return
+
+        while len(self.entries) > self.max_entries:
+            self.entries.popitem(last=False)
+
+
 class BaseGrammarBackend:
     _enable_strict_thinking: bool = False
 
     def __init__(self):
         self.executor = ThreadPoolExecutor()
-        self.cache: Dict[Tuple[str, str], BaseGrammarObject] = {}
+        self.cache = _GrammarCache(envs.GLM_GRAMMAR_OBJECT_CACHE_MAX_COUNT.get())
 
     def initialize_vocab_mask_buffer(
         self,
@@ -293,6 +326,10 @@ class BaseGrammarBackend:
 
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
         self.cache[key] = value
+
+    def get_cache_stats(self) -> Tuple[int, int]:
+        """Return (num cached grammar objects, backend-native cache bytes)."""
+        return len(self.cache.entries), 0
 
     def reset(self):
         self.cache.clear()
@@ -423,7 +460,11 @@ def create_grammar_backend(
     else:
         raise ValueError(f"Invalid grammar backend: {name}")
 
-    if get_serving().reasoning_parser and think_end_ids:
+    if (
+        get_serving().reasoning_parser
+        and (think_end_ids or getattr(tokenizer, "think_end_id", None) is not None)
+        and not get_serving().glm_decoding_constraint_module
+    ):
         from sglang.srt.constrained.reasoner_grammar_backend import (
             ReasonerGrammarBackend,
         )

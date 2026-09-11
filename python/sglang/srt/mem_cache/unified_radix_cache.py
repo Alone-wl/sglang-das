@@ -536,6 +536,12 @@ class UnifiedRadixCache(BasePrefixCache):
             result = self.linker.match(params.key, params.req, result)
         return result
 
+    def probe_prefix_len(self, key: RadixKey) -> Optional[int]:
+        """Estimate a device hit without running match finalizers or cache actions."""
+        if self.disable:
+            return 0
+        return self.tree_core.probe_prefix_len(key)
+
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 

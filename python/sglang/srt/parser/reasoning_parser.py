@@ -352,6 +352,31 @@ class DeepSeekR1Detector(BaseReasoningFormatDetector):
         # https://github.com/sgl-project/sglang/pull/3202#discussion_r1950153599
 
 
+class GLM5Detector(BaseReasoningFormatDetector):
+    """
+    Detector for GLM-5 model.
+    Assumes reasoning format:
+      (<think>)*(.*)</think>
+    Returns all the text before the </think> tag as `reasoning_text`
+    and the rest of the text as `normal_text`.
+
+    Args:
+        stream_reasoning (bool): If False, accumulates reasoning content until the end tag.
+            If True, streams reasoning content as it arrives.
+    """
+
+    def __init__(self, stream_reasoning: bool = True, force_reasoning: bool = True):
+        from sglang.srt.constrained.glm.escape import get_global_escaped_special_tokens
+
+        sp = get_global_escaped_special_tokens()
+        super().__init__(
+            sp.get("<think>"),
+            sp.get("</think>"),
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+        )
+
+
 class Qwen3Detector(BaseReasoningFormatDetector):
     """
     Detector for Qwen3 models (e.g., Qwen/Qwen3-235B-A22B).
@@ -2027,6 +2052,7 @@ class ReasoningParser:
         "deepseek-v4": DeepSeekV4Detector,
         "dots": Qwen3Detector,
         "glm45": Glm45Detector,
+        "glm5": GLM5Detector,
         "ling3": Ling3Detector,
         "hunyuan": HunyuanDetector,
         "gpt-oss": GptOssDetector,

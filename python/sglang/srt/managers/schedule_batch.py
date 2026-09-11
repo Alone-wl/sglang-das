@@ -1224,6 +1224,10 @@ class Req(ReqDllmMixin):
             None
         )
         self.grammar_wait_ct = 0
+        # GLM compile may overlap PD bootstrap/KV transfer, but must finish
+        # before this request enters a prebuilt batch.
+        self.grammar_overlap_queued = False
+        self.grammar_overlap_exposed = False
 
         # The number of cached tokens that were already cached in the KV cache
         self.cached_tokens = 0

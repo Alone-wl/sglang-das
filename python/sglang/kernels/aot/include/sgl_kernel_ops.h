@@ -1016,3 +1016,22 @@ std::vector<at::Tensor> fwd_kvcache_mla_fp8(
 
 std::vector<at::Tensor> get_mla_decoding_metadata_dense_fp8(
     at::Tensor& seqlens_k, const int64_t num_heads_per_head_k, const int64_t num_heads_k);
+
+void transfer_kv_per_layer_mla_lf_lf_H2D_hcu(
+    const at::Tensor& src,
+    at::Tensor dst,
+    const at::Tensor& src_indices,
+    const at::Tensor& dst_indices,
+    int64_t item_size,
+    int64_t page_size,
+    int64_t num_warps_per_block);
+
+void transfer_kv_all_layer_mla_lf_lf_D2H_hcu(
+    const at::Tensor src_layers,
+    const at::Tensor dst_layers,
+    const at::Tensor src_indices,
+    const at::Tensor dst_indices,
+    int64_t item_size,
+    int64_t num_layers,
+    int64_t block_quota,
+    int64_t num_warps_per_block);

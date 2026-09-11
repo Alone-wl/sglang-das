@@ -84,6 +84,7 @@ from sglang.srt.utils import (
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
+    is_hcu,
     is_hip,
     is_npu,
     round_up,
@@ -191,7 +192,7 @@ def create_moe_dispatcher(moe_runner_config: MoeRunnerConfig) -> BaseDispatcher:
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
             async_finish=True,
-            return_recv_hook=True,
+            return_recv_hook=not is_hcu(),
         )
     elif a2a_backend.is_deepep_v2():
         return DeepEPv2Dispatcher(

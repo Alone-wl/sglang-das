@@ -779,10 +779,27 @@ def eagle_sample(
     )
     num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
-    # Sample tokens
+    # HCU top-1 MTP samples the target distribution before greedy tree matching,
+    # retaining source temperature/top-k/top-p/min-p and per-request RNG semantics.
+    from sglang.srt.utils import is_hcu
+
+    sampled_target_ids = None
+    if not sampling_info.is_all_greedy and is_hcu() and verify_input.tree_topk == 1:
+        from sglang.srt.layers.sampler import sample_mtp_target_ids
+
+        sampled_target_ids = sample_mtp_target_ids(
+            next_token_logits,
+            sampling_info,
+            verify_input.draft_token_num,
+            verify_input.positions,
+        )
     target_predict = None
     if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
-        target_predict = torch.argmax(next_token_logits, dim=-1)
+        target_predict = (
+            torch.argmax(next_token_logits, dim=-1)
+            if sampled_target_ids is None
+            else sampled_target_ids
+        )
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
             predicts=predict,  # mutable

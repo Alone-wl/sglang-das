@@ -989,7 +989,7 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def add_chunked_req(self, req: Req, max_tokens: Optional[int] = None):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens()
         else:
@@ -1000,6 +1000,8 @@ class PrefillAdder:
                 _rem_tokens = min(
                     _rem_tokens, int(self.rem_swa_tokens) - self.page_size
                 )
+            if max_tokens is not None:
+                _rem_tokens = min(_rem_tokens, max(int(max_tokens), self.page_size))
             # The chunked_req must be added to the list; otherwise, it will cause a memory leak.
             # Therefore, in certain cases where _rem_tokens <= 0, it should be replaced with rem_chunk_tokens.
             if _rem_tokens <= 0:

@@ -262,3 +262,27 @@ class Schedule:
             "pipeline parallelism."
         ),
     ] = None
+
+    prefill_short_req_reserve: A[
+        bool, "Reserve part of a long HCU GLM prefill chunk for short FCFS requests."
+    ] = False
+    prefill_short_req_threshold: A[
+        int, "Maximum prefix-adjusted input length eligible for chunk reservation."
+    ] = 16384
+    prefill_short_req_max_reserve_ratio: A[
+        float, "Maximum fraction of a chunk reserved for short requests, in (0, 1)."
+    ] = 0.5
+    prefill_short_req_scan_depth: A[
+        int, "Maximum number of waiting FCFS requests inspected per round."
+    ] = 8
+    prefill_long_req_starve_threshold: A[
+        int, "Compressed rounds before a full-budget long-request round."
+    ] = 8
+    prefill_short_req_match_prefix: A[
+        bool,
+        "Probe reusable prefixes without splitting nodes, updating LRU, or allocating state.",
+    ] = False
+    prefill_short_req_max_total_len: A[
+        int,
+        "Maximum total request length considered for reservation; zero disables the limit.",
+    ] = 262144

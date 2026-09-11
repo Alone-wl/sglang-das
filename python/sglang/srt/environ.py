@@ -255,6 +255,13 @@ class DsparkFoldedSampling(IntEnum):
 
 
 class Envs:
+    SGLANG_ENABLE_HEALTH_CHECK_IPC_DRAIN_ALL = EnvBool(False)
+    GLM_USE_DISAGG_ASYNC_HEARTBEAT = EnvBool(True)
+    SGLANG_UVICORN_WORKER_STARTUP_TIMEOUT = EnvInt(300)
+    SGLANG_HTTP_WORKER_REUSE_PORT = EnvBool(False)
+    SGLANG_USE_FUSED_SILU_MUL_CLAMP_QUANT = EnvBool(False)
+    SGLANG_PIPELINE_GROUP_SIZE = EnvInt(None)
+    SGLANG_PIPELINED_KV_TRANSFER = EnvBool(False)
     # Organization principles for this registry:
     # - Put every field in exactly one topical section. Prefer an existing
     #   section; add a new one only when no current section is a clear fit.
@@ -325,7 +332,7 @@ class Envs:
     SGLANG_TIMEOUT_KEEP_ALIVE = EnvInt(5)
     # Uvicorn multiprocess supervisor pings each worker on this interval; default 5s is
     # too short when many workers cold-start and load tokenizers in parallel.
-    SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(10)
+    SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT = EnvInt(15)
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
@@ -356,6 +363,28 @@ class Envs:
     # value instead of asking the OS for a random port.  Useful to keep all
     # SGLang ports in a predictable range behind a firewall.
     SGLANG_PORT = EnvInt(None)
+    SGLANG_MC_RDMA_POOL_MAX_MB = EnvInt(0)
+    SGLANG_MC_RDMA_POOL_ACQUIRE_TIMEOUT_SECS = EnvFloat(60)
+    SGLANG_ENCODER_VIDEO_SHARD_MIN_MB = EnvInt(128)
+    SGLANG_ENCODER_VIDEO_SHARD_MIN_FRAMES_PER_ENCODER = EnvInt(80)
+    SGLANG_ENCODER_MAX_PENDING_VIT = EnvInt(32)
+    SGLANG_ENCODER_CHECK_NAN = EnvBool(False)
+    GLM_ENABLE_ENCODER_SESSION_ID_HEADER = EnvBool(False)
+    GLM_ENCODER_AFFINITY_SHARDS = EnvInt(1)
+
+    SGLANG_SKIP_VIDEO_PREPROCESS = EnvBool(False)
+    SGLANG_ENCODER_GLM_VIDEO_DECODE_WORKERS = EnvInt(4)
+
+    GLM_GRAMMAR_OBJECT_CACHE_MAX_COUNT = EnvInt(-1)
+    GLM_XGRAMMAR_BACKEND_CACHE_MAX_MB = EnvInt(-1)
+    SGLANG_USE_HICACHE_OPTIMIZATION_KERNEL = EnvBool(True)
+    GLM_USE_ABORT_FINISH_REASON = EnvBool(False)
+    SGLANG_ENABLE_TOKENIZER_OFFLOAD = EnvBool(True)
+    GLM_XGRAMMAR_ENABLE_DYNAMIC_COMPILATION = EnvBool(False)
+    GLM_GRAMMAR_ENABLE_DECODE_COMPILE_OVERLAP = EnvBool(True)
+
+    GLM_TOKENIZER_TORCH_NUM_THREADS = EnvInt(4)
+
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
     # ===================================================================
@@ -1775,6 +1804,21 @@ class Envs:
     SGLANG_WEIGHT_CACHE_READY_TEMPLATE = EnvStr(
         "/tmp/sglang_weight_cache_{device_uuid}.ready"
     )
+
+    # HCU GLM5-Next kernel controls.
+    SGLANG_USE_LIGHTOP_PREFILL_DEQUANT = EnvBool(True)
+    SGLANG_USE_FUSED_METADATA_COPY = EnvBool(True)
+    SGLANG_DSA_HCU_USE_LIGHTOP_DECODE_GATHER = EnvBool(True)
+    SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA = EnvBool(True)
+    SGLANG_DSA_KPOOL_AITER_TOPK = EnvBool(False)
+    SGLANG_DSA_HCU_MQA_LOGITS_WORKSPACE_GB = EnvFloat(2.0)
+    SGLANG_DSA_HCU_USE_TRITON_PAGED_MQA = EnvBool(False)
+    SGLANG_DSA_HCU_USE_INT8_MQA_LOGITS = EnvBool(True)
+    SGLANG_DSA_KPOOL_LIGHTOP_TOPK = EnvBool(False)
+    SGLANG_MOE_ROUTER_USE_CONFIG_DTYPE = EnvBool(False)
+    SGLANG_GLM5_NEXT_FUSE_QKVBFG = EnvBool(False)
+    SGLANG_DSA_CP_FUSE_SYMM_MEM = EnvBool(False)
+    SGLANG_DEBUG_HACK_CP_CHECK_RANK_CONSISTENCY = EnvBool(False)
 
 
 envs = Envs()

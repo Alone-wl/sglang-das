@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import functools
 import json
 import logging
 import math
+import re
 import time
 import uuid
 from enum import Enum
@@ -253,6 +255,69 @@ def _build_video_config(request: ChatCompletionRequest) -> Optional[Dict[str, An
     return config or None
 
 
+try:
+    import regex as _pcre
+except ImportError:
+    _pcre = None
+
+
+def _is_regex(instance: object) -> bool:
+    r"""Format check for JSON-schema `pattern`: stdlib `re` first, PCRE
+    (`regex` package) as fallback so `\p{...}` and friends are accepted.
+    Stdlib-re-acceptable patterns keep their original semantics."""
+    if not isinstance(instance, str):
+        return True
+    try:
+        re.compile(instance)
+        return True
+    except re.error:
+        if _pcre is not None:
+            try:
+                _pcre.compile(instance)
+                return True
+            except _pcre.error:
+                return False
+        return False
+
+
+_TOOL_SCHEMA_FORMAT_CHECKER = copy.deepcopy(Draft202012Validator.FORMAT_CHECKER)
+_TOOL_SCHEMA_FORMAT_CHECKER.checkers["regex"] = (_is_regex, ())
+
+
+@functools.lru_cache(maxsize=4096)
+def _check_schema_cached(schema_json: bytes) -> Optional[str]:
+    try:
+        Draft202012Validator.check_schema(
+            orjson.loads(schema_json), format_checker=_TOOL_SCHEMA_FORMAT_CHECKER
+        )
+    except SchemaError as e:
+        return str(e)
+    return None
+
+
+def _check_tool_parameters_schema(parameters) -> Optional[str]:
+    """Validate a tool's JSON-schema `parameters`, returning an error string
+    or None.
+
+    check_schema walks the whole Draft-2020-12 metaschema ($ref/$dynamicRef
+    resolution in pure Python) and runs on the http worker event loop; agent
+    clients resend an identical tool list on every turn, so cache verdicts by
+    the canonicalized schema.
+    """
+    try:
+        key = orjson.dumps(parameters, option=orjson.OPT_SORT_KEYS)
+    except (TypeError, orjson.JSONEncodeError):
+        # Not canonicalizable (non-JSON types); validate uncached.
+        try:
+            Draft202012Validator.check_schema(
+                parameters, format_checker=_TOOL_SCHEMA_FORMAT_CHECKER
+            )
+        except SchemaError as e:
+            return str(e)
+        return None
+    return _check_schema_cached(key)
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -316,6 +381,7 @@ class OpenAIServingChat(OpenAIServingBase):
         # Which Python-based chat encoder (if any) bypasses apply_chat_template.
         # Values: "dsv32", "dsv4", or custom values set by subclass. None for default.
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
+        self.init_glm()
         self._dsv4_reasoning_effort_profile = (
             chat_encoding.resolve_dsv4_reasoning_effort_profile(
                 model_path=self.tokenizer_manager.model_path,
@@ -407,6 +473,61 @@ class OpenAIServingChat(OpenAIServingBase):
         if encoded and encoded[0] == self.tokenizer_manager.tokenizer.bos_token_id:
             encoded = encoded[1:]
         return prompt_ids + encoded
+
+    def init_glm(self):
+        # Decoding constraint module
+        self._glm_constraint_module = None
+        self._glm_special_token_config = None
+        self._ignore_decoding_constraint_exception = (
+            get_serving().glm_ignore_decoding_constraint_exception
+        )
+        # Map tool_call_parser to chat_template_version
+        _parser_to_version = {
+            "glm45": "glm45",
+            "glm45stream": "glm45",
+            "glm47": "glm47",
+            "glm5": "glm47",
+            "glm5stream": "glm47",
+        }
+        self._glm_chat_template_version = _parser_to_version.get(self.tool_call_parser)
+
+        constraint_module_path = get_serving().glm_decoding_constraint_module
+        if constraint_module_path:
+            if self.tool_call_parser and self._glm_chat_template_version is None:
+                raise ValueError(
+                    f"Unsupported tool_call_parser '{self.tool_call_parser}' for decoding constraint. "
+                    f"Supported parsers: {list(_parser_to_version.keys())}"
+                )
+            self._load_glm_constraint_module(constraint_module_path)
+
+    def _load_glm_constraint_module(self, module_path: str):
+        """Load constraint module and initialize special token config."""
+        import importlib
+
+        module = importlib.import_module(module_path)
+
+        if not hasattr(module, "generation_constraint"):
+            raise AttributeError(
+                f"Module {module_path} missing 'generation_constraint'"
+            )
+        if not hasattr(module, "get_special_token_config"):
+            raise AttributeError(
+                f"Module {module_path} missing 'get_special_token_config'"
+            )
+
+        self._glm_constraint_module = module
+        self._glm_special_token_config = module.get_special_token_config(
+            self.tokenizer_manager.tokenizer
+        )
+        logger.info(f"Loaded decoding constraint module: {module_path}")
+
+    def _get_glm_enable_thinking(self, request: ChatCompletionRequest) -> bool:
+        """Get enable_thinking for constraint, default True."""
+        if request.chat_template_kwargs:
+            val = request.chat_template_kwargs.get("enable_thinking")
+            if val is not None:
+                return bool(val)
+        return True
 
     def _resolve_chat_encoding_spec(self) -> Optional[str]:
         """Determine which chat encoding spec to use.
@@ -942,8 +1063,68 @@ class OpenAIServingChat(OpenAIServingBase):
             and self.tool_call_parser
         )
 
+    def _validate_tool_references(
+        self, request: ChatCompletionRequest
+    ) -> Optional[str]:
+        effective_tools = self._effective_tools(request)
+        tool_references = []
+        for msg_index, message in enumerate(request.messages):
+            content = getattr(message, "content", None)
+            if not isinstance(content, list):
+                continue
+
+            for part_index, part in enumerate(content):
+                if getattr(part, "type", None) == "tool_reference":
+                    tool_references.append((msg_index, part_index, part.name))
+
+        if not tool_references:
+            return None
+
+        if not effective_tools:
+            msg_index, part_index, _ = tool_references[0]
+            return (
+                f"messages[{msg_index}].content[{part_index}] is a "
+                "tool_reference block, but tools is empty."
+            )
+
+        if request.tool_choice == "none":
+            msg_index, part_index, _ = tool_references[0]
+            return (
+                f"messages[{msg_index}].content[{part_index}] is a "
+                "tool_reference block, but tool_choice is none."
+            )
+
+        available_tool_names = {tool.function.name for tool in effective_tools}
+        if isinstance(request.tool_choice, ToolChoice):
+            available_tool_names = {
+                name
+                for name in available_tool_names
+                if name == request.tool_choice.function.name
+            }
+
+        for msg_index, part_index, tool_name in tool_references:
+            if tool_name not in available_tool_names:
+                return (
+                    f"messages[{msg_index}].content[{part_index}] references "
+                    f"unknown tool '{tool_name}'."
+                )
+
+        return None
+
     def _validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
         """Validate that the input is valid."""
+        if get_serving().glm_disable_nothink:
+            chat_template_kwargs = request.chat_template_kwargs or {}
+            if any(
+                key in chat_template_kwargs and not chat_template_kwargs[key]
+                for key in ("enable_thinking", "thinking")
+            ):
+                return (
+                    "Disabling thinking is not supported by this model: "
+                    "chat_template_kwargs.enable_thinking / thinking must not be "
+                    "falsy, and reasoning_effort='none' is rejected."
+                )
+
         if not request.messages:
             return "Messages cannot be empty."
 
@@ -983,6 +1164,9 @@ class OpenAIServingChat(OpenAIServingBase):
             if len(names) != len(set(names)):
                 return "Tool names must be unique across request and message tools."
 
+        if tool_reference_error := self._validate_tool_references(request):
+            return tool_reference_error
+
         # Validate tool definitions
         for i, tool in enumerate(effective_tools):
             if tool.function.parameters is None:
@@ -993,7 +1177,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 # guards against hand-crafted cyclic schemas so the request gets
                 # a 400 instead of crashing into a 500.
                 normalize_json_schema_types(tool.function.parameters)
-                Draft202012Validator.check_schema(tool.function.parameters)
+                error = _check_tool_parameters_schema(tool.function.parameters)
+                if error is not None:
+                    return f"Tool {i} function has invalid 'parameters' schema: {error}"
             except SchemaError as e:
                 return f"Tool {i} function has invalid 'parameters' schema: {str(e)}"
             except RecursionError:
@@ -1082,12 +1268,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     "return_prompt_token_ids is not supported with streaming. "
                     "Please set stream=false when using return_prompt_token_ids=true."
                 )
-            if request.return_token_ids:
-                raise ValueError(
-                    "return_token_ids is not supported with streaming on "
-                    "/v1/chat/completions. Please set stream=false when using "
-                    "return_token_ids=true."
-                )
             if request.return_meta_info:
                 raise ValueError(
                     "return_meta_info is not supported with streaming. "
@@ -1098,6 +1278,11 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Process messages and apply chat template
         processed_messages = self._process_messages(request, is_multimodal)
+        request._prompt_ids = processed_messages.prompt_ids
+        constraint = processed_messages.tool_call_constraint
+        request._constraint_string = (
+            constraint[1] if constraint and constraint[0] == "ebnf" else None
+        )
         # Build sampling parameters
         sampling_params = request.to_sampling_params(
             stop=processed_messages.stop,
@@ -1227,6 +1412,35 @@ class OpenAIServingChat(OpenAIServingBase):
         # tags must describe only the post-reasoning tool-call suffix.
         xgrammar_reasoning = thinking_mode and (self.reasoning_parser is None)
         tool_call_constraint = None
+        # Check if decoding constraint module is enabled
+        if self._glm_constraint_module is not None and request.enable_constraint:
+            enable_thinking = self._get_glm_enable_thinking(request)
+
+            # Extract functions from tools (None if no tools)
+            functions = None
+            if request.tools and request.tool_choice != "none":
+                request.skip_special_tokens = False
+                functions = [tool.function for tool in request.tools]
+
+            # Generate EBNF
+            try:
+                ebnf_grammar = self._glm_constraint_module.generation_constraint(
+                    enable_thinking=enable_thinking,
+                    functions=functions,
+                    special_tokens=self._glm_special_token_config,
+                    chat_template_version=self._glm_chat_template_version,
+                    root_name="root",
+                )
+                tool_call_constraint = ("ebnf", ebnf_grammar)
+            except Exception:
+                if not self._ignore_decoding_constraint_exception:
+                    raise
+                import traceback
+
+                logger.error(
+                    "Failed to generate decoding constraint, proceeding without constraint.\n%s",
+                    traceback.format_exc(),
+                )
 
         # Apply chat template and its stop strings
         tools = None
@@ -1243,7 +1457,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 ] or None
             elif request.tools:
                 tools = [item.model_dump() for item in request.tools]
-            if self.tool_call_parser:
+            if self.tool_call_parser and self._glm_constraint_module is None:
                 parser = FunctionCallParser(
                     effective_tools,
                     self.tool_call_parser,
@@ -1259,6 +1473,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tool_call_stop = parser.detector.eot_token
             if (
                 tool_call_constraint is None
+                and self._glm_constraint_module is None
                 and not required_parsed_natively
                 and not (
                     self.chat_encoding_spec == "kimi_k3"
@@ -1696,6 +1911,7 @@ class OpenAIServingChat(OpenAIServingBase):
         completion_tokens = {}
         cached_tokens = {}
         hidden_states = {}
+        output_ids_dict = {}
         routed_experts = {}
         cached_tokens_details = {}
         spec_tokens_details = {}
@@ -1725,6 +1941,12 @@ class OpenAIServingChat(OpenAIServingBase):
                 adapted_request, raw_request
             ):
                 index = content.get("index", 0)
+                if request.return_token_ids:
+                    chunk_ids = content.get("output_ids", [])
+                    if get_serving().incremental_streaming_output:
+                        output_ids_dict.setdefault(index, []).extend(chunk_ids)
+                    else:
+                        output_ids_dict[index] = list(chunk_ids)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
                     content["meta_info"]
@@ -1796,8 +2018,10 @@ class OpenAIServingChat(OpenAIServingBase):
                     # /abort_request or session lifecycle cleanup) falls through
                     # to the normal chunk path, matching the non-stream behavior
                     # in tokenizer_manager._handle_abort_finish_reason.
-                    if finish_reason_type == "abort" and isinstance(
-                        finish_reason.get("status_code"), HTTPStatus
+                    if (
+                        finish_reason_type == "abort"
+                        and not envs.GLM_USE_ABORT_FINISH_REASON.get()
+                        and isinstance(finish_reason.get("status_code"), HTTPStatus)
                     ):
                         code = finish_reason["status_code"]
                         error = self.create_streaming_error_response(
@@ -1986,12 +2210,23 @@ class OpenAIServingChat(OpenAIServingBase):
                     audio_tokens=total_audio_tokens,
                     video_tokens=total_video_tokens,
                 )
+                metadata = None
+                if request.return_token_ids:
+                    metadata = {
+                        "output_ids": [
+                            output_ids_dict.get(i, []) for i in range(request.n)
+                        ]
+                    }
+                    prompt_ids = getattr(request, "_prompt_ids", None)
+                    if prompt_ids is not None and not isinstance(prompt_ids, str):
+                        metadata["input_ids"] = prompt_ids
                 usage_chunk = ChatCompletionStreamResponse(
                     id=content["meta_info"]["id"],
                     created=int(time.time()),
                     choices=[],  # Empty choices array as per OpenAI spec
                     model=request.model,
                     usage=usage,
+                    metadata=metadata,
                 )
                 yield f"data: {usage_chunk.model_dump_json()}\n\n"
 
@@ -2211,13 +2446,26 @@ class OpenAIServingChat(OpenAIServingBase):
             video_tokens=video_tokens,
         )
 
+        metadata = build_endpoint_weight_version_metadata(ret[0]["meta_info"]) or {}
+        if (
+            request.return_constraint
+            and getattr(request, "_constraint_string", None) is not None
+        ):
+            metadata["constraint"] = request._constraint_string
+        if request.return_token_ids:
+            metadata["output_ids"] = [item.get("output_ids", []) for item in ret]
+            prompt_ids = ret[0].get(
+                "prompt_token_ids", getattr(request, "_prompt_ids", None)
+            )
+            if prompt_ids is not None and not isinstance(prompt_ids, str):
+                metadata["input_ids"] = prompt_ids
         return ChatCompletionResponse(
             id=ret[0]["meta_info"]["id"],
             created=created,
             model=request.model,
             choices=choices,
             usage=usage,
-            metadata=build_endpoint_weight_version_metadata(ret[0]["meta_info"]),
+            metadata=metadata,
             sglext=response_sglext,
         )
 
@@ -2316,6 +2564,7 @@ class OpenAIServingChat(OpenAIServingBase):
             detector_owns_format = (
                 parser.detector.supports_structural_tag()
                 or parser.detector.parses_required_natively()
+                or hasattr(parser.detector, "build_ebnf")
             )
             should_try_parser = not is_required or detector_owns_format
             if should_try_parser and parser.has_tool_call(text):
@@ -2488,12 +2737,21 @@ class OpenAIServingChat(OpenAIServingBase):
         Returns:
             The total number of tool calls in the history, or 0 if not applicable.
         """
+        # Called per tool-call chunk while streaming; messages are immutable
+        # for the request's lifetime, so scan them once and memoize.
+        cached = getattr(request, "_history_tool_calls_cnt", None)
+        if cached is not None:
+            return cached
         messages = getattr(request, "messages", [])
         idx = 0
         for msg in messages:
             if msg.role == "assistant":
                 tool_calls = getattr(msg, "tool_calls", None)
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
+        try:
+            request._history_tool_calls_cnt = idx
+        except (AttributeError, ValueError):
+            pass
         return idx
 
     def _patch_reasoning_skip_special_tokens(
@@ -2760,6 +3018,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     use_native_parser = (
                         probe.detector.supports_structural_tag()
                         or probe.detector.parses_required_natively()
+                        or hasattr(probe.detector, "build_ebnf")
                     )
                 if use_native_parser:
                     parser_dict[index] = probe

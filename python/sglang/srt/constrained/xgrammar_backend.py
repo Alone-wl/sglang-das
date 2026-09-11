@@ -16,6 +16,7 @@
 import dataclasses
 import json
 import logging
+import time
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -37,6 +38,7 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
 from sglang.srt.utils.common import is_pin_memory_available
 
@@ -116,6 +118,12 @@ class XGrammarGrammar(BaseGrammarObject):
         return _allocate_token_bitmask(vocab_size, batch_size)
 
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
+        stats = self.grammar_stats
+        if stats is not None and stats.first_mask_fill_time is None:
+            s = time.perf_counter()
+            self.matcher.fill_next_token_bitmask(vocab_mask, idx)
+            stats.first_mask_fill_time = time.perf_counter() - s
+            return
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
     @staticmethod
@@ -149,7 +157,13 @@ class XGrammarGrammar(BaseGrammarObject):
         )
         if grammar_stats := self.grammar_stats:
             grammar_stats = dataclasses.replace(
-                grammar_stats, is_cache_hit=True, tree_traversal_time=[]
+                grammar_stats,
+                is_cache_hit=True,
+                tree_traversal_time=[],
+                first_mask_fill_time=None,
+                compilation_time=None,
+                ebnf_size=None,
+                schema_count=None,
             )
         return XGrammarGrammar(
             matcher,
@@ -236,7 +250,28 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     f"Failed to create XGrammar TokenizerInfo from tokenizer: {e}"
                 )
 
-        self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        limit_mb = envs.GLM_XGRAMMAR_BACKEND_CACHE_MAX_MB.get()
+        cache_limit_bytes = -1 if limit_mb < 0 else limit_mb * 1024 * 1024
+        compiler_kwargs = {}
+        # GLM NOTE: The kwarg only exists in xgrammar >= 0.2.6, so pass it only
+        # when the env opts in; xgrammar disables its internal compile cache
+        # when cache_limit_bytes is bounded in this mode.
+        if envs.GLM_XGRAMMAR_ENABLE_DYNAMIC_COMPILATION.get():
+            import inspect
+
+            if (
+                "enable_dynamic_compilation"
+                not in inspect.signature(GrammarCompiler).parameters
+            ):
+                raise RuntimeError(
+                    "GLM dynamic grammar compilation requires xgrammar >= 0.2.6; main pins 0.2.1"
+                )
+            compiler_kwargs["enable_dynamic_compilation"] = True
+        self.grammar_compiler = GrammarCompiler(
+            tokenizer_info=tokenizer_info,
+            cache_limit_bytes=cache_limit_bytes,
+            **compiler_kwargs,
+        )
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
@@ -354,7 +389,11 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except RuntimeError as e:
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
-        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
+        return self._from_context(
+            ctx,
+            key_string,
+            GrammarStats(dispatch_type="ebnf", ebnf_size=len(key_string)),
+        )
 
     def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         try:
@@ -396,6 +435,12 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         return self._from_context(
             ctx, key_string, GrammarStats(dispatch_type="structural_tag")
         )
+
+    def get_cache_stats(self) -> Tuple[int, int]:
+        entries = len(self.cache.entries)
+        # get_cache_size_bytes only exists in xgrammar >= 0.2.6.
+        get_bytes = getattr(self.grammar_compiler, "get_cache_size_bytes", None)
+        return entries, int(get_bytes()) if get_bytes is not None else 0
 
     def reset(self):
         super().reset()

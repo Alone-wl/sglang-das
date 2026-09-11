@@ -56,6 +56,8 @@ class GenerationBatchResult:
     accept_length_per_req_cpu: Optional[List[int]] = None
     dllm_algo_state: Optional[List[Any]] = None
     can_run_cuda_graph: bool = False
+    pipelined_kv_rids: set[str] = dataclasses.field(default_factory=set)
+    pipelined_kv_finalize_infos: dict = dataclasses.field(default_factory=dict)
 
     # PP skip output comm: True when output send/recv was skipped and
     # next_token_ids are placeholder zeros. Used by process_batch_result_prefill
