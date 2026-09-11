@@ -2502,7 +2502,6 @@ def calculate_mla_kv_cache_dim(
     # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
     if not is_dsa_model:
         from sglang.kernels.ops.attention.utils import get_hcu_mla_fp8_kv_cache_dim
-        from sglang.srt.runtime_context import get_exec
 
         kernel = get_exec().kernel
         return get_hcu_mla_fp8_kv_cache_dim(
