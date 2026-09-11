@@ -897,7 +897,7 @@ class DeepseekSparseAttnBackend(
         indexer_seq_lens_cpu = forward_batch.seq_lens_cpu
         indexer_seq_lens = forward_batch.seq_lens
         use_kpool = self.dsa_index_kpool > 1
-        if use_kpool:
+        if use_kpool and self.real_page_size != 1:
             assert (
                 self.real_page_size == 64
                 and self.real_page_size % self.dsa_index_kpool == 0

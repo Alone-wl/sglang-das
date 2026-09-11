@@ -1417,38 +1417,9 @@ def _attention_backend_dual_chunk(view: Any) -> dict:
 
 
 @register_post_process
-def _dsa_kpool_page_constraints(view: Any) -> dict:
-    dsa_index_kpool = int(getattr(model_config_of(view).hf_config, "index_kpool", 1))
-    if dsa_index_kpool <= 1:
-        return {}
-    if 64 % dsa_index_kpool != 0:
-        raise ValueError(
-            f"DSA index_kpool={dsa_index_kpool} requires a page_size of 64 that is divisible by index_kpool."
-        )
-    if view.page_size not in (None, 64):
-        logger.warning(
-            f"DSA index_kpool={dsa_index_kpool} only supports page_size=64, "
-            f"changing page_size from {view.page_size} to 64."
-        )
-        return {"page_size": 64}
-    return {}
-
-
-@register_post_process
 def _page_size_default(view: Any) -> dict:
     if view.page_size is not None:
         return {}
-
-    dsa_index_kpool = int(getattr(model_config_of(view).hf_config, "index_kpool", 1))
-    if dsa_index_kpool > 1:
-        if 64 % dsa_index_kpool != 0:
-            raise ValueError(
-                f"DSA index_kpool={dsa_index_kpool} requires a page_size of 64 that is divisible by index_kpool."
-            )
-        logger.info(
-            f"Setting page_size=64 as default for DSA index_kpool={dsa_index_kpool}."
-        )
-        return {"page_size": 64}
 
     # SHUFFLE 5D vectorized KV layout (aiter backend + pa_decode_gluon)
     # is tuned for and prefers page_size=64 — making it the default
