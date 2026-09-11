@@ -24,6 +24,8 @@
 #include <cuda_runtime.h>
 #endif
 
+namespace sglang {
+
 struct KPoolWritePlanMultiDecodeParams {
   const int32_t* __restrict__ write_start;
   const int64_t* __restrict__ req_pool_indices;
@@ -279,3 +281,5 @@ struct KPoolWritePlanMultiDecodeKernel {
 };
 
 }  // namespace
+
+}  // namespace sglang

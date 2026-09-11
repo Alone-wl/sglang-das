@@ -32,7 +32,7 @@ def _jit_kpool_write_plan_module(num_draft_tokens: int, has_per_q: bool):
             cuda_wrappers=[
                 (
                     "kpool_write_plan",
-                    f"KPoolWritePlanKernel<{args}>::run",
+                    f"sglang::KPoolWritePlanKernel<{args}>::run",
                 )
             ],
         )
@@ -56,7 +56,7 @@ def _jit_kpool_write_plan_multi_decode_module():
             cuda_wrappers=[
                 (
                     "kpool_write_plan_multi_decode",
-                    "KPoolWritePlanMultiDecodeKernel::run",
+                    "sglang::KPoolWritePlanMultiDecodeKernel::run",
                 )
             ],
         )
