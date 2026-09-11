@@ -118,16 +118,14 @@ class Glm5NextCPLayerCommunicator(LayerCommunicator):
         allow_reduce_scatter: bool = False,
         is_last_layer: bool = False,
         qkv_latent_func: Optional[Callable] = None,
-        layer_id: int = -1,
     ):
         super().__init__(
-            layer_scatter_modes,
-            input_layernorm,
-            post_attention_layernorm,
-            allow_reduce_scatter,
-            is_last_layer,
-            qkv_latent_func,
-            layer_id,
+            layer_scatter_modes=layer_scatter_modes,
+            input_layernorm=input_layernorm,
+            post_attention_layernorm=post_attention_layernorm,
+            allow_reduce_scatter=allow_reduce_scatter,
+            is_last_layer=is_last_layer,
+            qkv_latent_func=qkv_latent_func,
         )
 
     def _post_init_communicate(self):

@@ -713,7 +713,6 @@ class ModelNextDecoderLayer(nn.Module):
             qkv_latent_func=(
                 self.self_attn.prepare_qkv_latent if not self.is_linear_attn else None
             ),
-            layer_id=self.layer_id,
         )
 
         if self.config.mhc and self.nsa_enable_prefill_cp:
