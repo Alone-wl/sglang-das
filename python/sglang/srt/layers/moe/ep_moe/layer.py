@@ -126,12 +126,17 @@ from deepgemm.m_group_gemm import grouped_gemm_w4a16_nt_masked_entry
 from lightop import moe as lightop_op
 from lightop.activation import (
     fuse_silu_and_mul,
-    fuse_silu_mul_clamp_quant,
     fuse_silu_mul_fp8_quant,
     fuse_silu_mul_fp8_quant_ep,
     fuse_silu_mul_quant,
     fuse_silu_mul_quant_ep,
 )
+
+try:
+    from lightop.activation import fuse_silu_mul_clamp_quant
+except ImportError:
+    # HCU wheels can expose this operator only from the package root.
+    from lightop import fuse_silu_mul_clamp_quant
 
 _is_hip = is_hip()
 _is_npu = is_npu()
