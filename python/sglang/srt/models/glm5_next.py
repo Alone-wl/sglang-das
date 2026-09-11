@@ -80,7 +80,6 @@ from sglang.srt.layers.utils.common import PPMissingLayer
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_position,
-    prepare_context_parallel_metadata,
 )
 from sglang.srt.layers.utils.glm5_next_cp import (
     cp_plain_all_gather,
@@ -88,6 +87,7 @@ from sglang.srt.layers.utils.glm5_next_cp import (
     cp_plain_split,
     cp_plain_to_scattered,
     cp_scattered_to_plain,
+    prepare_glm5_next_context_parallel_metadata,
 )
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -98,6 +98,11 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
 )
 from sglang.srt.managers.schedule_batch import MultimodalInputs
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    Phase,
+    check_cuda_graph_backend,
+)
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     PPProxyTensors,
@@ -1253,7 +1258,7 @@ class ModelNextModel(nn.Module):
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
                 nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                 else get_global_expert_distribution_recorder().with_current_layer(i)
             )
             with ctx:
@@ -1419,11 +1424,13 @@ class ModelNextForCausalLM(nn.Module):
     ) -> torch.Tensor:
         if self.nsa_enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, self.use_dsa, forward_batch):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
+                forward_batch.attn_cp_metadata = (
+                    prepare_glm5_next_context_parallel_metadata(
+                        len(input_ids),
+                        self.cp_rank,
+                        self.cp_size,
+                        forward_batch,
+                    )
                 )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):
@@ -1461,11 +1468,13 @@ class ModelNextForCausalLM(nn.Module):
             if self.nsa_enable_prefill_cp and can_cp_split(
                 len(input_ids), self.cp_size, self.use_dsa, forward_batch
             ):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
+                forward_batch.attn_cp_metadata = (
+                    prepare_glm5_next_context_parallel_metadata(
+                        len(input_ids),
+                        self.cp_rank,
+                        self.cp_size,
+                        forward_batch,
+                    )
                 )
 
             with get_attn_tp_context().maybe_input_scattered(forward_batch):
@@ -1523,7 +1532,7 @@ class ModelNextForCausalLM(nn.Module):
             for i in range(start, end):
                 ctx = (
                     nullcontext()
-                    if not get_global_server_args().disable_piecewise_cuda_graph
+                    if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
                     else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
@@ -1974,11 +1983,13 @@ class Glm5NextForConditionalGeneration(GlmVisualEncoderMixin, ModelNextForCausal
 
         if self.nsa_enable_prefill_cp:
             if can_cp_split(len(input_ids), self.cp_size, self.use_dsa, forward_batch):
-                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
-                    len(input_ids),
-                    self.cp_rank,
-                    self.cp_size,
-                    forward_batch.seq_lens_cpu.tolist(),
+                forward_batch.attn_cp_metadata = (
+                    prepare_glm5_next_context_parallel_metadata(
+                        len(input_ids),
+                        self.cp_rank,
+                        self.cp_size,
+                        forward_batch,
+                    )
                 )
 
         with get_attn_tp_context().maybe_input_scattered(forward_batch):

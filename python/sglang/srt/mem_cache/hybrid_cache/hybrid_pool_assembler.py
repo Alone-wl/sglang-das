@@ -844,18 +844,17 @@ def build_hybrid_mamba_stack(
             target_device_layer_num=kv_pool.layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
-    # MambaPoolHost only supports page_first/page_first_direct/layer_first.
-    # layout_hcu is KV-only (MHATokenToKVPoolHostHCU); fall back for mamba state.
+    # Mamba state uses page-first storage independently of HCU KV/index layout.
     mamba_layout = get_memory().hicache_mem_layout
-    if mamba_layout == "layout_hcu":
+    if mamba_layout == "layout_hcu" or (
+        mamba_layout == "layer_first" and is_hcu_glm_pool(kv_pool)
+    ):
         mamba_layout = "page_first"
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,
         allocator_type=_get_allocator_type(),
-        # mamba_layout maps HCU's layout_hcu onto page_first; the raw
-        # hicache_mem_layout would hand layout_hcu to the mamba pool.
         layout=mamba_layout,
     )
     entries = [

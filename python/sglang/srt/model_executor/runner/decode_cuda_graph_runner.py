@@ -273,9 +273,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             get_dsa_index_topk,
             is_deepseek_dsa,
         )
+        from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
 
         hf_config = model_runner.model_config.hf_config
-        if is_hip() and is_deepseek_dsa(hf_config):
+        # HCU GLM-Next uses its own indexer and one metadata buffer per batch
+        # size; it does not implement the AMD indexer's dense/sparse variants.
+        if is_hip() and is_deepseek_dsa(hf_config) and not is_glm5_next_hcu(hf_config):
             self.dsa_index_topk = get_dsa_index_topk(hf_config)
             self.dsa_dual_graph = True
             logger.info(

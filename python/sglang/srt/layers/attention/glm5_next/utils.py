@@ -5,6 +5,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.configs.model_config import get_dsa_index_kpool
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.glm5_next.runtime import (
     get_glm5_next_runtime_args as get_global_server_args,
@@ -32,9 +33,9 @@ def should_remap_pd_dsa_seed_to_local_slots(
     """
     from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
 
+    hf_config = getattr(model_config, "hf_config", None)
     hcu_glm5_no_kpool = (
-        is_glm5_next_hcu(getattr(model_config, "hf_config", None))
-        and getattr(model_config, "dsa_index_kpool", 1) <= 1
+        is_glm5_next_hcu(hf_config) and get_dsa_index_kpool(hf_config) <= 1
     )
     return (
         (is_cuda() or is_hcu())
@@ -208,7 +209,8 @@ def effective_forward_mode(forward_batch: "ForwardBatch"):
     ``query_start_loc`` / ``extend_seq_lens``.
     """
 
-    return getattr(forward_batch, "_original_forward_mode", forward_batch.forward_mode)
+    original_mode = forward_batch._original_forward_mode
+    return original_mode if original_mode is not None else forward_batch.forward_mode
 
 
 # Legacy alias kept for existing internal call sites.

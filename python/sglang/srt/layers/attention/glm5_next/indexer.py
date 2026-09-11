@@ -761,9 +761,7 @@ class Indexer(MultiPlatformOp):
 
         blocksize = page_size
         forward_mode = effective_forward_mode(forward_batch)
-        if forward_mode.is_target_verify() or forward_mode.is_draft_extend(
-            include_v2=True
-        ):
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             seqlens_32 = metadata.get_seqlens_expanded()
         else:
             seqlens_32 = metadata.get_seqlens_int32()
@@ -1895,7 +1893,7 @@ class Indexer(MultiPlatformOp):
             if (
                 forward_mode.is_decode_or_idle()
                 or forward_mode.is_target_verify()
-                or forward_mode.is_draft_extend(include_v2=True)
+                or forward_mode.is_draft_extend_v2()
             ):
                 topk_result = self._get_topk_paged(
                     forward_batch, layer_id, q_index, weights, metadata
@@ -1980,7 +1978,6 @@ class Indexer(MultiPlatformOp):
             forward_batch.forward_mode.is_extend()
             and not forward_batch.forward_mode.is_draft_extend_v2()
             and not forward_batch.forward_mode.is_target_verify()
-            and not forward_batch.forward_mode.is_draft_extend()
         )
 
         bs = q_lora.shape[0]
@@ -2167,7 +2164,6 @@ class Indexer(MultiPlatformOp):
                 if (
                     forward_batch.forward_mode.is_draft_extend_v2()
                     or forward_batch.forward_mode.is_target_verify()
-                    or forward_batch.forward_mode.is_draft_extend()
                 ):
                     num_draft_tokens = get_attn_backend().speculative_num_draft_tokens
                     actual_seq_lengths_q = torch.arange(

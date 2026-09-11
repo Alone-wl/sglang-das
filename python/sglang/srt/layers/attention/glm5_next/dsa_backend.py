@@ -15,6 +15,7 @@ from sglang.kernels.ops.attention.utils import (
     seqlens_expand_triton,
 )
 from sglang.srt.configs.model_config import (
+    get_dsa_index_kpool,
     get_dsa_index_topk,
     is_deepseek_dsa,
 )
@@ -453,7 +454,7 @@ class NativeSparseAttnBackend(
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
         self.dsa_index_topk = get_dsa_index_topk(model_runner.model_config.hf_config)
-        self.dsa_index_kpool = model_runner.model_config.dsa_index_kpool
+        self.dsa_index_kpool = get_dsa_index_kpool(model_runner.model_config.hf_config)
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -744,7 +745,7 @@ class NativeSparseAttnBackend(
                 write_start=(forward_batch.seq_lens - 1).to(torch.int32),
             )
             return metadata
-        if mode.is_extend_without_speculative() or mode.is_draft_extend():
+        if mode.is_extend_without_speculative():
             return _init_kpool_extend_metadata_impl(
                 metadata,
                 forward_batch,
@@ -835,7 +836,7 @@ class NativeSparseAttnBackend(
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                or forward_batch.forward_mode.is_draft_extend_v2()
             )
             else self.dsa_prefill_impl
         )
@@ -886,7 +887,7 @@ class NativeSparseAttnBackend(
                 dim=0,
                 output_size=batch_size * self.speculative_num_draft_tokens,
             )
-        elif forward_batch.forward_mode.is_draft_extend(include_v2=True):
+        elif forward_batch.forward_mode.is_draft_extend_v2():
             assert (
                 forward_batch.extend_seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens is not None
@@ -911,26 +912,15 @@ class NativeSparseAttnBackend(
                 sum(extend_seq_lens_cpu),
                 self.speculative_num_draft_tokens,
             )
-            if forward_batch.forward_mode.is_draft_extend_v2():
-                # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
-                # tokens upfront. All requests extend by the same fixed
-                # (speculative_num_draft_tokens). Use scalar to avoid GPU sync.
-                page_table = torch.repeat_interleave(
-                    page_table,
-                    repeats=self.speculative_num_draft_tokens,
-                    dim=0,
-                    output_size=batch_size * self.speculative_num_draft_tokens,
-                )
-            else:
-                # DRAFT_EXTEND (v1): V1 worker extends by (num_correct_drafts + 1) per request
-                # after verification. Lengths vary per request based on how many tokens
-                # were accepted.
-                page_table = torch.repeat_interleave(
-                    page_table,
-                    repeats=forward_batch.extend_seq_lens,
-                    dim=0,
-                    output_size=sum(extend_seq_lens_cpu),
-                )
+            # DRAFT_EXTEND_V2: V2 worker pre-fills draft KV cache with ALL speculated
+            # tokens upfront. All requests extend by the same fixed
+            # (speculative_num_draft_tokens). Use scalar to avoid GPU sync.
+            page_table = torch.repeat_interleave(
+                page_table,
+                repeats=self.speculative_num_draft_tokens,
+                dim=0,
+                output_size=batch_size * self.speculative_num_draft_tokens,
+            )
 
             if use_kpool:
                 kpool_inputs.full_real_page_table = self._transform_table_1_to_real(
@@ -997,11 +987,7 @@ class NativeSparseAttnBackend(
                         local_req_pool_indices=forward_batch.req_pool_indices[bs_idx],
                     )
 
-            if (
-                any(forward_batch.extend_prefix_lens_cpu)
-                or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
-                or bs_idx_cpu is not None
-            ):
+            if any(forward_batch.extend_prefix_lens_cpu) or bs_idx_cpu is not None:
                 max_seqlen_q = (
                     max(extend_seq_lens_cpu) if len(extend_seq_lens_cpu) != 0 else 1
                 )
@@ -1090,7 +1076,7 @@ class NativeSparseAttnBackend(
         if (is_cuda() or _is_hcu) and (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         ):
             deep_gemm = _get_deep_gemm()
             if deep_gemm is not None:
@@ -1099,7 +1085,7 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_batch.forward_mode.is_target_verify()
-                        or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+                        or forward_batch.forward_mode.is_draft_extend_v2()
                     )
                     else cache_seqlens_int32
                 )
@@ -1291,7 +1277,46 @@ class NativeSparseAttnBackend(
         elif self._lightop_decode_graph_workspaces[0].shape[0] < max_num_tokens:
             raise RuntimeError("LightOp decode CUDA graph workspace cannot grow")
 
-    def init_forward_metadata_capture_cuda_graph(
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        if in_capture:
+            # The EAGLE draft capture batch has no input_ids until draft_forward.
+            num_tokens = (
+                forward_batch.batch_size * (self.topk or 1)
+                if forward_batch.forward_mode.is_decode_or_idle()
+                else forward_batch.input_ids.numel()
+            )
+            self._capture_cuda_graph_metadata(
+                bs=forward_batch.batch_size,
+                num_tokens=num_tokens,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                encoder_lens=forward_batch.encoder_lens,
+                forward_mode=forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+            )
+        else:
+            self._replay_cuda_graph_metadata(
+                bs=forward_batch.batch_size,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                seq_lens_sum=forward_batch.seq_lens_sum,
+                encoder_lens=forward_batch.encoder_lens,
+                forward_mode=forward_batch.forward_mode,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+                out_cache_loc=forward_batch.out_cache_loc,
+                actual_forward_mode=getattr(forward_batch, "actual_forward_mode", None),
+            )
+
+    def update_verify_buffers_to_fill_after_draft(
+        self, spec_info: SpecInput, cuda_graph_bs: Optional[int]
+    ):
+        # Like main's DSA backend, this backend has no tree-mask buffers to fix up.
+        return None
+
+    def _capture_cuda_graph_metadata(
         self,
         bs: int,
         num_tokens: int,
@@ -1354,9 +1379,7 @@ class NativeSparseAttnBackend(
                 )
             else:
                 flashmla_metadata = None
-        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend(
-            include_v2=True
-        ):
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             cache_seqlens_int32 = (seq_lens + self.speculative_num_draft_tokens).to(
                 torch.int32
             )
@@ -1439,7 +1462,7 @@ class NativeSparseAttnBackend(
         if (is_cuda() or _is_hcu) and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend(include_v2=True)
+            or forward_mode.is_draft_extend_v2()
         ):
             deep_gemm = _get_deep_gemm()
             if deep_gemm is not None:
@@ -1447,7 +1470,7 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend(include_v2=True)
+                        or forward_mode.is_draft_extend_v2()
                     )
                     else cache_seqlens_int32
                 )
@@ -1517,7 +1540,7 @@ class NativeSparseAttnBackend(
         self.decode_cuda_graph_metadata[bs] = metadata
         self.forward_metadata = metadata
 
-    def init_forward_metadata_replay_cuda_graph(
+    def _replay_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
@@ -1597,7 +1620,7 @@ class NativeSparseAttnBackend(
                 index_kpool=self.dsa_index_kpool,
             )
             metadata.dsa_cache_seqlens_int32.copy_(dsa_cache_seqlens)
-        elif forward_mode.is_draft_extend(include_v2=True):
+        elif forward_mode.is_draft_extend_v2():
             assert seq_lens_cpu is not None
             max_seqlen_k = int(seq_lens_cpu.max().item())
             cache_seqlens = seq_lens.to(torch.int32)
@@ -1609,23 +1632,13 @@ class NativeSparseAttnBackend(
             page_indices = self.req_to_token[req_pool_indices, :max_seqlen_k]
 
             extend_seq_lens = spec_info.num_accept_tokens[:bs]
-            if forward_mode.is_draft_extend_v2():
-                extend_num_tokens = bs * self.speculative_num_draft_tokens
-                page_indices = torch.repeat_interleave(
-                    page_indices,
-                    repeats=self.speculative_num_draft_tokens,
-                    dim=0,
-                    output_size=extend_num_tokens,
-                )
-            else:
-                extend_seq_lens_cpu = extend_seq_lens.tolist()
-                extend_num_tokens = sum(extend_seq_lens_cpu)
-                page_indices = torch.repeat_interleave(
-                    page_indices,
-                    repeats=extend_seq_lens,
-                    dim=0,
-                    output_size=extend_num_tokens,
-                )
+            extend_num_tokens = bs * self.speculative_num_draft_tokens
+            page_indices = torch.repeat_interleave(
+                page_indices,
+                repeats=self.speculative_num_draft_tokens,
+                dim=0,
+                output_size=extend_num_tokens,
+            )
             metadata.page_table_1[: page_indices.shape[0], :max_seqlen_k].copy_(
                 page_indices
             )
@@ -1661,7 +1674,7 @@ class NativeSparseAttnBackend(
         if (is_cuda() or _is_hcu) and (
             forward_mode.is_decode_or_idle()
             or forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend(include_v2=True)
+            or forward_mode.is_draft_extend_v2()
         ):
             deep_gemm = _get_deep_gemm()
             if deep_gemm is not None:
@@ -1669,7 +1682,7 @@ class NativeSparseAttnBackend(
                     seqlens_expanded
                     if (
                         forward_mode.is_target_verify()
-                        or forward_mode.is_draft_extend(include_v2=True)
+                        or forward_mode.is_draft_extend_v2()
                     )
                     else metadata.cache_seqlens_int32
                 )
@@ -1798,8 +1811,6 @@ class NativeSparseAttnBackend(
                     mode_int = 0  # DECODE
                 elif forward_mode.is_target_verify():
                     mode_int = 1  # TARGET_VERIFY
-                elif forward_mode.is_draft_extend():
-                    mode_int = 2  # DRAFT_EXTEND
                 else:
                     raise ValueError(f"Unsupported forward_mode: {forward_mode}")
 
@@ -1884,18 +1895,6 @@ class NativeSparseAttnBackend(
                 )
                 metadata.dsa_seqlens_expanded.copy_(precomputed.seqlens_expanded)
                 metadata.dsa_cache_seqlens_int32.copy_(precomputed.dsa_cache_seqlens)
-
-            elif forward_mode.is_draft_extend():
-                # Draft extend mode
-                rows = precomputed.page_indices.shape[0]
-                cols = precomputed.max_seqlen_k
-                metadata.page_table_1[:rows, :cols].copy_(precomputed.page_indices)
-
-                size = precomputed.seqlens_expanded_size
-                metadata.dsa_seqlens_expanded[:size].copy_(precomputed.seqlens_expanded)
-                metadata.dsa_cache_seqlens_int32[:size].copy_(
-                    precomputed.dsa_cache_seqlens
-                )
 
             # Copy DSA cu_seqlens
             size = precomputed.seqlens_expanded_size
@@ -2008,7 +2007,7 @@ class NativeSparseAttnBackend(
             if (
                 forward_mode.is_decode_or_idle()
                 or forward_mode.is_target_verify()
-                or forward_mode.is_draft_extend(include_v2=True)
+                or forward_mode.is_draft_extend_v2()
             )
             else self.dsa_prefill_impl
         )
@@ -2636,7 +2635,7 @@ class NativeSparseAttnBackend(
         is_decode_family = (
             forward_batch.forward_mode.is_decode_or_idle()
             or forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend(include_v2=True)
+            or forward_batch.forward_mode.is_draft_extend_v2()
         )
         # MLATokenToKVPool stores the packed cache as uint8 but exposes it as
         # the configured FP8 dtype.  LightOp consumes the packed bytes (rather
@@ -3432,9 +3431,7 @@ class NativeSparseAttnBackend(
         extend_seq_lens_cpu: List[int],
         page_table_rows: int,
     ) -> List[int]:
-        if forward_mode.is_target_verify() or forward_mode.is_draft_extend(
-            include_v2=True
-        ):
+        if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             expanded_rows = sum(extend_seq_lens_cpu)
             assert expanded_rows == page_table_rows, (
                 "Speculative page-table rows must equal the expanded request "
@@ -3547,7 +3544,7 @@ class NativeSparseAttnBackend(
             and (
                 forward_mode.is_decode_or_idle()
                 or forward_mode.is_target_verify()
-                or forward_mode.is_draft_extend(include_v2=True)
+                or forward_mode.is_draft_extend_v2()
             )
         )
 
@@ -3632,38 +3629,25 @@ class NativeSparseAttnMultiStepBackend:
     def get_cuda_graph_seq_len_fill_value(self):
         return self.attn_backends[0].get_cuda_graph_seq_len_fill_value()
 
-    def init_forward_metadata_capture_cuda_graph(self, *args, **kwargs):
-        if args and isinstance(args[0], ForwardBatch):
-            forward_batch = args[0]
-            for i in range(self.speculative_num_steps - 1):
-                self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                    forward_batch.batch_size,
-                    forward_batch.batch_size * self.topk,
-                    forward_batch.req_pool_indices,
-                    forward_batch.seq_lens,
-                    encoder_lens=None,
-                    forward_mode=ForwardMode.DECODE,
-                    spec_info=forward_batch.spec_info,
-                )
-            return
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        if in_capture:
+            from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
-        for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                *args,
-                **kwargs,
+            inner_fb = build_inner_fb_view(
+                forward_batch,
+                bs=forward_batch.batch_size,
+                forward_mode=ForwardMode.DECODE,
             )
+            for backend in self.attn_backends:
+                backend.init_forward_metadata_out_graph(inner_fb, in_capture=True)
+        else:
+            self._init_decode_replay_cuda_graph(forward_batch, forward_batch.batch_size)
 
-    def init_forward_metadata_replay_cuda_graph(self, *args, **kwargs):
-        if args and isinstance(args[0], ForwardBatch):
-            forward_batch = args[0]
-            bs = args[1] if len(args) > 1 else kwargs["bs"]
-            return self._init_decode_replay_cuda_graph(forward_batch, bs)
-
-        for i in range(self.speculative_num_steps - 1):
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                *args,
-                **kwargs,
-            )
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        for backend in self.attn_backends:
+            backend.init_forward_metadata_in_graph(forward_batch)
 
     def _init_decode_replay_cuda_graph(self, forward_batch: ForwardBatch, bs: int):
         if envs.SGLANG_DSA_ENABLE_MTP_PRECOMPUTE_METADATA.get():
@@ -3895,7 +3879,7 @@ class NativeSparseAttnMultiStepBackend:
         else:
             # Fallback: compute metadata separately for each backend
             for i in range(self.speculative_num_steps - 1):
-                self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
+                self.attn_backends[i]._replay_cuda_graph_metadata(
                     bs=bs,
                     req_pool_indices=forward_batch.req_pool_indices,
                     seq_lens=forward_batch.seq_lens,

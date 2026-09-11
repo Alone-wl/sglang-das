@@ -789,13 +789,11 @@ def init_kpool_extend_metadata(
         counts so topk runs on this rank's q slice without a q all_gather.
 
     Returns input unchanged when the gate fails: extend-like mode
-    (extend / draft_extend v1/v2), valid seq lens, and the shared
+    (extend / draft_extend v2), valid seq lens, and the shared
     kpool layout (see ``_is_kpool_layout_enabled``).
     """
     mode = forward_batch.forward_mode
-    is_extend_like = mode.is_extend_without_speculative() or mode.is_draft_extend(
-        include_v2=True
-    )
+    is_extend_like = mode.is_extend_without_speculative() or mode.is_draft_extend_v2()
     if (
         not _is_kpool_layout_enabled(pool_size, real_page_size)
         or not is_extend_like

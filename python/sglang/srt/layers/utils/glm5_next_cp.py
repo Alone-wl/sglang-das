@@ -13,8 +13,35 @@ from sglang.srt.layers.dp_attention import (
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
+    prepare_context_parallel_metadata,
 )
 from sglang.srt.runtime_context import get_parallel
+
+
+def prepare_glm5_next_context_parallel_metadata(
+    kv_len, cp_rank, cp_size, forward_batch
+):
+    from sglang.srt.layers.attention.dsa.utils import (
+        is_dsa_prefill_cp_round_robin_split,
+    )
+
+    metadata = prepare_context_parallel_metadata(
+        kv_len,
+        cp_rank,
+        cp_size,
+        forward_batch.seq_lens_cpu.tolist(),
+        extend_seqs_len=forward_batch.extend_seq_lens_cpu,
+        device=forward_batch.input_ids.device,
+    )
+    if is_dsa_prefill_cp_round_robin_split():
+        # GLM-Next converts between plain KDA shards and round-robin NSA
+        # shards. Its gathers need the padded input length and shard sizes,
+        # which main's round-robin metadata no longer populates.
+        total_len = int(kv_len)
+        metadata.max_rank_len = [(total_len + cp_size - 1) // cp_size] * cp_size
+        metadata.per_rank_actual_token = _plain_cp_chunk_sizes(total_len, cp_size)
+        metadata.total_seq_lens = total_len
+    return metadata
 
 
 def _cp_size(cp_size: Optional[int] = None) -> int:

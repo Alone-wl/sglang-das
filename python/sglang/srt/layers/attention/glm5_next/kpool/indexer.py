@@ -1012,10 +1012,7 @@ class IndexerKPool(Indexer):
         """
 
         forward_mode = effective_forward_mode(forward_batch)
-        assert (
-            forward_mode.is_extend_without_speculative()
-            or forward_mode.is_draft_extend()
-        )
+        assert forward_mode.is_extend_without_speculative()
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
 
@@ -1694,7 +1691,6 @@ class IndexerKPool(Indexer):
         is_decode = mode.is_decode_or_idle()
         is_target_verify = mode.is_target_verify()
         is_draft_extend_v2 = mode.is_draft_extend_v2()
-        is_draft_extend_v1 = mode.is_draft_extend() and not is_draft_extend_v2
 
         enable_dual_stream = (
             self.alt_stream is not None
@@ -1706,8 +1702,6 @@ class IndexerKPool(Indexer):
         # target_verify and draft_extend_v2 share the same KPoolWritePlan
         # path: fixed q_len = N per batch, identical tail-ring + close-pool
         # write semantics, identical paged topk shape ``[B*N, ...]``.
-        # v1 draft_extend still has variable q_len = accept_length+1 and
-        # falls through to the extend planner below.
         if is_target_verify or is_draft_extend_v2:
             return self._forward_cuda_target_verify(
                 x=x,
@@ -1758,9 +1752,7 @@ class IndexerKPool(Indexer):
 
         if is_decode:
             compress_fn = self._compress_write_decode
-        elif is_extend or is_draft_extend_v1:
-            # v1 draft_extend: variable q_len = accept_length+1; goes through
-            # the extend planner like a short prefill.
+        elif is_extend:
             compress_fn = self._compress_write_extend
         else:
             raise NotImplementedError(
@@ -1803,7 +1795,7 @@ class IndexerKPool(Indexer):
                 layer_id=layer_id,
                 metadata=metadata,
             )
-            if is_hcu() and (is_extend or is_draft_extend_v1):
+            if is_hcu() and is_extend:
                 q_index, weights = self._prepare_hcu_prefill_q_and_logits_head_gate(
                     query, x
                 )
@@ -1813,16 +1805,12 @@ class IndexerKPool(Indexer):
 
         # K-only fast path (extend only): caller wants the cache
         # populated but not the topk indices.
-        if (is_extend or is_draft_extend_v1) and not return_indices:
+        if is_extend and not return_indices:
             return None
 
         # Topk dispatch:
         #   decode               -> paged kernel
-        #   draft_extend v1      -> ragged extend-plan kernel; v1 has
-        #                           variable accept_length+1 rows per request,
-        #                           and the kpool planner already builds the
-        #                           matching per-q pooled-K layout. v2 already
-        #                           returned above via the verify path.
+        #   draft_extend v2      -> already returned above via the verify path
         #   prefill (in-seq-split CP) -> ragged_with_cp on prev/next halves
         #   prefill (otherwise)  -> ragged kernel; CP round-robin-split runs
         #                           rank-local because the planner already
@@ -1830,16 +1818,6 @@ class IndexerKPool(Indexer):
         if is_decode:
             return self._get_topk_paged(
                 forward_batch, layer_id, q_index, weights, metadata
-            )
-
-        if is_draft_extend_v1:
-            return self._get_topk_ragged(
-                enable_dual_stream,
-                forward_batch,
-                layer_id,
-                q_index,
-                weights,
-                metadata,
             )
 
         if (

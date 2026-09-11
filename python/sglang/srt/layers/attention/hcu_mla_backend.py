@@ -290,7 +290,6 @@ class HCUMLABackend(AttentionBackend):
         elif (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
-            or forward_batch.forward_mode.is_draft_extend()
         ):
             seq_lens_cpu = forward_batch.seq_lens_cpu + self.num_draft_tokens
             seq_lens = forward_batch.seq_lens + self.num_draft_tokens
@@ -461,10 +460,54 @@ class HCUMLABackend(AttentionBackend):
         self.cuda_graph_num_splits = num_splits
         self.cuda_graph_kv_indices = cuda_graph_kv_indices
 
-    def init_forward_metadata_capture_cuda_graph(
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
+    ):
+        mode = forward_batch.forward_mode
+        if not (
+            mode.is_decode_or_idle()
+            or mode.is_target_verify()
+            or mode.is_draft_extend_v2()
+        ):
+            if not self.skip_prefill:
+                self.flashattn_backend.init_forward_metadata_out_graph(
+                    forward_batch, in_capture=in_capture
+                )
+            return
+
+        if in_capture:
+            self._capture_cuda_graph_metadata(
+                bs=forward_batch.batch_size,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                encoder_lens=forward_batch.encoder_lens,
+                forward_mode=mode,
+                spec_info=forward_batch.spec_info,
+            )
+        else:
+            self._replay_cuda_graph_metadata(
+                bs=forward_batch.batch_size,
+                req_pool_indices=forward_batch.req_pool_indices,
+                seq_lens=forward_batch.seq_lens,
+                seq_lens_sum=forward_batch.seq_lens_sum,
+                encoder_lens=forward_batch.encoder_lens,
+                forward_mode=mode,
+                spec_info=forward_batch.spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
+            )
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        mode = forward_batch.forward_mode
+        if not self.skip_prefill and not (
+            mode.is_decode_or_idle()
+            or mode.is_target_verify()
+            or mode.is_draft_extend_v2()
+        ):
+            self.flashattn_backend.init_forward_metadata_in_graph(forward_batch)
+
+    def _capture_cuda_graph_metadata(
         self,
         bs: int,
-        num_tokens: int,
         req_pool_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         encoder_lens: Optional[torch.Tensor],
@@ -521,11 +564,7 @@ class HCUMLABackend(AttentionBackend):
                 self.cuda_graph_num_splits[: bs + 1],
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
-        elif (
-            forward_mode.is_target_verify()
-            or forward_mode.is_draft_extend_v2()
-            or forward_mode.is_draft_extend()
-        ):
+        elif forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             seq_lens = seq_lens + self.num_draft_tokens
             max_seqlen_pad = triton.cdiv(seq_lens.max().item(), PAGE_SIZE)
 
@@ -570,19 +609,8 @@ class HCUMLABackend(AttentionBackend):
                 self.cuda_graph_num_splits[: bs + 1],
                 self.cuda_graph_kv_indices[:bs, :max_seqlen_pad],
             )
-        else:
-            if not self.skip_prefill:
-                self.flashattn_backend.init_forward_metadata_capture_cuda_graph(
-                    bs,
-                    num_tokens,
-                    req_pool_indices,
-                    seq_lens,
-                    encoder_lens,
-                    forward_mode,
-                    spec_info,
-                )
 
-    def init_forward_metadata_replay_cuda_graph(
+    def _replay_cuda_graph_metadata(
         self,
         bs: int,
         req_pool_indices: torch.Tensor,
@@ -692,18 +720,6 @@ class HCUMLABackend(AttentionBackend):
             self.forward_metadata.block_kv_indices = self.cuda_graph_kv_indices[
                 :bs, :max_seqlen_pad
             ]
-        else:
-            if not self.skip_prefill:
-                self.flashattn_backend.init_forward_metadata_replay_cuda_graph(
-                    bs,
-                    req_pool_indices,
-                    seq_lens,
-                    seq_lens_sum,
-                    encoder_lens,
-                    forward_mode,
-                    spec_info,
-                    seq_lens_cpu,
-                )
 
     def get_cuda_graph_seq_len_fill_value(self):
         return 1
@@ -928,10 +944,7 @@ class HCUMLABackend(AttentionBackend):
         q_rope: Optional[torch.Tensor] = None,
         k_rope: Optional[torch.Tensor] = None,
     ):
-        if (
-            forward_batch.forward_mode == ForwardMode.EXTEND
-            or forward_batch.forward_mode == ForwardMode.DRAFT_EXTEND
-        ):
+        if forward_batch.forward_mode == ForwardMode.EXTEND:
             if not self.skip_prefill:
                 return self.flashattn_backend.forward_extend(
                     q,
@@ -1072,33 +1085,19 @@ class HCUMLAMultiStepDraftBackend:
                 max_bs, max_num_tokens, block_kv_indices=None
             )
 
-    def init_forward_metadata_capture_cuda_graph(self, forward_batch: ForwardBatch):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_capture_cuda_graph(
-                forward_batch.batch_size,
-                forward_batch.batch_size * self.topk,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-            )
-
-        self.common_template(forward_batch, call_fn)
-
-    def init_forward_metadata_replay_cuda_graph(
-        self, forward_batch: ForwardBatch, bs: int
+    def init_forward_metadata_out_graph(
+        self, forward_batch: ForwardBatch, in_capture: bool = False
     ):
-        def call_fn(i, forward_batch):
-            self.attn_backends[i].init_forward_metadata_replay_cuda_graph(
-                bs,
-                forward_batch.req_pool_indices,
-                forward_batch.seq_lens,
-                seq_lens_sum=-1,
-                encoder_lens=None,
-                forward_mode=ForwardMode.DECODE,
-                spec_info=forward_batch.spec_info,
-                seq_lens_cpu=forward_batch.seq_lens_cpu,
-            )
+        from sglang.srt.model_executor.forward_batch_info import build_inner_fb_view
 
-        self.common_template(forward_batch, call_fn)
+        inner_fb = build_inner_fb_view(
+            forward_batch,
+            bs=forward_batch.batch_size,
+            forward_mode=ForwardMode.DECODE,
+        )
+        for backend in self.attn_backends:
+            backend.init_forward_metadata_out_graph(inner_fb, in_capture=in_capture)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        for backend in self.attn_backends:
+            backend.init_forward_metadata_in_graph(forward_batch)
