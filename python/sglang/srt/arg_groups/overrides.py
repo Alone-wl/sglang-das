@@ -764,10 +764,31 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         )
         return declared
 
-    if not user_set_prefill and not user_set_decode and get_platform().is_hip:
-        declared["dsa_prefill_backend"] = "tilelang"
-        declared["dsa_decode_backend"] = "tilelang"
-    elif kv_cache_dtype == "fp8_e4m3":
+    if get_platform().is_hip:
+        flashmla_backends = {
+            "flashmla_sparse",
+            "flashmla_sparse_q8",
+            "flashmla_kv",
+            "flashmla_auto",
+            "flashinfer_sparse_mla",
+        }
+        for field in ("dsa_prefill_backend", "dsa_decode_backend"):
+            value = getattr(view, field)
+            if value in flashmla_backends:
+                declared[field] = "tilelang"
+        if not user_set_prefill:
+            declared["dsa_prefill_backend"] = "tilelang"
+        if not user_set_decode:
+            declared["dsa_decode_backend"] = "tilelang"
+        prefill = declared.get("dsa_prefill_backend", view.dsa_prefill_backend)
+        decode = declared.get("dsa_decode_backend", view.dsa_decode_backend)
+        _check_tilelang_dsa_fp8_kv(kv_cache_dtype, prefill, decode, hip=True)
+        logger.warning(
+            f"Set HIP/HCU DSA backends: prefill={prefill}, decode={decode}."
+        )
+        return declared
+
+    if kv_cache_dtype == "fp8_e4m3":
         # Blackwell FP8 defaults to trtllm; Hopper FP8 to flashmla_kv.
         default = "trtllm" if major >= 10 else "flashmla_kv"
         if not user_set_prefill:
