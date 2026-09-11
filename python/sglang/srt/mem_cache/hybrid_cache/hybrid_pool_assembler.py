@@ -49,6 +49,15 @@ def _get_allocator_type(server_args: ServerArgs) -> str:
     return get_allocator_type(server_args)
 
 
+def _get_mamba_hicache_layout(server_args: ServerArgs) -> str:
+    layout = server_args.hicache_mem_layout
+    if layout in ("page_first", "page_first_direct"):
+        return layout
+    if server_args.hicache_io_backend == "direct":
+        return "page_first_direct"
+    return "page_first"
+
+
 def _make_layer_mapper(
     layer_mapping: dict[int, int],
     transfer_layer_num: int,
@@ -725,17 +734,12 @@ def build_hybrid_mamba_stack(
             target_host_layer_num=kv_host_pool.target_layer_num,
             draft_layer_num=len(mtp_draft_device_pools),
         )
-    # MambaPoolHost only supports page_first/page_first_direct/layer_first.
-    # layout_hcu is KV-only (MHATokenToKVPoolHostHCU); fall back for mamba state.
-    mamba_layout = server_args.hicache_mem_layout
-    if mamba_layout == "layout_hcu":
-        mamba_layout = "page_first"
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,
         allocator_type=_get_allocator_type(server_args),
-        layout=mamba_layout,
+        layout=_get_mamba_hicache_layout(server_args),
     )
     entries = [
         build_pool_entry(
@@ -835,17 +839,12 @@ def build_hybrid_mamba_swa_stack(
         host_size=swa_host_size,
         pool_label="swa",
     )
-    # MambaPoolHost only supports page_first/page_first_direct/layer_first.
-    # layout_hcu is KV-only (MHATokenToKVPoolHostHCU); fall back for mamba state.
-    mamba_layout = server_args.hicache_mem_layout
-    if mamba_layout == "layout_hcu":
-        mamba_layout = "page_first"
     mamba_host_pool = MambaPoolHost(
         mamba_pool,
         get_memory().hicache_ratio,
         mamba_host_size,
         allocator_type=get_memory().hicache_storage_backend,
-        layout=mamba_layout,
+        layout=_get_mamba_hicache_layout(server_args),
     )
     entries = [
         build_pool_entry(
