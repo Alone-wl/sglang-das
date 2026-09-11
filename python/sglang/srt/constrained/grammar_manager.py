@@ -114,7 +114,7 @@ class GrammarManager:
         # GLM NOTE: emitted when the grammar attaches (cache hit / compile
         # done / timeout); tree_traversal_time has no writers yet, so nothing
         # is lost by not waiting for request finish.
-        if grammar_stats is not None and self.scheduler.enable_metrics:
+        if grammar_stats is not None and self.scheduler.metrics_reporter.enable_metrics:
             self.scheduler.metrics_collector.log_grammar_stats(grammar_stats)
 
     def get_cache_stats(self):
