@@ -193,6 +193,7 @@ class MatchResult(NamedTuple):
                             loaded back to device. Pure-KV cache semantics;
         swa_host_hit_length  :   Number of SWA tokens that hit on host (within the sliding
                             window) and will be load-back into the SWA device pool.
+        swa_branching_seqlen: The SWA radix cache branching point, if any.
         mamba_host_hit_length:   Number of Mamba slots that hit on host and will be load-back
                             into the Mamba device pool. Typically 0 or 1.
         mamba_branching_seqlen: The mamba radix cache branching point, which is the longest
@@ -208,6 +209,7 @@ class MatchResult(NamedTuple):
     best_match_node: Any
     host_hit_length: int = 0
     swa_host_hit_length: int = 0
+    swa_branching_seqlen: Optional[int] = None
     mamba_host_hit_length: int = 0
     mamba_branching_seqlen: Optional[int] = None
     cache_protected_len: Optional[int] = None
