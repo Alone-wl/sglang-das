@@ -416,7 +416,10 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             prepare_w8a8_int8_deepgemm_weights(layer)
             return
 
-        if _is_hcu and self.runner.runner_backend.is_lightop():
+        if (
+            _is_hcu
+            and self.runner.runner_backend.value == MoeRunnerBackend.LIGHTOP.value
+        ):
             from sglang.srt.layers.moe.moe_runner.lightop import (
                 process_weights_after_loading_lightop,
             )
@@ -445,7 +448,7 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
 
         if moe_runner_backend.is_aiter() and _is_hcu:
             self.runner = MoeRunner(MoeRunnerBackend.AITER, moe_runner_config)
-        elif moe_runner_backend.is_lightop() and _is_hcu:
+        elif moe_runner_backend.value == MoeRunnerBackend.LIGHTOP.value and _is_hcu:
             self.runner = MoeRunner(MoeRunnerBackend.LIGHTOP, moe_runner_config)
         elif moe_runner_backend.is_triton():
             self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
@@ -515,7 +518,10 @@ class W8A8Int8MoEMethod(FusedMoEMethodBase):
             )
 
             quant_info = get_aiter_w8a8_int8_quant_info(layer)
-        elif _is_hcu and self.runner.runner_backend.is_lightop():
+        elif (
+            _is_hcu
+            and self.runner.runner_backend.value == MoeRunnerBackend.LIGHTOP.value
+        ):
             from sglang.srt.layers.moe.moe_runner.lightop import get_lightop_quant_info
 
             quant_info = get_lightop_quant_info(layer)
