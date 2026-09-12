@@ -450,7 +450,6 @@ class Sampler(nn.Module):
                         sampling_info.top_ps,
                         filter_apply_order="top_k_first",
                         deterministic=True,
-                        check_nan=self.use_nan_detection,
                     )
                 else:
                     # A slower fallback implementation with torch native operations.
