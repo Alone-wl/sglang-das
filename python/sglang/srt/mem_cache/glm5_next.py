@@ -724,6 +724,15 @@ class Glm5NextMLATokenToKVPool(DSATokenToKVPool):
                 slot, set_remote_layer_id=(slot != discard_main_slot)
             )
 
+    def _get_layer_prefetch_stream(self):
+        # The HCU draft shares target Main-KV scratch but uses its own NCCL
+        # communicator. Its side-stream broadcasts can stall at completion
+        # after a HiCache reload. Keep both draft KV and Index-K broadcasts
+        # on the forward stream; target layers retain asynchronous prefetch.
+        if self.shares_layer_split_scratch:
+            return self.device_module.current_stream()
+        return self.kv_broadcast_stream
+
     def prefetch_kv_buffer(
         self,
         layer_id: int,
@@ -780,8 +789,9 @@ class Glm5NextMLATokenToKVPool(DSATokenToKVPool):
             self.remote_kv_layer_ids[slot] = layer_id
             return
 
-        self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
-        with self.device_module.stream(self.kv_broadcast_stream):
+        broadcast_stream = self._get_layer_prefetch_stream()
+        broadcast_stream.wait_stream(self.device_module.current_stream())
+        with self.device_module.stream(broadcast_stream):
             if transfer_counter is not None:
                 transfer_counter.wait_until(transfer_idx)
             if self._active_main_kv_page_plan is not None:
@@ -1603,8 +1613,9 @@ class Glm5NextDSATokenToKVPool(Glm5NextMLATokenToKVPool):
             self.remote_index_layer_id = layer_id
             return
 
-        self.kv_broadcast_stream.wait_stream(self.device_module.current_stream())
-        with self.device_module.stream(self.kv_broadcast_stream):
+        broadcast_stream = self._get_layer_prefetch_stream()
+        broadcast_stream.wait_stream(self.device_module.current_stream())
+        with self.device_module.stream(broadcast_stream):
             if transfer_counter is not None:
                 transfer_counter.wait_until(transfer_idx)
             self._broadcast_tensor_from_owner(
