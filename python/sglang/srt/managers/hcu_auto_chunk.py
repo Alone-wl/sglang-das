@@ -48,7 +48,7 @@ class HcuAutoChunkPlanner:
 
     def _estimate_auto_chunk_prefix_len(self, req: Req) -> int:
         """Estimate reusable prefix length without mutating cache or request state."""
-        fill_ids = list(req.full_untruncated_fill_ids)
+        fill_ids = req.full_untruncated_fill_ids
         max_prefix_len = max(len(fill_ids) - 1, 0)
         if getattr(req, "return_logprob", False) and req.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, req.logprob_start_len)
@@ -74,6 +74,7 @@ class HcuAutoChunkPlanner:
                 RadixKey(
                     token_ids=fill_ids[:max_prefix_len],
                     extra_key=getattr(req, "extra_key", None),
+                    cache_salt=req.cache_salt,
                 )
             )
         except Exception as exc:
