@@ -52,7 +52,11 @@ class DSATopKBackend(Enum):
         return self == DSATopKBackend.FLASHINFER
 
     def should_use_topk_v2(self) -> bool:
-        return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+        return (
+            self.is_sgl_kernel()
+            and envs.SGLANG_OPT_USE_TOPK_V2.get()
+            and not _is_hcu
+        )
 
     def topk_func(
         self,

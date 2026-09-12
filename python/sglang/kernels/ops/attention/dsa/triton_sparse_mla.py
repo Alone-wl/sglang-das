@@ -35,11 +35,6 @@ _AUTOTUNE_CONFIGS = [
 ]
 
 
-@triton.autotune(
-    configs=_AUTOTUNE_CONFIGS,
-    key=["topk", "H", "DIM"],
-    prune_configs_by={"early_config_prune": _prune_configs},
-)
 @triton.jit
 def _sparse_mla_fwd_kernel(
     q_nope_ptr,
@@ -60,18 +55,20 @@ def _sparse_mla_fwd_kernel(
 
     h = tl.arange(0, H)
     dv = tl.arange(0, D_V)
-    dt = tl.arange(0, D_TAIL)
+    if D_TAIL > 0:
+        dt = tl.arange(0, D_TAIL)
     # q is read as two separate tensors (q_nope width D_V, q_rope width D_TAIL):
     # the upstream concat into a single [.., DIM] tensor is skipped since this
     # kernel splits q into main/tail anyway.
     q_main = tl.load(q_nope_ptr + s_i * H * D_V + h[:, None] * D_V + dv[None, :]).to(
         q_nope_ptr.dtype.element_ty
     )  # [H, D_V]
-    q_tail = tl.load(
-        q_rope_ptr + s_i * H * D_TAIL + h[:, None] * D_TAIL + dt[None, :]
-    ).to(
-        q_nope_ptr.dtype.element_ty
-    )  # [H, D_TAIL]
+    if D_TAIL > 0:
+        q_tail = tl.load(
+            q_rope_ptr + s_i * H * D_TAIL + h[:, None] * D_TAIL + dt[None, :]
+        ).to(
+            q_nope_ptr.dtype.element_ty
+        )  # [H, D_TAIL]
 
     m_i = tl.full([H], -float("inf"), tl.float32)
     l_i = tl.zeros([H], tl.float32)
@@ -87,14 +84,16 @@ def _sparse_mla_fwd_kernel(
         kv_main = tl.load(kbase + dv[None, :], mask=valid[:, None], other=0.0).to(
             q_nope_ptr.dtype.element_ty
         )  # [BLOCK_N, D_V] -- reused as V
-        kv_tail = tl.load(
-            kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
-        ).to(
-            q_nope_ptr.dtype.element_ty
-        )  # [BLOCK_N, D_TAIL]
+        if D_TAIL > 0:
+            kv_tail = tl.load(
+                kbase + (D_V + dt)[None, :], mask=valid[:, None], other=0.0
+            ).to(
+                q_nope_ptr.dtype.element_ty
+            )  # [BLOCK_N, D_TAIL]
 
         qk = tl.dot(q_main, tl.trans(kv_main)).to(tl.float32)
-        qk += tl.dot(q_tail, tl.trans(kv_tail)).to(tl.float32)
+        if D_TAIL > 0:
+            qk += tl.dot(q_tail, tl.trans(kv_tail)).to(tl.float32)
         qk = qk * sm_scale
         qk = tl.where(valid[None, :], qk, -float("inf"))
 
@@ -156,5 +155,8 @@ def triton_sparse_mla_fwd(
         DIM=dim,
         D_V=d_v,
         D_TAIL=d_tail,
+        BLOCK_N=64,
+        num_warps=4,
+        num_stages=1,
     )
     return out.unsqueeze(0)

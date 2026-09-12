@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.sampling.sampling_observer import DeviceAuxiliaryOutput
 from sglang.srt.utils.common import (
     is_cpu,
+    is_hcu,
     is_npu,
     is_pin_memory_available,
     use_intel_amx_backend,
@@ -65,6 +66,7 @@ logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
+_is_hcu = is_hcu()
 
 _UNQUANTIZED_LM_HEAD_METHODS = {
     "UnquantizedEmbeddingMethod",
@@ -329,7 +331,11 @@ class LogitsProcessor(nn.Module):
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
                 include_prefill=False, floor=128
             ),
-            enabled=self.do_tensor_parallel_all_gather and not self.use_attn_tp_group,
+            enabled=(
+                self.do_tensor_parallel_all_gather
+                and not self.use_attn_tp_group
+                and not _is_hcu
+            ),
             skip_entry_sync=True,
         )
 

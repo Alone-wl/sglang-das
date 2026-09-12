@@ -23,7 +23,6 @@ import torch
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
-
 class BaseTokenToKVPoolAllocator(abc.ABC):
     @abc.abstractmethod
     def __init__(
@@ -44,8 +43,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
 
         self.free_pages = None
         self.release_pages = None
-        # None: free right away. A list: hold frees until free_group_end().
-        self.free_group: list[torch.Tensor] | None = None
+        self.is_not_in_free_group = True
+        self.free_group = []
 
     @property
     def size_full(self):
@@ -92,13 +91,13 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         return torch.cat((self.free_pages, self.release_pages))
 
     def free_group_begin(self):
-        assert self.free_group is None, "free groups cannot be nested"
+        self.is_not_in_free_group = False
         self.free_group = []
 
     def free_group_end(self):
-        pending, self.free_group = self.free_group, None
-        if pending:
-            self.free(torch.cat(pending))
+        self.is_not_in_free_group = True
+        if self.free_group:
+            self.free(torch.cat(self.free_group))
 
     @staticmethod
     def _copy_for_free_group(free_index: torch.Tensor) -> torch.Tensor:

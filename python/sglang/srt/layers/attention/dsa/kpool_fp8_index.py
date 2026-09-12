@@ -9,6 +9,72 @@ INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 
 
+def kpool_bf16_paged_mqa_logits(
+    q: torch.Tensor,
+    buf: torch.Tensor,
+    weights: torch.Tensor,
+    pool_seqlens: torch.Tensor,
+    page_table: torch.Tensor,
+    max_seq_len: int,
+    slots_per_page: int,
+) -> torch.Tensor:
+    """Compute pooled-index logits from the native packed FP8 page layout.
+
+    The CUDA paged-MQA kernels assume a 64-slot page. HCU uses the same
+    packed ``[K bytes][FP32 scales]`` layout with one slot per page, so keep
+    the page geometry in the fallback kernel instead of reshaping it to a
+    CUDA-only layout.
+    """
+    assert q.ndim == 4 and q.shape[1] == 1
+    assert q.shape[-1] == INDEX_HEAD_DIM
+    assert buf.dtype == torch.uint8 and buf.ndim == 2 and buf.is_contiguous()
+    assert slots_per_page > 0
+    assert buf.shape[1] == slots_per_page * (INDEX_HEAD_DIM + 4)
+    assert weights.shape == (q.shape[0], q.shape[2])
+    assert pool_seqlens.shape == (q.shape[0],)
+    assert page_table.shape[0] == q.shape[0]
+    assert page_table.shape[1] * slots_per_page >= max_seq_len
+    assert page_table.is_contiguous()
+
+    q = q.squeeze(1).to(torch.bfloat16).contiguous()
+    weights = weights.to(torch.float32).contiguous()
+    pool_seqlens = pool_seqlens.to(torch.int32).contiguous()
+    page_table = page_table.to(torch.int32).contiguous()
+    logits = torch.empty(
+        (q.shape[0], max_seq_len), dtype=torch.float32, device=q.device
+    )
+    if max_seq_len == 0 or q.shape[0] == 0:
+        return logits
+
+    _kpool_bf16_paged_mqa_logits_kernel[
+        (q.shape[0], triton.cdiv(max_seq_len, 4))
+    ](
+        q,
+        buf,
+        buf.view(torch.float32),
+        weights,
+        pool_seqlens,
+        page_table,
+        logits,
+        q.stride(0),
+        q.stride(1),
+        weights.stride(0),
+        weights.stride(1),
+        page_table.stride(0),
+        page_table.stride(1),
+        logits.stride(0),
+        max_seq_len,
+        NUM_HEADS=q.shape[1],
+        SLOTS_PER_PAGE=slots_per_page,
+        BUF_NUMEL_PER_PAGE=buf.shape[1],
+        HEAD_DIM=INDEX_HEAD_DIM,
+        BLOCK_K=4,
+        BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
+        num_warps=4,
+    )
+    return logits
+
+
 def kpool_max_closed_pools(num_draft_tokens: int, pool_size: int) -> int:
     """Return the most pools an N-token write can close at any start offset."""
     return (num_draft_tokens + pool_size - 1) // pool_size
@@ -47,7 +113,6 @@ def gather_index_k_scale_prefix_into(
     assert page_indices.dtype in (torch.int32, torch.int64)
     assert k_out.dtype == torch.uint8
     assert scale_out.dtype == torch.float32
-    assert pool.page_size == BLOCK_SIZE_K
     assert k_out.shape[0] >= seq_len
     assert k_out.shape[1] == INDEX_HEAD_DIM
     assert scale_out.shape[0] >= seq_len
@@ -58,16 +123,17 @@ def gather_index_k_scale_prefix_into(
     if seq_len == 0:
         return
 
+    slots_per_page = pool.slots_per_page
     _gather_index_k_scale_prefix_into_kernel[(seq_len,)](
         buf,
         buf.view(torch.float32),
         page_indices,
         k_out,
         scale_out,
-        PAGE_SIZE=pool.page_size,
+        PAGE_SIZE=slots_per_page,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         HEAD_DIM=INDEX_HEAD_DIM,
-        S_OFFSET_NBYTES_IN_PAGE=pool.page_size * INDEX_HEAD_DIM,
+        S_OFFSET_NBYTES_IN_PAGE=slots_per_page * INDEX_HEAD_DIM,
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),
     )
 
@@ -106,6 +172,103 @@ def _gather_index_k_scale_prefix_into_kernel(
     tl.store(scale_out_ptr + token_id, scale)
 
 
+@triton.jit
+def _decode_e4m3fn(raw):
+    raw = raw.to(tl.int32)
+    sign = tl.where((raw & 0x80) != 0, -1.0, 1.0)
+    exponent = (raw >> 3) & 0x0F
+    mantissa = raw & 0x07
+    normal = tl.exp2(exponent.to(tl.float32) - 7.0) * (
+        1.0 + mantissa.to(tl.float32) * 0.125
+    )
+    subnormal = mantissa.to(tl.float32) * 0.001953125
+    value = tl.where(exponent == 0, subnormal, normal)
+    value = tl.where((exponent == 15) & (mantissa == 7), 0.0, value)
+    return sign * value
+
+
+@triton.jit
+def _kpool_bf16_paged_mqa_logits_kernel(
+    q_ptr,
+    buf_u8_ptr,
+    buf_fp32_ptr,
+    weights_ptr,
+    pool_seqlens_ptr,
+    page_table_ptr,
+    logits_ptr,
+    q_stride_0,
+    q_stride_1,
+    weights_stride_0,
+    weights_stride_1,
+    page_table_stride_0,
+    page_table_stride_1,
+    logits_stride_0,
+    max_seq_len,
+    NUM_HEADS: tl.constexpr,
+    SLOTS_PER_PAGE: tl.constexpr,
+    BUF_NUMEL_PER_PAGE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    batch_idx = tl.program_id(0)
+    pool_offset = tl.program_id(1) * BLOCK_K + tl.arange(0, BLOCK_K)
+    valid_output = pool_offset < max_seq_len
+    pool_seqlen = tl.load(pool_seqlens_ptr + batch_idx).to(tl.int32)
+    valid_pool = valid_output & (pool_offset < pool_seqlen)
+
+    logical_page = pool_offset // SLOTS_PER_PAGE
+    slot = pool_offset % SLOTS_PER_PAGE
+    physical_page = tl.load(
+        page_table_ptr
+        + batch_idx * page_table_stride_0
+        + logical_page * page_table_stride_1,
+        mask=valid_pool,
+        other=0,
+    ).to(tl.int32)
+    physical_page = tl.maximum(physical_page, 0)
+
+    dims = tl.arange(0, BLOCK_D)
+    scores = tl.zeros([BLOCK_K], dtype=tl.float32)
+    scale_offsets = (
+        physical_page * (BUF_NUMEL_PER_PAGE // 4)
+        + (SLOTS_PER_PAGE * HEAD_DIM // 4)
+        + slot
+    )
+    scales = tl.load(buf_fp32_ptr + scale_offsets, mask=valid_pool, other=0.0).to(
+        tl.float32
+    )
+
+    for head_idx in tl.static_range(0, NUM_HEADS):
+        q_vec = tl.load(
+            q_ptr + batch_idx * q_stride_0 + head_idx * q_stride_1 + dims,
+            mask=dims < HEAD_DIM,
+            other=0.0,
+        ).to(tl.bfloat16)
+        k_offsets = (
+            physical_page[:, None] * BUF_NUMEL_PER_PAGE
+            + slot[:, None] * HEAD_DIM
+            + dims[None, :]
+        )
+        raw_k = tl.load(
+            buf_u8_ptr + k_offsets,
+            mask=valid_pool[:, None] & (dims[None, :] < HEAD_DIM),
+            other=0.0,
+        )
+        k = (_decode_e4m3fn(raw_k) * scales[:, None]).to(tl.bfloat16)
+        dot = tl.sum((k * q_vec[None, :]).to(tl.float32), axis=1)
+        weight = tl.load(
+            weights_ptr + batch_idx * weights_stride_0 + head_idx * weights_stride_1
+        ).to(tl.float32)
+        scores += tl.maximum(dot, 0.0) * weight
+
+    tl.store(
+        logits_ptr + batch_idx * logits_stride_0 + pool_offset,
+        tl.where(valid_pool, scores, 0.0),
+        mask=valid_output,
+    )
+
+
 def kpool_build_ragged_layout(
     full_page_table: torch.Tensor,
     cu_pages_excl: torch.Tensor,
@@ -120,8 +283,8 @@ def kpool_build_ragged_layout(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Build one flat pooled-page table plus per-q row starts/ends.
 
-    DSA stores 64 pooled entries per physical page. A pooled page therefore
-    corresponds to every ``pool_size``-th 64-token page in the original real
+    A pooled page contains ``slots_per_page`` entries. It therefore
+    corresponds to every ``pool_size``-th real page group in the original
     page table.
     """
     device = full_page_table.device
@@ -359,15 +522,17 @@ def compute_pooled_write_locs(
     page_table_64: torch.Tensor,
     pool_ids: torch.Tensor,
     pool_size: int,
+    slots_per_page: int = BLOCK_SIZE_K,
 ) -> torch.Tensor:
     """Map logical pooled-K ids to packed physical index-cache locations."""
     assert page_table_64.ndim == 1
+    assert slots_per_page > 0
     pool_ids = pool_ids.to(torch.int64)
-    pool_page_group = torch.div(pool_ids, BLOCK_SIZE_K, rounding_mode="floor")
+    pool_page_group = torch.div(pool_ids, slots_per_page, rounding_mode="floor")
     token_page_row = pool_page_group * pool_size
     packed_page = page_table_64.index_select(0, token_page_row.to(torch.int64))
-    return packed_page.to(torch.int64) * BLOCK_SIZE_K + torch.remainder(
-        pool_ids, BLOCK_SIZE_K
+    return packed_page.to(torch.int64) * slots_per_page + torch.remainder(
+        pool_ids, slots_per_page
     )
 
 
@@ -592,28 +757,88 @@ def topk_from_pooled_history_logits(
         )
 
     if group_topk in (128, 160, 192, 224, 256, 512):
-        from sglang.kernels.ops.moe.kpool_topk_transform import (
-            fast_kpool_topk_transform_fused,
-        )
+        try:
+            from sglang.kernels.ops.moe.kpool_topk_transform import (
+                fast_kpool_topk_transform_fused,
+            )
 
-        result = fast_kpool_topk_transform_fused(
-            score=logits,
-            lengths=group_lengths.to(torch.int32),
-            pool_size=pool_size,
-            topk=topk,
-            page_table=page_table,
-            topk_indices_offset=topk_offsets,
-            row_starts=row_starts,
-            seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
-            page_table_row_index=page_table_row_index,
-        )
-        if out_rows is None or out_rows == result.shape[0]:
-            return result
-        padded = torch.full(
-            (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
-        )
-        padded[: result.shape[0]] = result
-        return padded
+            result = fast_kpool_topk_transform_fused(
+                score=logits,
+                lengths=group_lengths.to(torch.int32),
+                pool_size=pool_size,
+                topk=topk,
+                page_table=page_table,
+                topk_indices_offset=topk_offsets,
+                row_starts=row_starts,
+                seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
+                page_table_row_index=page_table_row_index,
+            )
+            if out_rows is None or out_rows == result.shape[0]:
+                return result
+            padded = torch.full(
+                (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
+            )
+            padded[: result.shape[0]] = result
+            return padded
+        except ModuleNotFoundError:
+            if row_starts is not None or page_table_row_index is not None:
+                raise
+
+            group_rank = torch.arange(cols, device=logits.device).unsqueeze(0)
+            valid_logits = logits.masked_fill(
+                group_rank >= group_lengths.to(torch.int64).unsqueeze(1),
+                float("-inf"),
+            )
+            selected_count = min(cols, group_topk)
+            selected_groups = torch.topk(
+                valid_logits, k=selected_count, dim=1
+            ).indices.to(torch.int32)
+            if selected_count < group_topk:
+                selected_groups = torch.cat(
+                    [
+                        selected_groups,
+                        torch.zeros(
+                            logits.shape[0],
+                            group_topk - selected_count,
+                            dtype=torch.int32,
+                            device=logits.device,
+                        ),
+                    ],
+                    dim=1,
+                )
+            rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
+            max_valid_groups = min(cols, group_topk)
+            valid_counts = torch.minimum(
+                group_lengths.to(torch.int32),
+                torch.full_like(group_lengths.to(torch.int32), max_valid_groups),
+            )
+            group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
+            expanded = expand_pooled_groups_to_topk(
+                selected_groups.contiguous(),
+                group_valid,
+                topk=topk,
+                pool_size=pool_size,
+                page_table=page_table,
+                topk_offsets=topk_offsets,
+            )
+            if seq_lens is None:
+                result = expanded
+            else:
+                result = append_kpool_tail_to_topk(
+                    expanded,
+                    seq_lens=seq_lens,
+                    pool_lens=group_lengths,
+                    pool_size=pool_size,
+                    page_table=page_table,
+                    topk_offsets=topk_offsets,
+                )
+            if out_rows is None or out_rows == result.shape[0]:
+                return result
+            padded = torch.full(
+                (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
+            )
+            padded[: result.shape[0]] = result
+            return padded
 
     assert (
         page_table_row_index is None
@@ -683,7 +908,6 @@ def kpool_softmax_rotate_write_cache(
     assert slot_score.dtype in KPOOL_SCORE_DTYPES
     assert ape.dtype == torch.float32
     assert buf.dtype == torch.uint8
-    assert pool.page_size == BLOCK_SIZE_K
     assert pool.index_head_dim == INDEX_HEAD_DIM
     assert loc.dtype == torch.int64
     assert write_cache or return_compressed
@@ -713,6 +937,7 @@ def kpool_softmax_rotate_write_cache(
             )
         return None
 
+    slots_per_page = pool.slots_per_page
     buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     if return_compressed:
@@ -742,11 +967,11 @@ def kpool_softmax_rotate_write_cache(
         slot_score.stride(0),
         slot_score.stride(1),
         ape.stride(0),
-        PAGE_SIZE=pool.page_size,
+        PAGE_SIZE=slots_per_page,
         BUF_NUMEL_PER_PAGE=buf.shape[1],
         POOL_SIZE=slot_k.shape[1],
         HEAD_DIM=slot_k.shape[2],
-        S_OFFSET_NBYTES_IN_PAGE=pool.page_size * pool.index_head_dim,
+        S_OFFSET_NBYTES_IN_PAGE=slots_per_page * pool.index_head_dim,
         ROUND_SCALE=round_scale,
         HAS_WRITE_MASK=has_write_mask,
         RETURN_COMPRESSED=return_compressed,
@@ -786,7 +1011,6 @@ def kpool_decode_update_and_maybe_write_cache(
     assert slot_score.dtype == tail_score.dtype
     assert ape.dtype == torch.float32
     assert buf.dtype == torch.uint8
-    assert pool.page_size == BLOCK_SIZE_K
     assert pool.index_head_dim == INDEX_HEAD_DIM
     assert tail_k.is_contiguous()
     assert tail_score.is_contiguous()
@@ -1650,12 +1874,15 @@ def kpool_write_tail_and_maybe_compress(
     num_draft_tokens: int,
     round_scale: bool,
     effective_n_per_batch: Optional[torch.Tensor] = None,
+    pool_size: Optional[int] = None,
 ) -> None:
     assert num_draft_tokens > 0
     assert key.dim() == 2 and key.shape[1] == INDEX_HEAD_DIM
     assert score.shape == key.shape
     assert tail_k.shape == tail_score.shape
-    assert tail_k.shape[1] == pool.index_kpool + pool.tail_extra_slots
+    if pool_size is None:
+        pool_size = pool.index_kpool
+    assert tail_k.shape[1] == pool_size + pool.tail_extra_slots
     assert tail_k.shape[2] == INDEX_HEAD_DIM
     assert key.dtype == torch.bfloat16
     assert score.dtype in KPOOL_SCORE_DTYPES
@@ -1668,7 +1895,7 @@ def kpool_write_tail_and_maybe_compress(
         return
     assert bn % num_draft_tokens == 0
     bs = bn // num_draft_tokens
-    max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool.index_kpool)
+    max_closed_pools = kpool_max_closed_pools(num_draft_tokens, pool_size)
     assert write_loc.shape == (bs, max_closed_pools), write_loc.shape
     assert write_loc.stride(1) == 1, write_loc.stride()
 
@@ -1707,7 +1934,7 @@ def kpool_write_tail_and_maybe_compress(
         ape.stride(0),
         write_loc.stride(0),
         N=num_draft_tokens,
-        POOL_SIZE=pool.index_kpool,
+        POOL_SIZE=pool_size,
         TAIL_SIZE=tail_k.shape[1],
         HEAD_DIM=INDEX_HEAD_DIM,
         BLOCK_D=triton.next_power_of_2(INDEX_HEAD_DIM),

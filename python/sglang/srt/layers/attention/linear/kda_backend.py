@@ -995,7 +995,22 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 replayssm_g=mamba_cache_params.replayssm_g,
                 replayssm_beta=mamba_cache_params.replayssm_beta,
             )
+        physical_seq_len = seq_len
+        if (
+            getattr(forward_batch, "num_token_non_padded_cpu", None) is not None
+            and forward_batch.num_token_non_padded_cpu < physical_seq_len
+        ):
+            seq_len = forward_batch.num_token_non_padded_cpu
+            mixed_qkv = mixed_qkv[:seq_len]
+            a = a[:, :seq_len]
+            b = b[:, :seq_len]
+
         if ragged_layout is None:
+            if seq_len % draft_token_num != 0:
+                raise RuntimeError(
+                    "KDA target_verify expected a dense MTP token layout, but "
+                    f"got seq_len={seq_len}, draft_token_num={draft_token_num}."
+                )
             batch_size = seq_len // draft_token_num
             conv_state_indices = cache_indices[:batch_size]
             # Fused chain-verify fast path: one kernel replaces the transpose-copy +
@@ -1019,7 +1034,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 retrieve_parent_token=retrieve_parent_token,
                 replayssm_rawv=replayssm_rawv,
             ):
-                return self._fused_chain_verify_fn(
+                fused_output = self._fused_chain_verify_fn(
                     mixed_qkv=mixed_qkv,
                     conv_weight=layer.conv_weights,
                     conv_bias=layer.bias,
@@ -1049,6 +1064,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     head_v_dim=layer.head_v_dim,
                     lower_bound=layer.lower_bound,
                 )
+                if physical_seq_len != seq_len:
+                    pad = fused_output.new_zeros(
+                        (1, physical_seq_len - seq_len) + tuple(fused_output.shape[2:])
+                    )
+                    fused_output = torch.cat((fused_output, pad), dim=1)
+                return fused_output
             dense_token_indices = None
             mixed_qkv_dense = mixed_qkv.view(batch_size, draft_token_num, -1)
         else:
@@ -1100,6 +1121,15 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
             padded_flat[: batch_size * draft_token_num] = mixed_qkv_flat
             mixed_qkv = padded_flat[dense_token_indices]
+
+        expected_qkv_dim = layer.q_dim + layer.k_dim + layer.v_dim
+        if mixed_qkv.shape[-1] != expected_qkv_dim:
+            if mixed_qkv.shape[-1] < expected_qkv_dim:
+                raise RuntimeError(
+                    "KDA target_verify mixed_qkv has fewer channels than q/k/v "
+                    f"expect: got {mixed_qkv.shape[-1]}, expected {expected_qkv_dim}."
+                )
+            mixed_qkv = mixed_qkv[..., :expected_qkv_dim]
 
         q, k, v = mixed_qkv.split([layer.q_dim, layer.k_dim, layer.v_dim], dim=-1)
         q = q.unflatten(-1, (-1, layer.head_q_dim)).unsqueeze(0)  # n (h d) -> 1 n h d
@@ -1161,6 +1191,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # stay finite. Uncovered == clamped-to-ghost.
             covered = dense_token_indices < (batch_size * draft_token_num)
             core_attn_out = torch.where(covered.view(1, -1, 1, 1), core_attn_out, 0.0)
+        if physical_seq_len != seq_len:
+            pad = core_attn_out.new_zeros(
+                (1, physical_seq_len - seq_len) + tuple(core_attn_out.shape[2:])
+            )
+            core_attn_out = torch.cat((core_attn_out, pad), dim=1)
         return core_attn_out
 
     def _can_run_fused_chain_verify(

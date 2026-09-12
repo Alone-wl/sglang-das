@@ -94,6 +94,17 @@ class MHCState:
     def attn_to_mlp(
         self, hidden_states, residual, out_norm: Optional[torch.nn.Module] = None
     ):
+        if residual is not None and hidden_states.shape[0] < residual.shape[0]:
+            hidden_states = torch.cat(
+                [
+                    hidden_states,
+                    hidden_states.new_zeros(
+                        residual.shape[0] - hidden_states.shape[0],
+                        *hidden_states.shape[1:],
+                    ),
+                ],
+                dim=0,
+            )
         hidden_states = self.hc_post(hidden_states, residual, self.h_res, self.h_post)
         residual = hidden_states
         out_norm_weight, out_norm_eps = self._resolve_out_norm(out_norm)

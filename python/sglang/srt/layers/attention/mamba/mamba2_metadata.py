@@ -55,6 +55,9 @@ class ForwardMetadata:
     track_ssm_h_dst: Optional[torch.Tensor] = None
     track_ssm_final_src: Optional[torch.Tensor] = None
     track_ssm_final_dst: Optional[torch.Tensor] = None
+    track_ssm_seq_idx: Optional[torch.Tensor] = None
+    track_ssm_end_locs: Optional[torch.Tensor] = None
+    track_ssm_recompute_dst: Optional[torch.Tensor] = None
     state_checkpoint_cu_starts: Optional[torch.Tensor] = None
     num_state_checkpoints: int = 0
     state_checkpoint_every_n_tokens: int = 0

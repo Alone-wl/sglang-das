@@ -926,6 +926,118 @@ class ReqKvInfo:
 class Req(ReqDllmMixin):
     """The input and output status of a request."""
 
+    @property
+    def req_pool_idx(self):
+        return self.kv.req_pool_idx
+
+    @req_pool_idx.setter
+    def req_pool_idx(self, value):
+        self.kv.req_pool_idx = value
+
+    @property
+    def cache_protected_len(self):
+        return self.kv.cache_protected_len
+
+    @cache_protected_len.setter
+    def cache_protected_len(self, value):
+        self.kv.cache_protected_len = value
+
+    @property
+    def kv_committed_len(self):
+        return self.kv.kv_committed_len
+
+    @kv_committed_len.setter
+    def kv_committed_len(self, value):
+        self.kv.kv_committed_len = value
+
+    @property
+    def kv_allocated_len(self):
+        return self.kv.kv_allocated_len
+
+    @kv_allocated_len.setter
+    def kv_allocated_len(self, value):
+        self.kv.kv_allocated_len = value
+
+    @property
+    def swa_evict_floor(self):
+        return self.kv.swa_evict_floor
+
+    @swa_evict_floor.setter
+    def swa_evict_floor(self, value):
+        self.kv.swa_evict_floor = value
+
+    @property
+    def swa_evicted_seqlen(self):
+        return self.kv.swa_evicted_seqlen
+
+    @swa_evicted_seqlen.setter
+    def swa_evicted_seqlen(self, value):
+        self.kv.swa_evicted_seqlen = value
+
+    @property
+    def retraction_backup(self):
+        return self.kv.retraction_backup
+
+    @retraction_backup.setter
+    def retraction_backup(self, value):
+        self.kv.retraction_backup = value
+
+    @property
+    def mamba_pool_idx(self):
+        return self.kv.mamba_pool_idx
+
+    @mamba_pool_idx.setter
+    def mamba_pool_idx(self, value):
+        self.kv.mamba_pool_idx = value
+
+    @property
+    def mamba_ping_pong_track_buffer(self):
+        return self.kv.mamba_ping_pong_track_buffer
+
+    @mamba_ping_pong_track_buffer.setter
+    def mamba_ping_pong_track_buffer(self, value):
+        self.kv.mamba_ping_pong_track_buffer = value
+
+    @property
+    def mamba_next_track_idx(self):
+        return self.kv.mamba_next_track_idx
+
+    @mamba_next_track_idx.setter
+    def mamba_next_track_idx(self, value):
+        self.kv.mamba_next_track_idx = value
+
+    @property
+    def mamba_last_track_idx(self):
+        return self.kv.mamba_last_track_idx
+
+    @mamba_last_track_idx.setter
+    def mamba_last_track_idx(self, value):
+        self.kv.mamba_last_track_idx = value
+
+    @property
+    def mamba_last_track_seqlen(self):
+        return self.kv.mamba_last_track_seqlen
+
+    @mamba_last_track_seqlen.setter
+    def mamba_last_track_seqlen(self, value):
+        self.kv.mamba_last_track_seqlen = value
+
+    @property
+    def mamba_cow_src_index(self):
+        return self.kv.mamba_cow_src_index
+
+    @mamba_cow_src_index.setter
+    def mamba_cow_src_index(self, value):
+        self.kv.mamba_cow_src_index = value
+
+    @property
+    def mamba_needs_clear(self):
+        return self.kv.mamba_needs_clear
+
+    @mamba_needs_clear.setter
+    def mamba_needs_clear(self, value):
+        self.kv.mamba_needs_clear = value
+
     def __init__(
         self,
         rid: str,
@@ -2623,6 +2735,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             req.extend_batch_idx += 1
 
+            # update req-level memory management fields
+            # TODO(th4): co-locate this req.kv bookkeeping with the real KV
+            # allocation in alloc_for_extend above; they are currently a few
+            # steps apart and should become one owned-kv allocation step.
+            req.kv_committed_len = seq_len
+
             # If input_embeds are available, store them
             if req.input_embeds is not None:
                 # Slice to match extend_input_len — PrefillAdder truncates
@@ -3379,6 +3497,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.out_cache_loc = alloc_for_decode(self, token_per_req=1)
 
         for req in self.reqs:
+            req.kv_committed_len += 1
             req.decode_batch_idx += 1
 
         # New-tensor avoids racing model_worker_batch refs queued for
@@ -3644,57 +3763,61 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
             eviction_interval = max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
             self.token_to_kv_pool_allocator.free_group_begin()
-            for idx, req in enumerate(self.reqs):
-                if self.forward_mode.is_decode():
-                    # We set evict_swa condition here with two reasons:
-                    # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
-                    # 2. Evict only once >= eviction_interval tokens have slid
-                    # out of the window, amortizing eviction work while keeping
-                    # each request's overshoot within the interval the pool
-                    # budget reserves. Gating on accumulated tokens (rather
-                    # than an iteration-counter phase) cannot starve because
-                    # seqlen progress is monotonic per KV handle.
-                    if (
-                        req.decode_batch_idx >= 1
-                        and req.kv.holds_kv
-                        and req.seqlen - 1 - sliding_window_size
-                        >= req.kv.swa_evicted_seqlen + eviction_interval
-                    ):
-                        self._evict_swa(req, req.seqlen - 1)
+            try:
+                for idx, req in enumerate(self.reqs):
+                    if self.forward_mode.is_decode():
+                        # We set evict_swa condition here with two reasons:
+                        # 1. In overlap scheduler, we cannot evict swa when req.decode_batch_idx == 0 since the prev extend batch is still running.
+                        # 2. Evict only once >= eviction_interval tokens have slid
+                        # out of the window, amortizing eviction work while keeping
+                        # each request's overshoot within the interval the pool
+                        # budget reserves. Gating on accumulated tokens (rather
+                        # than an iteration-counter phase) cannot starve because
+                        # seqlen progress is monotonic per KV handle.
+                        if (
+                            req.decode_batch_idx >= 1
+                            and req.kv.holds_kv
+                            and req.seqlen - 1 - sliding_window_size
+                            >= req.kv.swa_evicted_seqlen + eviction_interval
+                        ):
+                            self._evict_swa(req, req.seqlen - 1)
 
-                    # Once the decode position has moved past the sliding window,
-                    # the SWA portion of the prefill-time tree lock is no longer
-                    # needed by this request. Convert it from protected to
-                    # evictable so SWA LRU can reclaim it under pressure.
-                    if (
-                        release_leaf_lock
-                        and not req.swa_prefix_lock_released
-                        and req.swa_uuid_for_lock is not None
-                        and req.last_node is not None
-                        and req.decode_batch_idx >= sliding_window_size
-                    ):
-                        self.tree_cache.dec_swa_lock_only(
-                            req.last_node,
-                            req.swa_uuid_for_lock,
-                            skip_lock_node_ids=req.skip_lock_node_ids,
-                        )
-                        req.swa_prefix_lock_released = True
-                elif self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache():
-                    pre_len = self.prefix_lens[idx]
-                    if self.enable_overlap:
-                        # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
-                        if req.extend_batch_idx < 2:
-                            continue
-                        else:
-                            pre_len = (
-                                pre_len - get_schedule().chunked_prefill_size
-                                if get_schedule().chunked_prefill_size > 0
-                                else pre_len
+                        # Once the decode position has moved past the sliding window,
+                        # the SWA portion of the prefill-time tree lock is no longer
+                        # needed by this request. Convert it from protected to
+                        # evictable so SWA LRU can reclaim it under pressure.
+                        if (
+                            release_leaf_lock
+                            and not req.swa_prefix_lock_released
+                            and req.swa_uuid_for_lock is not None
+                            and req.last_node is not None
+                            and req.decode_batch_idx >= sliding_window_size
+                        ):
+                            self.tree_cache.dec_swa_lock_only(
+                                req.last_node,
+                                req.swa_uuid_for_lock,
+                                skip_lock_node_ids=req.skip_lock_node_ids,
                             )
+                            req.swa_prefix_lock_released = True
+                    elif (
+                        self.forward_mode.is_extend() and self.tree_cache.is_chunk_cache()
+                    ):
+                        pre_len = self.prefix_lens[idx]
+                        if self.enable_overlap:
+                            # In chunked prefill case, when the second extend batch is scheduling, the first extend batch is still running, so we cannot evict swa tokens
+                            if req.extend_batch_idx < 2:
+                                continue
+                            else:
+                                pre_len = (
+                                    pre_len - get_schedule().chunked_prefill_size
+                                    if get_schedule().chunked_prefill_size > 0
+                                    else pre_len
+                                )
+                                self._evict_swa(req, pre_len)
+                        else:
                             self._evict_swa(req, pre_len)
-                    else:
-                        self._evict_swa(req, pre_len)
-            self.token_to_kv_pool_allocator.free_group_end()
+            finally:
+                self.token_to_kv_pool_allocator.free_group_end()
 
     def _evict_swa(self, req: Req, pre_len: int):
         assert self.tree_cache.supports_swa(), "prefix cache must support swa"

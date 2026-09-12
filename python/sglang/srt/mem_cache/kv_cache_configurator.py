@@ -2485,11 +2485,31 @@ def calculate_mla_kv_cache_dim(
     if uses_trtllm_kv_layout:
         return kv_cache_dim
 
-    # On HIP, TileLang and AITER DSA kernels consume the raw MLA KV layout:
-    # nope(512 fp8) + rope(64 fp8), without extra per-block scales.
+    # On HIP, CUDA-only FlashMLA choices are remapped to AITER by the DSA
+    # backend. Include them here so the KV pool is allocated in the raw MLA
+    # layout before that remap happens; otherwise AITER receives the scaled
+    # 528/656-byte rows.
     if _is_hip and (
-        get_exec().kernel.dsa_prefill_backend in ("tilelang", "aiter")
-        or get_exec().kernel.dsa_decode_backend in ("tilelang", "aiter")
+        get_exec().kernel.dsa_prefill_backend
+        in (
+            "tilelang",
+            "aiter",
+            "flashmla_sparse",
+            "flashmla_sparse_q8",
+            "flashmla_kv",
+            "flashmla_auto",
+            "flashinfer_sparse_mla",
+        )
+        or get_exec().kernel.dsa_decode_backend
+        in (
+            "tilelang",
+            "aiter",
+            "flashmla_sparse",
+            "flashmla_sparse_q8",
+            "flashmla_kv",
+            "flashmla_auto",
+            "flashinfer_sparse_mla",
+        )
     ):
         return kv_cache_dim
 

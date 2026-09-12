@@ -431,7 +431,10 @@ class IndexerKPool(MultiPlatformOp):
                         n_pools, dtype=torch.int64, device=key.device
                     )
                     write_locs = compute_pooled_write_locs(
-                        token_page_table, pool_ids, kpool
+                        token_page_table,
+                        pool_ids,
+                        kpool,
+                        slots_per_page=get_token_to_kv_pool().slots_per_page,
                     )
                     compressed = self._write_compressed_pooled_index_cache(
                         slot_k,
@@ -686,7 +689,7 @@ class IndexerKPool(MultiPlatformOp):
                 block_tables, self.index_kpool
             ).contiguous()
             pool_schedule_metadata = plan.pool_schedule_metadata
-            if pool_schedule_metadata is None and build_schedule_metadata:
+            if pool_schedule_metadata is None and build_schedule_metadata and is_cuda():
                 pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                     pool_context_lens.clamp(min=1), blocksize, self.sm_count
                 )
@@ -721,7 +724,7 @@ class IndexerKPool(MultiPlatformOp):
             ]
 
         pool_context_lens = pool_seqlens.contiguous().view(-1, 1)
-        if pool_schedule_metadata is None and build_schedule_metadata:
+        if pool_schedule_metadata is None and build_schedule_metadata and is_cuda():
             pool_schedule_metadata = deep_gemm.get_paged_mqa_logits_metadata(
                 pool_context_lens.clamp(min=1), blocksize, self.sm_count
             )
@@ -777,15 +780,13 @@ class IndexerKPool(MultiPlatformOp):
             assert isinstance(get_token_to_kv_pool(), DSATokenToKVPool)
 
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
-        # DeepGEMM paged-MQA requires 64-token pages.
-        assert page_size == 64, "only support page size 64"
+        slots_per_page = pool.slots_per_page
 
         block_tables = metadata.get_page_table_64()
 
         kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
 
-        blocksize = page_size
+        blocksize = slots_per_page
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
@@ -801,12 +802,9 @@ class IndexerKPool(MultiPlatformOp):
             weights = weights[:n_real]
         q_fp8 = q_fp8.unsqueeze(1)  # the next_n dim is 1 now
         assert len(kv_cache_fp8.shape) == 2
-        block_kv = 64
+        block_kv = slots_per_page
         num_heads_kv = 1
         head_dim_with_sf = 132
-        kv_cache_fp8 = kv_cache_fp8.view(
-            kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
-        )
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
         use_tilelang_paged_mqa = self._should_use_tilelang_paged_mqa_logits(q_fp8)
@@ -821,7 +819,24 @@ class IndexerKPool(MultiPlatformOp):
             )
         )
         pool_max_seq_len = pool_block_tables.shape[1] * blocksize
-        if use_tilelang_paged_mqa:
+        if is_hip():
+            from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+                kpool_bf16_paged_mqa_logits,
+            )
+
+            logits = kpool_bf16_paged_mqa_logits(
+                q_fp8,
+                kv_cache_fp8,
+                weights,
+                pool_seqlens,
+                pool_block_tables,
+                pool_max_seq_len,
+                slots_per_page,
+            )
+        elif use_tilelang_paged_mqa:
+            kv_cache_fp8 = kv_cache_fp8.view(
+                kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
             from sglang.kernels.ops.attention.dsa.tilelang_kernel import (
                 tilelang_fp8_paged_mqa_logits,
             )
@@ -837,6 +852,9 @@ class IndexerKPool(MultiPlatformOp):
                 clean_logits=False,
             )
         else:
+            kv_cache_fp8 = kv_cache_fp8.view(
+                kv_cache_fp8.shape[0], block_kv, num_heads_kv, head_dim_with_sf
+            )
             logits = deep_gemm.fp8_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
@@ -1222,8 +1240,6 @@ class IndexerKPool(MultiPlatformOp):
 
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
-        page_size = get_token_to_kv_pool().page_size
-        assert page_size == 64, "only support page size 64"
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
         if metadata.attn_metadata.kpool_extend_plan is not None:
@@ -1282,7 +1298,7 @@ class IndexerKPool(MultiPlatformOp):
         enable_dual_stream: bool,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        assert is_cuda(), "DSA kpool target_verify is CUDA-only"
+        assert is_cuda() or is_hip(), "DSA kpool target_verify requires CUDA/HIP"
         plan = metadata.attn_metadata.kpool_write_plan
         assert plan is not None, "DSA kpool target_verify requires kpool_write_plan"
         num_draft_tokens = plan.num_draft_tokens
@@ -1307,23 +1323,49 @@ class IndexerKPool(MultiPlatformOp):
 
         buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
 
+        physical_num_tokens = key.shape[0]
+        real_num_tokens = getattr(forward_batch, "num_token_non_padded_cpu", None)
+        if real_num_tokens is None or real_num_tokens >= physical_num_tokens:
+            real_num_tokens = physical_num_tokens
+        if real_num_tokens % num_draft_tokens != 0:
+            raise RuntimeError(
+                "DSA KPool target_verify requires real token count divisible by "
+                f"num_draft_tokens, got real_num_tokens={real_num_tokens}, "
+                f"num_draft_tokens={num_draft_tokens}, "
+                f"physical_num_tokens={physical_num_tokens}."
+            )
+
+        key_for_write = key[:real_num_tokens]
+        score_for_write = self._compute_gate_score_if_missing(
+            x[:real_num_tokens],
+            gate_score_maybe[:real_num_tokens]
+            if gate_score_maybe is not None
+            else None,
+        )
+
         def _compress_write() -> None:
+            batch_size = real_num_tokens // num_draft_tokens
             kpool_write_tail_and_maybe_compress(
                 pool=pool,
                 buf=buf,
-                key=key,
-                score=self._compute_gate_score_if_missing(x, gate_score_maybe),
+                key=key_for_write,
+                score=score_for_write,
                 tail_k=tail_k_buf,
                 tail_score=tail_score_buf,
                 ape=self.index_kpool_compress_ape,
-                req_pool_indices=plan.req,
-                write_start=plan.write_start,
-                tail_logical_start=plan.tail_logical_start,
-                write_loc=plan.write_loc,
-                out_cache_loc=forward_batch.out_cache_loc,
+                req_pool_indices=plan.req[:batch_size],
+                write_start=plan.write_start[:batch_size],
+                tail_logical_start=plan.tail_logical_start[:batch_size],
+                write_loc=plan.write_loc[:batch_size],
+                out_cache_loc=forward_batch.out_cache_loc[: key.shape[0]],
                 num_draft_tokens=num_draft_tokens,
                 round_scale=self.scale_fmt is not None,
-                effective_n_per_batch=plan.effective_n_per_batch,
+                effective_n_per_batch=(
+                    plan.effective_n_per_batch[:batch_size]
+                    if plan.effective_n_per_batch is not None
+                    else None
+                ),
+                pool_size=self.index_kpool,
             )
 
         if enable_dual_stream:
@@ -1488,7 +1530,7 @@ class IndexerKPool(MultiPlatformOp):
         if weights is None:
             weights = self._get_logits_head_gate(x, q_scale)
 
-        if is_cuda():
+        if is_cuda() or is_hip():
             if (
                 forward_batch.forward_mode.is_decode_or_idle()
                 or forward_batch.forward_mode.is_target_verify()
@@ -1516,5 +1558,5 @@ class IndexerKPool(MultiPlatformOp):
                         kpool_extend_cache=kpool_extend_cache,
                     )
         else:
-            raise NotImplementedError("kpool indexer is only supported on CUDA")
+            raise NotImplementedError("kpool indexer is only supported on CUDA/HIP")
         return topk_result

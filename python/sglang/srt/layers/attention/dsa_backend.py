@@ -164,6 +164,12 @@ if _is_hip:
     from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
 
     try:
+        from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
+    except ImportError:
+        print(
+            "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
+        )
+    try:
         from aiter import (  # noqa: F401
             flash_attn_varlen_func,
             get_mla_metadata_info_v1,
@@ -171,11 +177,8 @@ if _is_hip:
             mha_batch_prefill_func,
             paged_attention_ragged,
         )
-        from aiter.mla import mla_decode_fwd, mla_prefill_fwd  # noqa: F401
     except ImportError:
-        print(
-            "aiter is AMD specific kernel library. Please make sure aiter is installed on your AMD device."
-        )
+        pass
 else:
     from sglang.kernels.ops.attention.flash_attention import (
         flash_attn_varlen_func,
@@ -312,6 +315,7 @@ _DSA_IMPL_T: TypeAlias = Literal[
     "flashinfer_sparse_mla",
     "fa3",
     "tilelang",
+    "aiter",
     "trtllm",
 ]
 
@@ -374,6 +378,31 @@ class DeepseekSparseAttnBackend(
         self.supports_mha_one_shot: bool = True
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        if _is_hip:
+            flashmla_impls = {
+                "flashmla_sparse",
+                "flashmla_sparse_q8",
+                "flashmla_kv",
+                "flashmla_auto",
+                "flashinfer_sparse_mla",
+            }
+            remapped_prefill_impl = self.dsa_prefill_impl
+            remapped_decode_impl = self.dsa_decode_impl
+            if self.dsa_prefill_impl in flashmla_impls:
+                remapped_prefill_impl = "aiter"
+            if self.dsa_decode_impl in flashmla_impls:
+                remapped_decode_impl = "aiter"
+            if (
+                remapped_prefill_impl != self.dsa_prefill_impl
+                or remapped_decode_impl != self.dsa_decode_impl
+            ):
+                logger.warning(
+                    "Remapping HIP/HCU DSA backend away from CUDA-only FlashMLA: "
+                    f"prefill={self.dsa_prefill_impl}->{remapped_prefill_impl}, "
+                    f"decode={self.dsa_decode_impl}->{remapped_decode_impl}."
+                )
+                self.dsa_prefill_impl = remapped_prefill_impl
+                self.dsa_decode_impl = remapped_decode_impl
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
@@ -412,7 +441,7 @@ class DeepseekSparseAttnBackend(
             )
 
             self.kv_indices = torch.zeros(
-                max_bs * self.dsa_index_topk,
+                max_bs * (self.dsa_index_topk + max(self.dsa_index_kpool - 1, 0)),
                 dtype=torch.int32,
                 device=self.device,
             )
@@ -430,16 +459,6 @@ class DeepseekSparseAttnBackend(
             self.aiter_dsa_metadata_kv_dtype = None
             self.aiter_dsa_kv_last_page_lens = None
             self.aiter_dsa_work_metadata = None
-
-            if (
-                self.dsa_prefill_impl == "aiter" or self.dsa_decode_impl == "aiter"
-            ) and model_runner.kv_cache_dtype == fp8_dtype:
-                self._ensure_aiter_dsa_decode_metadata_buffer(
-                    max_seqlen_q=1,
-                    batch_size=max_bs,
-                    q_dtype=torch.bfloat16,
-                    kv_dtype=fp8_dtype,
-                )
 
         # Speculative decoding
         self.topk = get_spec().speculative_eagle_topk or 0
@@ -660,51 +679,33 @@ class DeepseekSparseAttnBackend(
         q_dtype: torch.dtype,
         kv_dtype: torch.dtype,
     ) -> dict:
-        self._ensure_aiter_dsa_decode_metadata_buffer(
-            max_seqlen_q=max_seqlen_q,
-            batch_size=bs,
-            q_dtype=q_dtype,
-            kv_dtype=kv_dtype,
-        )
-        self.aiter_dsa_kv_last_page_lens[:bs].fill_(1)
-        kv_last_page_lens = self.aiter_dsa_kv_last_page_lens[:bs]
+        _ = qo_indptr, kv_indptr, max_seqlen_q, q_dtype, kv_dtype
+        if (
+            self.aiter_dsa_kv_last_page_lens is None
+            or self.aiter_dsa_kv_last_page_lens.shape[0] < bs
+        ):
+            self.aiter_dsa_kv_last_page_lens = torch.ones(
+                (bs,), dtype=torch.int32, device=self.device
+            )
+        else:
+            self.aiter_dsa_kv_last_page_lens[:bs].fill_(1)
+        return {"kv_last_page_lens": self.aiter_dsa_kv_last_page_lens[:bs]}
 
-        get_mla_metadata_v1(
-            qo_indptr,
-            kv_indptr,
-            kv_last_page_lens,
-            self.num_head_padded,
-            1,
-            False,
-            self.aiter_dsa_work_metadata,
-            self.aiter_dsa_work_info_set,
-            self.aiter_dsa_work_indptr,
-            self.aiter_dsa_reduce_indptr,
-            self.aiter_dsa_reduce_final_map,
-            self.aiter_dsa_reduce_partial_map,
-            page_size=1,
-            kv_granularity=16,
-            max_seqlen_qo=max_seqlen_q,
-            uni_seqlen_qo=max_seqlen_q,
-            fast_mode=False,
-            topk=self.dsa_index_topk,
-            max_split_per_batch=self.aiter_dsa_max_split_per_batch,
-            intra_batch_mode=True,
-            dtype_q=q_dtype,
-            dtype_kv=kv_dtype,
+    @staticmethod
+    def _pad_aiter_sparse_indices(page_table_1: torch.Tensor) -> torch.Tensor:
+        topk = page_table_1.shape[-1]
+        padded_topk = 1 << (topk - 1).bit_length()
+        if padded_topk == topk:
+            return page_table_1
+        return torch.cat(
+            (
+                page_table_1,
+                page_table_1.new_full(
+                    (*page_table_1.shape[:-1], padded_topk - topk), -1
+                ),
+            ),
+            dim=-1,
         )
-
-        return {
-            "kv_last_page_lens": kv_last_page_lens,
-            "work_meta_data": self.aiter_dsa_work_metadata,
-            "work_indptr": self.aiter_dsa_work_indptr,
-            "work_info_set": self.aiter_dsa_work_info_set,
-            "reduce_indptr": self.aiter_dsa_reduce_indptr,
-            "reduce_final_map": self.aiter_dsa_reduce_final_map,
-            "reduce_partial_map": self.aiter_dsa_reduce_partial_map,
-            "intra_batch_mode": True,
-            "num_kv_splits": self.aiter_dsa_max_split_per_batch,
-        }
 
     def _pad_trtllm_sparse_page_table(
         self, page_table_1: torch.Tensor
@@ -2969,6 +2970,7 @@ class DeepseekSparseAttnBackend(
 
         # TODO the 2nd dim is seq_len_q, need to be >1 when MTP
         q_all = q_all.view(-1, 1, layer.tp_q_head_num, layer.head_dim)
+        num_q_tokens = q_all.shape[0]
         num_q_heads = q_all.shape[2]
         target_q_heads = self.flashmla_kv_num_q_heads
         if target_q_heads != num_q_heads:
@@ -3010,6 +3012,21 @@ class DeepseekSparseAttnBackend(
 
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
+
+        if o.shape[0] != num_q_tokens:
+            if o.shape[0] > num_q_tokens:
+                o = o[:num_q_tokens]
+            else:
+                o = torch.cat(
+                    [
+                        o,
+                        o.new_zeros(
+                            num_q_tokens - o.shape[0],
+                            *o.shape[1:],
+                        ),
+                    ],
+                    dim=0,
+                )
 
         return o
 
@@ -3111,6 +3128,80 @@ class DeepseekSparseAttnBackend(
             d_v=v_head_dim,
         )
 
+    @staticmethod
+    def _aiter_mla_stage1_available() -> bool:
+        try:
+            import aiter
+        except ImportError:
+            return False
+        return hasattr(aiter, "mla_decode_stage1_asm_fwd")
+
+    def _forward_aiter_torch_fallback(
+        self,
+        q_kernel: torch.Tensor,
+        kv_cache: torch.Tensor,
+        o_kernel: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+    ) -> None:
+        if self.kv_cache_dim < layer.head_dim:
+            raise RuntimeError(
+                "AITER fallback requires a KV cache row at least as wide as "
+                f"the query head: kv_cache_dim={self.kv_cache_dim}, "
+                f"head_dim={layer.head_dim}."
+            )
+
+        if layer.head_dim == layer.v_head_dim:
+            from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
+                triton_sparse_mla_fwd,
+            )
+
+            output = triton_sparse_mla_fwd(
+                q_nope=q_kernel,
+                q_rope=q_kernel[..., layer.v_head_dim :],
+                kv=kv_cache.view(-1, 1, self.kv_cache_dim),
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=layer.scaling,
+                d_v=layer.v_head_dim,
+            )
+            o_kernel.copy_(output.squeeze(0).to(o_kernel.dtype))
+            return
+
+        kv_values = kv_cache.view(-1, self.kv_cache_dim)[..., : layer.head_dim]
+        kv_values = kv_values.to(dtype=q_kernel.dtype)
+        kv_indptr = torch.zeros(
+            page_table_1.shape[0] + 1, dtype=torch.int32, device=self.device
+        )
+        kv_indptr[1:] = torch.cumsum((page_table_1 != -1).sum(dim=1), dim=0)
+        kv_indices = torch.zeros(
+            page_table_1.numel(), dtype=torch.int32, device=self.device
+        )
+        get_valid_kv_indices(page_table_1, kv_indptr, kv_indices, page_table_1.shape[0])
+        qo_indptr = torch.arange(
+            0, page_table_1.shape[0] + 1, dtype=torch.int32, device=self.device
+        )
+        qo_offsets = qo_indptr.tolist()
+        kv_offsets = kv_indptr.tolist()
+        for batch_idx in range(len(qo_offsets) - 1):
+            qo_start, qo_end = qo_offsets[batch_idx : batch_idx + 2]
+            kv_start, kv_end = kv_offsets[batch_idx : batch_idx + 2]
+            if qo_start == qo_end:
+                continue
+            if kv_start == kv_end:
+                o_kernel[qo_start:qo_end].zero_()
+                continue
+
+            indices = kv_indices[kv_start:kv_end].to(torch.long)
+            keys = kv_values.index_select(0, indices)
+            queries = q_kernel[qo_start:qo_end]
+            logits = torch.einsum("qhd,kd->qhk", queries, keys) * layer.scaling
+            if layer.logit_cap > 0:
+                logits = layer.logit_cap * torch.tanh(logits / layer.logit_cap)
+            weights = torch.softmax(logits.float(), dim=-1).to(queries.dtype)
+            values = keys[..., : layer.v_head_dim]
+            output = torch.einsum("qhk,kd->qhd", weights, values)
+            o_kernel[qo_start:qo_end].copy_(output.to(o_kernel.dtype))
+
     def _forward_aiter(
         self,
         q_all: torch.Tensor,
@@ -3121,6 +3212,7 @@ class DeepseekSparseAttnBackend(
         bs: int,
     ) -> torch.Tensor:
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+        page_table_1 = self._pad_aiter_sparse_indices(page_table_1)
 
         if layer.head_dim != layer.v_head_dim:
             o = q.new_empty((q.shape[0], layer.tp_q_head_num * layer.v_head_dim))
@@ -3141,12 +3233,6 @@ class DeepseekSparseAttnBackend(
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-
-        q_scale = None
-        kv_scale = None
-        aiter_persistent_kwargs = {}
-        if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
 
         kv_indptr = self.kv_indptr
 
@@ -3169,21 +3255,27 @@ class DeepseekSparseAttnBackend(
             )
             kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
-        mla_decode_fwd(
-            q_kernel,
-            kv_cache.view(-1, 1, 1, layer.head_dim),
-            o_kernel,
-            metadata.cu_seqlens_q,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            metadata.max_seq_len_q,
-            sm_scale=layer.scaling,
-            logit_cap=layer.logit_cap,
-            q_scale=q_scale,
-            kv_scale=kv_scale,
-            **aiter_persistent_kwargs,
-        )
+        if self._aiter_mla_stage1_available():
+            mla_decode_fwd(
+                q_kernel,
+                kv_cache.view(-1, 1, 1, layer.head_dim),
+                o_kernel,
+                metadata.cu_seqlens_q,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                metadata.max_seq_len_q,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+            )
+        else:
+            self._forward_aiter_torch_fallback(
+                q_kernel,
+                kv_cache,
+                o_kernel,
+                page_table_1,
+                layer,
+            )
 
         if self.need_pad_heads:
             o = o_kernel[:, :: self.head_repeat_factor, :]
@@ -3199,6 +3291,7 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         num_tokens = q_all.shape[0]
         q = q_all.reshape(-1, layer.tp_q_head_num * layer.head_dim)
+        page_table_1 = self._pad_aiter_sparse_indices(page_table_1)
 
         if layer.head_dim != layer.v_head_dim:
             o = q.new_empty((num_tokens, layer.tp_q_head_num * layer.v_head_dim))
@@ -3219,12 +3312,6 @@ class DeepseekSparseAttnBackend(
         else:
             q_kernel = q.view(-1, layer.tp_q_head_num, layer.head_dim)
             o_kernel = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
-
-        q_scale = None
-        kv_scale = None
-        aiter_persistent_kwargs = {}
-        if kv_cache.dtype == fp8_dtype:
-            kv_scale = torch.ones((), dtype=torch.float32, device=q_kernel.device)
 
         non_minus1_mask = page_table_1 != -1
         non_minus1_counts = non_minus1_mask.sum(dim=1)
@@ -3258,21 +3345,27 @@ class DeepseekSparseAttnBackend(
             kv_last_page_lens = aiter_persistent_kwargs.pop("kv_last_page_lens")
 
         # TODO support more forward_mode
-        mla_decode_fwd(
-            q_kernel,
-            kv_cache.view(-1, 1, 1, layer.head_dim),
-            o_kernel,
-            cu_seqlens_q,
-            kv_indptr,
-            kv_indices,
-            kv_last_page_lens,
-            1,  # max_seq_len_q = 1 for per-token attention
-            sm_scale=layer.scaling,
-            logit_cap=layer.logit_cap,
-            q_scale=q_scale,
-            kv_scale=kv_scale,
-            **aiter_persistent_kwargs,
-        )
+        if self._aiter_mla_stage1_available():
+            mla_decode_fwd(
+                q_kernel,
+                kv_cache.view(-1, 1, 1, layer.head_dim),
+                o_kernel,
+                cu_seqlens_q,
+                kv_indptr,
+                kv_indices,
+                kv_last_page_lens,
+                1,
+                sm_scale=layer.scaling,
+                logit_cap=layer.logit_cap,
+            )
+        else:
+            self._forward_aiter_torch_fallback(
+                q_kernel,
+                kv_cache,
+                o_kernel,
+                page_table_1,
+                layer,
+            )
 
         if self.need_pad_heads:
             o = o_kernel[:, :: self.head_repeat_factor, :]

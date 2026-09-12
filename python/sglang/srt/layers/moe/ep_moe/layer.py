@@ -79,6 +79,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors_marlin
     SlimQuantCompressedTensorsMarlinConfig,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW8A8Fp8MoE,
     NPUCompressedTensorsW4A16Int4DynamicMoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
@@ -147,6 +148,7 @@ _is_hcu = is_hcu()
 _is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
+_use_deepgemm_moe = get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 _use_w4a8_contiguous_hipc = get_bool_env_var(
@@ -555,6 +557,18 @@ class DeepEPMoE(FusedMoE):
 
     _has_printed = False
 
+    def _is_hcu_deepep_w8a8_fp8_moe(self) -> bool:
+        scheme = getattr(self, "scheme", None)
+        return (
+            _is_hcu
+            and get_moe_a2a_backend().is_deepep()
+            and (
+                isinstance(scheme, CompressedTensorsW8A8Fp8MoE)
+                or type(scheme).__name__ == "CompressedTensorsW8A8Fp8MoE"
+                or type(self.quant_config).__name__ == "W8A8Fp8Config"
+            )
+        )
+
     def __init__(
         self,
         num_experts: int,
@@ -688,7 +702,10 @@ class DeepEPMoE(FusedMoE):
             self.use_w4a8_marlin = False
             self.use_w8a8_marlin = True
             self.use_bf16_marlin = False
-        elif _use_fp8_w8a8_moe and _is_hcu:
+        elif (
+            (_use_fp8_w8a8_moe or _use_deepgemm_moe)
+            and self._is_hcu_deepep_w8a8_fp8_moe()
+        ):
             self.use_w4afp8 = False
             self.use_fp8_w8a8 = True
             self.use_block_quant = False
@@ -872,7 +889,14 @@ class DeepEPMoE(FusedMoE):
 
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             # assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
-            if deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
+            if (
+                _is_hcu
+                and _use_deepgemm_moe
+                and hasattr(self, "w13_weight_deepgemm")
+                and hasattr(self, "w2_weight_deepgemm")
+            ):
+                output = self.forward_groupgemm_w8a8_fp8_contiguous(dispatch_output)
+            elif deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8:
                 output = self.forward_deepgemm_contiguous(dispatch_output)
             elif self.use_w4a8_marlin:
                 output = self.forward_deepgemm_w4a8_marlin_contiguous(dispatch_output)
@@ -885,7 +909,17 @@ class DeepEPMoE(FusedMoE):
             elif self.use_w4afp8:
                 output = self.forward_cutlass_w4afp8(dispatch_output)
             else:
-                raise ValueError(f"Dispatch output is not supported")
+                raise ValueError(
+                    "Dispatch output is not supported: "
+                    f"quant_config={type(self.quant_config).__name__}, "
+                    f"quant_method={type(getattr(self, 'quant_method', None)).__name__}, "
+                    f"scheme={type(getattr(self, 'scheme', None)).__name__}, "
+                    f"use_fp8_w8a8={self.use_fp8_w8a8}, "
+                    f"use_w4a8_marlin={self.use_w4a8_marlin}, "
+                    f"use_w8a8_marlin={self.use_w8a8_marlin}, "
+                    f"use_bf16_marlin={self.use_bf16_marlin}, "
+                    f"has_deepgemm_weights={hasattr(self, 'w13_weight_deepgemm') and hasattr(self, 'w2_weight_deepgemm')}"
+                )
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if self.quant_config is None:
                 output = self.forward_unquantized_deepep_ll(dispatch_output)

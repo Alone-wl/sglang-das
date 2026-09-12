@@ -85,7 +85,9 @@ import torch
 import torch.distributed as dist
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
-_use_fp8_w8a8_moe = get_bool_env_var("SGLANG_USE_FP8_W8A8_MOE")
+_use_fp8_w8a8_moe = get_bool_env_var(
+    "SGLANG_USE_FP8_W8A8_MOE"
+) or get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
 _use_marlin_w16a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W16A16_MOE")
 _use_marlin_w4a16_moe = get_bool_env_var("SGLANG_USE_MARLIN_W4A16_MOE_OPT")
 

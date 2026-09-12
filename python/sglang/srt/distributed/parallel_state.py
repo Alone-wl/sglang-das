@@ -79,6 +79,9 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_hcu = is_hcu()
 _is_xpu = is_xpu()
+_hcu_disable_pynccl = _is_hcu and get_bool_env_var(
+    "SGLANG_HCU_DISABLE_PYNCCL", "true"
+)
 _is_musa = is_musa()
 use_quick_custom_allreduce = get_bool_env_var(
     "SGLANG_USE_QUICK_CUSTOM_ALLREDUCE", default="false"
@@ -1976,7 +1979,7 @@ def init_model_parallel_group(
         local_rank=local_rank,
         torch_distributed_backend=backend,
         use_pynccl=(
-            not (_is_npu or _is_xpu or backend == "mooncake")
+            not (_is_npu or _is_xpu or _hcu_disable_pynccl or backend == "mooncake")
             if use_pynccl is None
             else use_pynccl
         ),

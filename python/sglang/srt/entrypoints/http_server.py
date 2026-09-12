@@ -681,9 +681,17 @@ async def health_generate(request: Request) -> Response:
     rid = f"{HEALTH_CHECK_RID_PREFIX}_{uuid.uuid4().hex}"
 
     if _global_state.tokenizer_manager.is_generation:
+        tokenizer = _global_state.tokenizer_manager.tokenizer
+        health_input_id = 0
+        if tokenizer is not None:
+            health_input_id = (
+                getattr(tokenizer, "eos_token_id", None)
+                or getattr(tokenizer, "pad_token_id", None)
+                or health_input_id
+            )
         gri = GenerateReqInput(
             rid=rid,
-            input_ids=[0],
+            input_ids=[health_input_id],
             sampling_params=sampling_params,
             log_metrics=False,
         )

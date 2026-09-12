@@ -561,6 +561,36 @@ def supports_mamba_cache_extra_buffer(view: Any, model_arch: str) -> bool:
     return False
 
 
+def _config_attr(config: Any, name: str, default: Any = None) -> Any:
+    if config is None:
+        return default
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
+
+
+def _dsa_config_for_post_process(hf_config: Any) -> Any:
+    """Return the config object that carries DSA indexer fields.
+
+    Hybrid GLM5 checkpoints expose the served architecture on the outer config,
+    but keep DSA fields such as index_topk under text_config. The later model
+    runner normalizes to that text config before constructing the DSA backend;
+    the argument post-process pass runs earlier and therefore has to look
+    through the outer wrapper explicitly.
+    """
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    model_arch = (_config_attr(hf_config, "architectures") or [None])[0]
+    if model_arch not in _DEEPSEEK_FAMILY_ARCHS:
+        return None
+    if is_deepseek_dsa(hf_config):
+        return hf_config
+    text_config = _config_attr(hf_config, "text_config")
+    if _config_attr(text_config, "index_topk") is not None:
+        return text_config
+    return None
+
+
 @register_post_process
 def _mamba_radix_cache_resolution(view: Any) -> dict:
     """Resolve the hybrid-mamba radix cache fields (pure).
@@ -612,12 +642,9 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
     resolution: default the kv-cache dtype from the device capability
     (Blackwell FP8, Hopper bf16) and normalize the bf16 alias. Reads the
     PRISTINE dsa split backends (their resolution runs after this pass)."""
-    from sglang.srt.configs.model_config import is_deepseek_dsa
-
     hf_config = model_config_of(view).hf_config
-    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
-        return {}
-    if not is_deepseek_dsa(hf_config):
+    dsa_config = _dsa_config_for_post_process(hf_config)
+    if dsa_config is None:
         return {}
     if get_platform().is_npu or get_platform().is_xpu:
         return {}
@@ -638,7 +665,7 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
         )
 
     kv_cache_dtype = view.kv_cache_dtype
-    has_attention_sinks = bool(getattr(hf_config, "learnable_sink", False))
+    has_attention_sinks = bool(_config_attr(dsa_config, "learnable_sink", False))
     if has_attention_sinks and kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
         raise ValueError(
             "Learnable DSA attention sinks require a bfloat16 KV cache; "
@@ -690,12 +717,9 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     """Slot pass in the DSA arm: default the DSA prefill/decode split
     backends from the mid-resolution kv-cache dtype and the device
     capability. The hisparse arm takes precedence under --enable-hisparse."""
-    from sglang.srt.configs.model_config import is_deepseek_dsa
-
     hf_config = model_config_of(view).hf_config
-    if hf_config.architectures[0] not in _DEEPSEEK_FAMILY_ARCHS:
-        return {}
-    if not is_deepseek_dsa(hf_config):
+    dsa_config = _dsa_config_for_post_process(hf_config)
+    if dsa_config is None:
         return {}
     if get_platform().is_npu or get_platform().is_xpu:
         return {}
@@ -715,7 +739,7 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
         and not get_platform().is_hip
     )
 
-    if getattr(hf_config, "learnable_sink", False):
+    if _config_attr(dsa_config, "learnable_sink", False):
         backend = "flashmla_sparse"
         for field in ("dsa_prefill_backend", "dsa_decode_backend"):
             value = getattr(view, field)

@@ -17,7 +17,7 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -117,8 +117,13 @@ class KPoolWritePlan:
     effective_n_per_batch: Optional[torch.Tensor] = None
 
 
-def _is_kpool_layout_enabled(pool_size: int, real_page_size: int) -> bool:
-    return pool_size > 1 and real_page_size == 64 and real_page_size % pool_size == 0
+def _is_kpool_layout_enabled(
+    pool_size: int, real_page_size: int, slots_per_page: int = 64
+) -> bool:
+    return pool_size > 1 and (
+        (real_page_size == 64 and real_page_size % pool_size == 0)
+        or (is_hip() and real_page_size == 1 and slots_per_page == 1)
+    )
 
 
 @dataclass
@@ -496,7 +501,7 @@ def init_kpool_extend_metadata(
     mode = forward_batch.forward_mode
     is_extend_like = mode.is_extend_without_speculative() or mode.is_draft_extend_v2()
     if (
-        not _is_kpool_layout_enabled(pool_size, real_page_size)
+        not _is_kpool_layout_enabled(pool_size, real_page_size, slots_per_page)
         or not is_extend_like
         or forward_batch.extend_seq_lens_cpu is None
         or forward_batch.seq_lens_cpu is None
@@ -577,7 +582,7 @@ def init_pooled_paged_mqa_metadata(
     build_schedule_metadata: bool = True,
 ) -> DSAMetadata:
     if (
-        not _is_kpool_layout_enabled(pool_size, real_page_size)
+        not _is_kpool_layout_enabled(pool_size, real_page_size, slots_per_page)
         or not is_cuda()
         or not forward_mode.is_decode_or_idle()
     ):
@@ -617,7 +622,7 @@ def update_pooled_paged_mqa_metadata(
     build_schedule_metadata: bool = True,
 ) -> None:
     if (
-        not _is_kpool_layout_enabled(pool_size, real_page_size)
+        not _is_kpool_layout_enabled(pool_size, real_page_size, slots_per_page)
         or not is_cuda()
         or not forward_mode.is_decode_or_idle()
     ):
@@ -699,7 +704,10 @@ def init_kpool_write_plan_capture(
     is_v2: bool = False,
     build_schedule_metadata: bool = True,
 ) -> DSAMetadata:
-    if not _is_kpool_layout_enabled(pool_size, real_page_size) or num_draft_tokens == 0:
+    if (
+        not _is_kpool_layout_enabled(pool_size, real_page_size, slots_per_page)
+        or num_draft_tokens == 0
+    ):
         return metadata
 
     plan = _alloc_kpool_write_plan_buffers(
@@ -732,7 +740,9 @@ def update_kpool_write_plan(
     slots_per_page: int,
     effective_n_per_batch: Optional[torch.Tensor] = None,
 ) -> None:
-    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_cuda():
+    if not _is_kpool_layout_enabled(pool_size, real_page_size, slots_per_page) or not (
+        is_cuda() or is_hip()
+    ):
         return
     is_verify = forward_mode.is_target_verify()
     is_decode = forward_mode.is_decode_or_idle()
@@ -793,7 +803,10 @@ def init_kpool_write_plan(
     is_decode = forward_mode.is_decode_or_idle()
     is_v2 = forward_mode.is_draft_extend_v2()
     is_ring_write = is_verify or is_decode or is_v2
-    if not _is_kpool_layout_enabled(pool_size, real_page_size) or not is_ring_write:
+    if (
+        not _is_kpool_layout_enabled(pool_size, real_page_size, slots_per_page)
+        or not is_ring_write
+    ):
         return metadata
 
     pool = getattr(forward_batch, "token_to_kv_pool", None)
