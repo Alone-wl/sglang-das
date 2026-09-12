@@ -92,16 +92,88 @@ Validation of the inherited checkpoint before committing it:
 Corresponding checkpoint commit: this document's initial checkpoint commit
 (`wip(hcu): checkpoint GLM-5.3 Flash FP8 runtime adaptation`).
 
+### 2026-09-12 (session two): target-only isolation
+
+To decide whether the earlier incoherent output originates in the target
+path or the EAGLE draft path, the launcher was copied and stripped of the
+four `--speculative-*` flags into `/home/work/glm/target_only.sh`. The
+env is identical to `ifb.sh` (`SGLANG_USE_DEEPGEMM_MOE=1`, aiter/hip
+FlashMLA remap, DeepEP normal on eight ranks, FP8 KV cache).
+
+Two runs were captured:
+
+1. `target_only_v2.log` first attempt sent a single-token prompt (`Hello`).
+   All eight TP ranks stalled inside `causal_conv1d_fn` at
+   `python/sglang/srt/layers/attention/linear/kda_backend.py`
+   for the full 300-second scheduler watchdog. `causal_conv1d_fn` is a
+   Triton kernel with a hard-coded convolution width of four, and a
+   1-token prefill is a corner case where the queried window is shorter
+   than the kernel. The scheduler debug at kill time reported
+   `leaked_mamba_pages={2, 3, 4}`; the mamba pool held the request but
+   forward never returned.
+2. A rerun with multi-token prompts (`"The quick brown fox …"`, etc.) hung
+   identically, this time in the first MoE layer: all eight ranks blocked
+   in `torch.distributed.all_gather_object` inside DeepEP's `Buffer.__init__`
+   (`python/sglang/srt/layers/moe/token_dispatcher/deepep.py:379`).
+   The MainThread native frames were only `libc.so.6`; every rank was
+   stuck in the same collective, not diverging. NCCL logs report the
+   NUMA-balancing warning and the missing `iommu=pt` boot flag but no
+   fatal error before the hang.
+
+Both hangs happen on the first prefill and both start from the same
+pretrained-weight state, so they are unlikely to be caused by
+per-request state divergence. The plausible root causes are:
+
+- A stale DeepEP shared-memory / semaphore layout left by earlier kills
+  that the new run inherits (`/dev/shm/sem.mp-*` was populated). Cleaning
+  those between runs is now a required step for the isolation harness.
+- A collective-timing dependency where the first DeepEP `Buffer` init
+  races the HCU custom-allreduce fence and one rank temporarily leaves
+  the collective, blocking `all_gather_object` forever. `common.sh`
+  disables the DCU custom allreduce (`USE_DCU_CUSTOM_ALLREDUCE=0`),
+  but `parallel_state.py` still defaults to disabling pynccl on HCU
+  (`SGLANG_HCU_DISABLE_PYNCCL=true`), routing collectives through NCCL /
+  Gloo instead. The earlier successful `target_only.log` run at 11:11
+  had run once and then died at 11:24; subsequent starts have never
+  reached generation.
+
+Neither corresponds to a numerical bug in the target model. Until a
+prefill returns, target-vs-draft correctness cannot be isolated at all,
+so the immediate priority is unblocking the first prefill on the
+current commit rather than chasing dequant paths.
+
+Candidate divergences flagged from source-only review (all still
+unverified — none reproduce standalone without the server):
+
+- `_forward_aiter_torch_fallback` in
+  `python/sglang/srt/layers/attention/dsa_backend.py:3140` skips a KV
+  scale when casting FP8 KV to bfloat16. On the primary MLA path
+  (`layer.head_dim != layer.v_head_dim`) this is used unconditionally
+  whenever `aiter.mla_decode_stage1_asm_fwd` is missing.
+- `communicator_mhc.attn_to_mlp` zero-pads hidden_states to residual's
+  batch size before `hc_post`, papering over a shape mismatch whose
+  root cause is not documented (see
+  `python/sglang/srt/layers/communicator_mhc.py:94`).
+- KDA `forward_target_verify` pads `core_attn_out` with zeros to
+  `physical_seq_len`, which sends zero-attention outputs into the sampler
+  for the padded positions (see `linear/kda_backend.py:1067`).
+
 ## Known unresolved issues
 
-1. Greedy target output is incoherent on simple prompts. Because EAGLE verifies
-   draft proposals against the target, the 0% draft acceptance is evidence of a
-   mismatch but does not by itself identify whether the target path, draft path,
+1. First prefill hangs before returning any token — either in
+   `causal_conv1d_fn` (KDA) or in `all_gather_object` (DeepEP Buffer
+   init), depending on prompt length. The scheduler watchdog fires
+   after 300s and kills the run.
+2. Greedy target output is incoherent on simple prompts in the runs
+   that did complete. Because EAGLE verifies draft proposals against
+   the target, the 0% draft acceptance is evidence of a mismatch but
+   does not by itself identify whether the target path, draft path,
    or both are wrong.
-2. The first request after model load can spend several minutes in lazy
-   compilation. This must not be mistaken for a scheduler deadlock; subsequent
-   health requests are fast.
-3. Accuracy has not yet been validated against a trusted reference response or
-   evaluation set.
-4. The supplied `/home/work/glm/ifb.sh` warmup path has not yet completed in this
-   session; the inherited server used `--skip-server-warmup`.
+3. The first request after model load can spend several minutes in lazy
+   compilation. This must not be mistaken for a scheduler deadlock;
+   subsequent health requests are fast (when the run reaches steady state
+   at all).
+4. Accuracy has not yet been validated against a trusted reference
+   response or evaluation set.
+5. The supplied `/home/work/glm/ifb.sh` warmup path has not yet completed
+   in this session; the inherited server used `--skip-server-warmup`.
