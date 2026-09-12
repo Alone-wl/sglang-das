@@ -30,17 +30,29 @@ class _HcuLayerOwnership:
             return
         self._hcu_is_indexer = hasattr(self, "indexer_page_stride_size")
         device_refs = []
+        host_refs = self.index_k_data_refs if self._hcu_is_indexer else self.data_refs
+        host_ptrs = []
         for pool in (self.device_pool, *self.mtp_draft_device_pools):
             buffers = (
                 self._get_device_index_buffers(pool)
                 if self._hcu_is_indexer
                 else pool.kv_buffer
             )
-            device_refs.extend(buffers[i] for i in self._owned_device_layer_ids(pool))
+            for layer_id in self._owned_device_layer_ids(pool):
+                host_layer_id, _ = self._transfer_layer_ids(
+                    pool, layer_id, is_draft=pool is not self.device_pool
+                )
+                device_refs.append(buffers[layer_id])
+                host_ptrs.append(kernel_accessible_host_ptr(host_refs[host_layer_id]))
         self._hcu_device_data_ptrs = torch.tensor(
             [x.data_ptr() for x in device_refs],
             dtype=torch.uint64,
             device=self.device_pool.device,
+        )
+        # Main reserves the worst-rank layer count, so host storage may include
+        # padding layers. Pair only owned target/draft layers for the copy kernel.
+        self._hcu_host_data_ptrs = torch.tensor(
+            host_ptrs, dtype=torch.uint64, device=self.device_pool.device
         )
 
     def _backup_hcu_layer_first(self, host_indices, device_indices):
@@ -50,11 +62,10 @@ class _HcuLayerOwnership:
             host_indices, device_indices = self._get_indexer_page_indices(
                 host_indices, device_indices
             )
-            host_ptrs = self.index_k_data_ptrs
             item_size = self.indexer_page_stride_size
         else:
-            host_ptrs = self.data_ptrs
             item_size = self.token_stride_size
+        host_ptrs = self._hcu_host_data_ptrs
         if host_ptrs.numel() == 0 or host_indices.numel() == 0:
             return
         transfer_kv_all_layer_mla_lf_lf_D2H_hcu(

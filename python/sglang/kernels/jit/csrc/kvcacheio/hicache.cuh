@@ -19,8 +19,8 @@ inline void* hicache_kernel_accessible_ptr(tvm::ffi::TensorView tensor) {
 #ifdef USE_ROCM
   if (ptr != nullptr && (tensor.device().device_type == kDLCPU || tensor.device().device_type == kDLGPUHost)) {
     void* device_ptr = nullptr;
-    const auto err = cudaHostGetDevicePointer(&device_ptr, ptr, 0);
-    host::RuntimeCheck(err == cudaSuccess, "HiCache host memory must be registered as mapped");
+    const auto err = hipHostGetDevicePointer(&device_ptr, ptr, 0);
+    host::RuntimeCheck(err == hipSuccess, "HiCache host memory must be registered as mapped");
     return device_ptr;
   }
 #endif
