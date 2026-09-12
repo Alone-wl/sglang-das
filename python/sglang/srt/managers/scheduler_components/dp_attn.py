@@ -230,8 +230,8 @@ def _update_gather_batch(
         batch.global_forward_mode = mlp_sync_info.global_forward_mode
 
     # Check forward mode for cuda graph
-    batch.can_run_dp_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
-    batch.can_run_dp_breakable_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
+    batch.can_run_decode_cuda_graph = mlp_sync_info.can_run_decode_cuda_graph
+    batch.can_run_dp_prefill_cuda_graph = mlp_sync_info.can_run_prefill_cuda_graph
 
 
 def prepare_mlp_sync_batch_raw(
