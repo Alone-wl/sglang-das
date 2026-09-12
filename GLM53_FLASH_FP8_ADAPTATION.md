@@ -158,22 +158,56 @@ unverified — none reproduce standalone without the server):
   `physical_seq_len`, which sends zero-attention outputs into the sampler
   for the padded positions (see `linear/kda_backend.py:1067`).
 
+### 2026-09-12 (session two, later): first prefill unblocked
+
+The DeepEP `Buffer.__init__` `all_gather_object` hang and the KDA
+`causal_conv1d_fn` hang both cleared after clearing the stale sglang
+shared-memory state that earlier crashed sglang runs had left behind:
+
+```
+rm -f /dev/shm/sglang_loads_*.shm \
+      /dev/shm/sgl_shm_mm_* \
+      /dev/shm/sgl_shm_mq_* \
+      /dev/shm/sem.mp-* \
+      /dev/shm/torch_*
+```
+
+A fresh `target_only.sh` after that cleanup reached
+"fired up and ready to roll" and returned three deterministic /generate
+responses back-to-back on port 8080. Because the token IDs match on
+repeated runs of the same prompts, the pipeline is deterministic —
+subsequent numerical work can rely on that.
+
+The observed outputs (greedy, temperature=0, top_k=1):
+
+```
+'The quick brown fox jumps over the lazy' -> '漂浮umo phen率umuwesen禹 SF'
+'1 + 1 = 2. 2 + 2 ='                       -> '-minRONinisubstLOTSiple意ortun'
+'Once upon a time in a'                    -> ' secondary âanolick inquire goose珍aniwargsSubsetikhbih'
+```
+
+So there is definitely a numerical bug on the target path, independent
+of EAGLE: this is target-only. The suspects flagged from source review
+(aiter torch MLA fallback missing KV scale, MHC `attn_to_mlp` zero pad,
+KDA `target_verify` zero pad) can now be tested for real.
+
+Operational rule for the isolation harness going forward: **always
+clean `/dev/shm` before starting a new sglang run**; skipping this step
+is what caused the earlier "target model hangs on first prefill"
+symptom that was misread as a KDA / DeepEP correctness bug.
+
 ## Known unresolved issues
 
-1. First prefill hangs before returning any token — either in
-   `causal_conv1d_fn` (KDA) or in `all_gather_object` (DeepEP Buffer
-   init), depending on prompt length. The scheduler watchdog fires
-   after 300s and kills the run.
-2. Greedy target output is incoherent on simple prompts in the runs
-   that did complete. Because EAGLE verifies draft proposals against
-   the target, the 0% draft acceptance is evidence of a mismatch but
-   does not by itself identify whether the target path, draft path,
-   or both are wrong.
-3. The first request after model load can spend several minutes in lazy
-   compilation. This must not be mistaken for a scheduler deadlock;
-   subsequent health requests are fast (when the run reaches steady state
-   at all).
-4. Accuracy has not yet been validated against a trusted reference
+1. Greedy target output is deterministically incoherent on simple
+   prompts. Because EAGLE verifies draft proposals against the target,
+   the 0% draft acceptance the earlier session recorded is fully
+   consistent with a broken target path; whether the draft path also
+   has independent issues remains to be checked.
+2. The first request after model load can spend several minutes in
+   lazy compilation. This must not be mistaken for a scheduler
+   deadlock; subsequent health requests are fast.
+3. Accuracy has not yet been validated against a trusted reference
    response or evaluation set.
-5. The supplied `/home/work/glm/ifb.sh` warmup path has not yet completed
-   in this session; the inherited server used `--skip-server-warmup`.
+4. The supplied `/home/work/glm/ifb.sh` warmup path has not yet
+   completed in this session; the inherited server used
+   `--skip-server-warmup`.
