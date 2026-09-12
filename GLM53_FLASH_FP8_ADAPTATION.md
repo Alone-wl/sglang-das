@@ -196,18 +196,138 @@ clean `/dev/shm` before starting a new sglang run**; skipping this step
 is what caused the earlier "target model hangs on first prefill"
 symptom that was misread as a KDA / DeepEP correctness bug.
 
+### 2026-09-12 (session two, still later): numerical hypotheses ruled out
+
+Ran the target-only launcher with `--kv-cache-dtype fp8_e4m3` in a stable
+loop (post-shm-cleanup) against three fixed multi-token prompts. The
+output is deterministic and identical run-to-run:
+
+```
+'The quick brown fox jumps over the lazy' -> '漂浮umo phen率umuwesen禹 SF'
+'1 + 1 = 2. 2 + 2 ='                       -> '-minRONinisubstLOTSiple意ortun'
+'Once upon a time in a'                    -> ' secondary âanolick inquire goose珍aniwargsSubsetikhbih'
+```
+
+Verified against sources; ruled out:
+
+- **`_forward_aiter_torch_fallback` KV scale.** For GLM-5.3-Flash
+  `qk_rope_head_dim == 0`, so `attn_mqa.head_dim == kv_lora_rank == 512
+  == v_head_dim`. That takes the `triton_sparse_mla_fwd` branch, not
+  the einsum loop. The kernel decodes FP8 via `.to(bfloat16)` on the
+  raw `float8_e4m3fn`-view KV buffer, which is arithmetically correct
+  because `set_mla_kv_buffer_triton_fp8_quant` writes the raw MLA KV
+  layout without per-block scales and stores as uint8 aliased to
+  `torch.float8_e4m3fn` via `store_dtype`.
+- **`_forward_aiter_torch_fallback` head-count MFMA.** `need_pad_heads`
+  fires (`num_q_heads = 8 < 16`) and `repeat_interleave` duplicates
+  each head so the kernel sees `H=16`; the output stride `[:, ::factor,
+  :]` picks the correct duplicate.
+- **Tilelang MHC pre.** Rerun with `SGLANG_OPT_USE_TILELANG_MHC_PRE=0`
+  produced bit-identical garbled output. (`SGLANG_OPT_USE_TILELANG_MHC_POST=0`
+  was not honored — `envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(True)` runs
+  somewhere later in model_hook or server_args; that specific flag is not
+  disable-able from the launcher alone. Model-hook line 400 only fires
+  for DeepseekV4, not `GlmMoeDsaForCausalLM`.)
+- **MHC hc_pre/hc_post kernels.** `sglang-das` diff vs upstream in
+  `mhc.py` is a cosmetic refactor; the tilelang and torch dispatches
+  are semantically identical.
+- **DeepGEMM channel-FP8 MoE weight prep.** The DCU reference at
+  `/Users/wanglong/Code/sglang-model` uses the same
+  `pack_int8_weight_enk_to_w6_low_latency` packer against FP8 weights
+  in `_prepare_dsv4_channel_fp8_deepgemm_weights` and feeds the same
+  `m_grouped_fp8_gemm_nt_contiguous`. Packer-name mismatch is not the
+  bug.
+- **kpool_bf16_paged_mqa_logits kernel.** The FP8 K decode path (bit
+  extraction, subnormal handling, NaN sentinel) matches the E4M3FN
+  spec; the K side applies its per-slot scale; the Q side folds
+  `q_scale` into `weights` via `_get_logits_head_gate`, so the
+  algebraic identity `max(q_r·k_r, 0)·w = max(q_fp8·k_fp8, 0)·(w·q_s·k_s)`
+  holds.
+- **FP8 KV write kernel `set_mla_kv_buffer_fp8_quant_kernel`.** Handles
+  the `rope_dim == 0` case (GLM-5.3-Flash's layout) by taking the
+  `base + BLOCK <= nope_dim` early branch; the BF16→FP8 downcast is
+  done via a typed `tl.store` with no manual scaling, matching how the
+  fallback reads it back.
+- **bf16 KV variant.** Falls over on the DSA indexer with
+  `AssertionError: Scaled index K cache is not enabled` in
+  `memory_pool.py:5089` -- the indexer read path assumes the scaled
+  index K path but the pool only allocates it in FP8 mode. This is a
+  separate correctness bug in the bf16 KV path, not a workaround for
+  the FP8 accuracy problem.
+- **`_forward_tilelang`.** Crashes in `libtilelang.so`
+  `GemmNode::InferLayout` → `make_hcu_swizzled_layout` for the
+  gemm_hcu_mmac shape (D_V=512, H=8-or-16). Tilelang DSA prefill/decode
+  is not viable on gfx938 at this shape.
+- **`SGLANG_USE_DEEPGEMM_MOE=0` variant.** Hard-crashes at the DeepEP
+  dispatch: `Dispatch output is not supported: quant_config=...
+  scheme=CompressedTensorsW8A8Fp8MoE, use_fp8_w8a8=False,
+  has_deepgemm_weights=False`. `deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM`
+  is False on HCU, so this scheme has no working dispatch branch
+  besides `SGLANG_USE_DEEPGEMM_MOE=1`.
+- **`forward_mla_rocm.py` drift.** `md5 diff` vs upstream shows two
+  attribute-access diffs only (`get_parallel().dcp_replicate_q_proj`
+  vs `get_parallel().config.dcp_replicate_q_proj`); no semantic
+  divergence.
+
+Suspects that remain unverified but still possible:
+
+- **Aiter DeepEP normal-mode dispatch payload shape / stride.** The
+  scheme's forward path is `deepep dispatch → forward_impl → forward_groupgemm_w8a8_fp8_contiguous`;
+  we compared the das and DCU-reference forward_groupgemm bodies and
+  they match, but the `pack_int8_weight_enk_to_w6_low_latency` packer
+  is called on **compressed-tensors channel-FP8** weights (per token
+  `strategy: token`, per channel `strategy: channel`). Whether the
+  packer really preserves FP8 magnitude for these strategies on HCU
+  gfx938 wasn't validated at the tensor level — a smoke test that
+  dumps `w13_weight_deepgemm.dequantize()` vs the original per-channel
+  bf16 weight for one expert would settle this.
+- **Compressed-tensors kv_cache_scheme is null.** But the launcher
+  forces `--kv-cache-dtype fp8_e4m3` regardless. If the model
+  checkpoint expects a different KV quantization convention than
+  `mla_quantize_for_fp8_no_rope`'s plain `.to(float8_e4m3fn)` cast,
+  that would look exactly like this bug. No public description of the
+  intended KV quantization was found in the checkpoint's
+  `quantization_config`.
+- **DSA indexer `weights_proj` path.** `_get_logits_head_gate` uses
+  `self.weights_proj(x.float())`. If `weights_proj` weights are
+  channel-FP8 quantized, casting `x` to float in Python and doing the
+  linear in FP32 while the weights are FP8 (via bf16 upcast) may work,
+  but validate that this path exists on HCU.
+- **Deep model divergence points not yet inspected:**
+  `Glm5NextForConditionalGeneration.__init__` weight-loader mapping,
+  the `fused_qkvbfg_a_proj` packed slice ordering, the MTP eh_proj /
+  enorm / hnorm paths (excluded from quantization per the config
+  `ignore` list — need to confirm they are loaded in bf16).
+
+Operational notes:
+
+- Always clean `/dev/shm` (`sglang_loads_*.shm`, `sgl_shm_mm_*`,
+  `sgl_shm_mq_*`, `sem.mp-*`, `torch_*`) before starting a new run.
+- `SGLANG_OPT_USE_TILELANG_MHC_POST` cannot be disabled from the
+  launcher; toggling it requires a code change in `environ.py` or
+  `arg_groups/model_hook.py`.
+- SSH goes through a 2FA `zz_jump_wl` ProxyJump. Do not retry after a
+  failed attempt (the jump blacklists brute force); when the
+  ControlMaster socket at `~/.ssh/control-wanglong3@42.228.13.241:65024`
+  is gone, ask the user to `ssh nmz26` once from their terminal to
+  rebuild it.
+
 ## Known unresolved issues
 
 1. Greedy target output is deterministically incoherent on simple
-   prompts. Because EAGLE verifies draft proposals against the target,
-   the 0% draft acceptance the earlier session recorded is fully
-   consistent with a broken target path; whether the draft path also
-   has independent issues remains to be checked.
-2. The first request after model load can spend several minutes in
+   prompts. The list of possible root causes has narrowed but no
+   candidate has been confirmed. Highest-yield next probes: dump
+   `w13_weight_deepgemm.dequantize()` for one expert and compare
+   against the raw channel-FP8 weight; then dump the FP8 KV buffer
+   after the first write, cast back to bf16, and compare against
+   `(cache_k_nope || cache_k_rope).to(bf16)`.
+2. `--kv-cache-dtype bfloat16` cannot currently launch: the DSA
+   indexer asserts `use_scaled_index_k_cache` unconditionally.
+3. The first request after model load can spend several minutes in
    lazy compilation. This must not be mistaken for a scheduler
-   deadlock; subsequent health requests are fast.
-3. Accuracy has not yet been validated against a trusted reference
+   deadlock; subsequent requests are fast.
+4. Accuracy has not yet been validated against a trusted reference
    response or evaluation set.
-4. The supplied `/home/work/glm/ifb.sh` warmup path has not yet
+5. The supplied `/home/work/glm/ifb.sh` warmup path has not yet
    completed in this session; the inherited server used
    `--skip-server-warmup`.
