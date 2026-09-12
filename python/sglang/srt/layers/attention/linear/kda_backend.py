@@ -1586,9 +1586,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
         needs_repad = n_valid is not None and n_valid < n_total
         if needs_repad:
             mixed_qkv = mixed_qkv[:n_valid]
-            # a/b shape: [1, N, ...] after model layer's unsqueeze(0).
-            a = a[:, :n_valid] if a.ndim == 4 else a[:n_valid]
-            b = b[:, :n_valid] if b.ndim == 3 else b[:n_valid]
+
+        if n_valid is not None:
+            # Main's linear-attention wrapper may already trim mixed_qkv while
+            # leaving the [1, N, ...] gates padded. Align their token dimension
+            # even when mixed_qkv no longer needs trimming here.
+            num_tokens = mixed_qkv.shape[0]
+            a = a[:, :num_tokens] if a.ndim in (3, 4) else a[:num_tokens]
+            b = b[:, :num_tokens] if b.ndim == 3 else b[:num_tokens]
 
         forward_metadata = self.forward_metadata
         # Match hybrid_linear_attn_backend._forward_metadata: read the CURRENT
