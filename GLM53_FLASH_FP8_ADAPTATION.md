@@ -27,7 +27,7 @@
 ## 当前状态
 
 - 本地分支：`glm5.3-flash`；推送目标：`wl/glm5.3-flash`。
-- 本次文档重构前的本地基线：`782f6c8577`。
+- 当前本地代码提交：`a5f5c1f0dc`；其后只有本文档的状态更新。
 - 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`191fc0cc91`，已落后于本地文档提交。
 - 模型：`/home/work/GLM-5.3-Flash-Channel-FP8-w8a8`。
 - 硬件：8 张 HCU，`gfx938`。
@@ -90,6 +90,8 @@
 | `fe3abe5842` | HCU ragged MQA logits 改用 LightOp | 对 Torch 参考最大绝对误差 `3.8e-06` |
 | `191fc0cc91` | 记录四个长 prompt 故障和当前阻塞 | 文档提交 |
 | `782f6c8577` | 修正 HiCache-off 和 EvalScope 结论 | 文档提交 |
+| `7a03aa8469` | 将调试日志重构为精简中文交接文档 | `git diff --check`；未修改代码 |
+| `a5f5c1f0dc` | 缺少融合模块时复用 Torch pooled-history top-k | CPU 语义测试、`compileall`、`git diff --check` 通过；待 HCU 验证 |
 
 ## 调试记录
 
