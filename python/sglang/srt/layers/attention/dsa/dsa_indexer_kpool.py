@@ -16,13 +16,20 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hcu, is_hip, is_npu
 
 if is_cuda():
     try:
         import deep_gemm
     except ImportError as e:
         deep_gemm = e
+
+_is_hcu = is_hcu()
+if _is_hcu:
+    # HCU has no DeepGEMM build, so every deep_gemm.*_mqa_logits call in this
+    # module has a LightOp counterpart below. This is the same operator the
+    # non-kpool DSA indexer uses on HCU (_hcu_mqa_logits in dsa_indexer.py).
+    from lightop import attention as lightop_attention
 
 if is_npu():
     import custom_ops  # noqa: F401
@@ -934,14 +941,33 @@ class IndexerKPool(MultiPlatformOp):
                 scale_out=k_scale,
             )
             k_fp8 = k_u8.view(torch.float8_e4m3fn)
-            logits = deep_gemm.fp8_mqa_logits(
-                q_fp8[:n_real].contiguous(),
-                (k_fp8.contiguous(), k_scale.contiguous()),
-                weights[:n_real].contiguous(),
-                ks_per_q,
-                ke_per_q,
-                clean_logits=True,
-            )
+            if _is_hcu:
+                # DeepGEMM has no HCU build (deep_gemm_wrapper.ENABLE_JIT_
+                # DEEPGEMM is False there, and this module only imports
+                # deep_gemm under is_cuda()). The HCU ragged MQA-logits
+                # operator is the same LightOp entry the non-kpool DSA indexer
+                # already uses for this exact computation (_hcu_mqa_logits in
+                # dsa_indexer.py), so reuse it rather than reimplementing the
+                # kernel. The two differ in the KV operand: deep_gemm takes a
+                # (K, scale) tuple, LightOp takes K plus explicit kv_scale.
+                logits = lightop_attention.mqa_logits(
+                    q_fp8[:n_real].contiguous(),
+                    k_fp8.contiguous(),
+                    weights[:n_real].contiguous(),
+                    ks_per_q,
+                    ke_per_q,
+                    kv_scale=k_scale.contiguous(),
+                    clean_logit=True,
+                )
+            else:
+                logits = deep_gemm.fp8_mqa_logits(
+                    q_fp8[:n_real].contiguous(),
+                    (k_fp8.contiguous(), k_scale.contiguous()),
+                    weights[:n_real].contiguous(),
+                    ks_per_q,
+                    ke_per_q,
+                    clean_logits=True,
+                )
         else:
             logits = torch.empty((n_real, 0), dtype=torch.float32, device=device)
 
@@ -1166,14 +1192,28 @@ class IndexerKPool(MultiPlatformOp):
                     and zero_starts_by_batch[i] is not None
                     else torch.zeros((q_len,), dtype=torch.int32, device=q_fp8.device)
                 )
-                local_logits = deep_gemm.fp8_mqa_logits(
-                    q_fp8[q_slice].contiguous(),
-                    (k_fp8.contiguous(), k_scale.contiguous()),
-                    weights[q_slice].contiguous(),
-                    row_starts,
-                    local_pool_lens,
-                    clean_logits=True,
-                )
+                if _is_hcu:
+                    # Same substitution as _get_topk_ragged_kpool_plan: DeepGEMM
+                    # does not exist on HCU, use the LightOp ragged MQA-logits
+                    # operator the non-kpool DSA indexer already relies on.
+                    local_logits = lightop_attention.mqa_logits(
+                        q_fp8[q_slice].contiguous(),
+                        k_fp8.contiguous(),
+                        weights[q_slice].contiguous(),
+                        row_starts,
+                        local_pool_lens,
+                        kv_scale=k_scale.contiguous(),
+                        clean_logit=True,
+                    )
+                else:
+                    local_logits = deep_gemm.fp8_mqa_logits(
+                        q_fp8[q_slice].contiguous(),
+                        (k_fp8.contiguous(), k_scale.contiguous()),
+                        weights[q_slice].contiguous(),
+                        row_starts,
+                        local_pool_lens,
+                        clean_logits=True,
+                    )
             else:
                 local_logits = torch.empty(
                     (q_len, 0), dtype=torch.float32, device=q_fp8.device
