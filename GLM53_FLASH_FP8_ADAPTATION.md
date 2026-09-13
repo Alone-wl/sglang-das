@@ -19,6 +19,38 @@
   validation result, corresponding commit, and known unresolved issue so that a
   different engineer can resume without reconstructing the history.
 
+- Keep this document current with every reproduced problem, diagnosis, fix,
+  validation result, corresponding commit, and known unresolved issue so that a
+  different engineer can resume without reconstructing the history.
+
+## Requirements added during the session
+
+These were added by the operator after the original brief above and are
+binding in the same way:
+
+1. **Debug accuracy from the root cause; do not reward-hack.** No fitting the
+   output, no suppressing a symptom, no special-casing the probe prompts. When
+   a candidate is ruled out, record *how* it was ruled out, not just that it
+   was.
+2. **Regress the parallel scheme to plain TP first and check whether the bug
+   survives.** Only if it does, look further. (Done: the incoherent-output bug
+   reproduced with `--tp-size 8 --ep-size 1 --moe-a2a-backend none`, which
+   retired EP/DeepEP/EAGLE as causes before any deeper work.)
+3. **On node-login problems, stop and hand back for the operator to fix; do
+   not retry.** The 2FA ProxyJump blacklists repeated failures, so a retry can
+   lock the account out. (Applied once: the control socket disappeared and the
+   next attempt returned `Too many authentication failures`; work stopped
+   rather than retried.)
+4. **Run the supplied `ifb.sh` once; if it works, create a venv with `uv`,
+   install evalscope, and run GSM8K and MATH-500.** If anything is broken,
+   stop and report rather than improvising around it.
+5. **For the long-prompt crash: disable HiCache first and debug in that
+   configuration.** If the problem persists with HiCache off, keep fixing it;
+   if it clears, write the issue down and carry on with HiCache disabled.
+   Outcome recorded below under "final session": the VMFault clears, the
+   long-prompt failure does not, so both halves of the instruction were
+   followed.
+
 ## Environment and branch
 
 - Local branch: `glm5.3-flash`.
@@ -29,6 +61,13 @@
 - Main runtime configuration: TP=8, EP=8, DeepEP normal mode, DSA/NSA,
   FP8-E4M3 KV cache, hierarchical cache, hybrid Mamba extra buffer, and EAGLE
   speculative decoding.
+- **Current effective configuration (2026-09-13): hierarchical cache is
+  disabled.** `/home/work/glm/ifb_nohicache.sh` is `ifb.sh` minus
+  `--enable-hierarchical-cache`, `--hicache-size`, `--hicache-write-policy`,
+  `--hicache-io-backend` and `--hicache-mem-layout`. This is a deliberate
+  workaround for the Mamba-backup VMFault (known issue 3), not a config
+  preference; re-enable HiCache once that fault is diagnosed. The commit on
+  the remote checkout is `191fc0cc91`.
 
 ## Inherited work before this debugging session
 
@@ -570,32 +609,154 @@ blocker and was not resolved before this report.**
 - Server startup is ~7-8 minutes; keep the threshold probes batched so one
   launch answers several questions.
 
+## 2026-09-13 (final session): HiCache-off re-verification and the eval stall
+
+This section continues directly from the Failure 1-4 sequence above. Operating
+instruction for this session: **turn HiCache off and re-verify the long-prompt
+crash; if HiCache-off still fails, keep fixing it; if it clears, record the
+issue and continue with HiCache off.**
+
+### HiCache-off re-verification (a clean confirmation of Failure 1)
+
+HiCache-off was already in place via `ifb_nohicache.sh` (confirmed: zero
+`hierarchical-cache`/`hicache-*` flags in the launcher). Restarted clean after
+`/dev/shm` cleanup and re-ran the threshold ladder twice.
+
+Server: `fired up` = 1, `VMFault` = **0**, no startup errors.
+
+```
+reps=  1  prompt_tok=  11 -> OK  3.1s
+reps=  4  prompt_tok=  41 -> OK  3.0s
+reps=  8  prompt_tok=  81 -> OK  3.1s     <-- died here with HiCache ON
+reps= 16  prompt_tok= 161 -> OK  3.1s
+reps= 32  prompt_tok= 321 -> OK  3.1s
+reps= 64  prompt_tok= 641 -> OK  3.3s
+reps=128  prompt_tok=1281 -> OK  3.8s
+reps=256               -> CRASH
+```
+
+So the answer to the instruction is unambiguous:
+
+- **HiCache off removes the VMFault entirely.** `KERNEL VMFault` count is 0
+  across the whole session, versus repeated kernel VMFaults plus
+  `transfer_mamba_backup_kernel` and exit code -6 with HiCache on. The
+  practical prompt limit moves from 81 to 1281 tokens.
+- **HiCache off does NOT remove the long-prompt problem.** The 2561-token
+  rung still kills the server, with the identical Failure 4 signature and
+  nothing else:
+
+  ```
+  ModuleNotFoundError: No module named
+    'sglang.kernels.ops.moe.kpool_topk_transform'      (x8, one per rank)
+  VMFault count: 0
+  ```
+
+  Per the instruction ("if it still fails, keep fixing"), diagnosis continued;
+  see the route analysis under Failure 4 above. No fix was landed this session.
+
+Also worth recording: the failing prefill is a **cached** one
+(`#cached-token: 640` on the 641-token rung), i.e. chunked/prefix-cached
+prefill reaches `_get_topk_ragged_kpool_plan` just as a cold one does.
+
+### The evalscope GSM8K run did not fail because of a crash
+
+This corrects an earlier reading of this session. The GSM8K smoke run
+(limit 20, `--eval-batch-size 1`, `max_tokens: 2048`) was labelled a crash -
+by-association because the separate threshold ladder crashes. It was not.
+
+What actually happened, from `out_gsm8k_smoke/logs/eval_log.log` and
+`/tmp/glm53_eval.log`:
+
+- The server did **not** crash: `Scheduler hit an exception` = 0,
+  `Fatal Python error` = 0, `KERNEL VMFault` = 0.
+- The server did **not** stall: the decode batches are progressing normally
+  (`#full token` advancing 1978 -> 2018 -> 2058 at a steady ~50s/step, mamba
+  num 4).
+- evalscope simply made no measurable progress: 49+ minutes elapsed, still
+  `0/20`, with `Attempt 1 / 5 failed: Request timed out.. Retrying...`.
+- No predictions were written: `out_gsm8k_smoke/predictions/` is empty; only
+  `configs/task_config.yaml` and `logs/eval_log.log` exist.
+
+So the real symptom is **throughput, not correctness**: with
+`--eval-batch-size 1` and `max_tokens: 2048`, a single GSM8K request needs
+thousands of decode steps at roughly 20 tokens/minute on this box, which is
+far outside evalscope's request timeout. Three separate concerns are tangled
+here and must not be conflated:
+
+| Concern | Evidence | Status |
+| --- | --- | --- |
+| Long-prompt crash (>~1280 tok) | Failure 4 ModuleNotFoundError | real, open |
+| GSM8K eval produces no score | 0/20 after 49 min, retry timeouts | real, open - a throughput/config problem |
+| GSM8K crash | none observed | not a thing |
+
+### Throughput numbers measured this session
+
+These matter for sizing the eval run and are the reason a 20-question smoke
+test could not finish:
+
+- Short-prompt request, 8 output tokens: ~3.1-3.8 s (all rungs).
+- GSM8K-shaped request (`max_tokens: 2048`): decode advanced ~40 tokens per
+  ~50 s, i.e. **roughly 20-50 tokens/minute**. A full 2048-token answer would
+take on the order of an hour.
+- EAGLE acceptance was 0.23-0.28 / accept length 2.2-2.4 during these runs.
+
+Before any further eval attempt, the timeout must be raised well beyond
+evalscope's default and `max_tokens` cut to something a greedy GSM8K answer
+actually needs, otherwise every request will time out and retry regardless of
+whether the model is correct.
+
+### Correction to the record above
+
+An earlier turn of this session reported the GSM8K smoke run as having
+crashed the server. That was wrong, and it was wrong in a way worth naming:
+the crash was inferred from the *separate* threshold ladder rather than read
+off the eval's own log. The eval server log shows no crash at all. The
+unresolved-issue entry for the eval was rewritten accordingly.
+
 ## Known unresolved issues
 
-1. **OPEN — long prompts (>~1280 tokens) still kill the server.** Current
-   blocker is `ModuleNotFoundError: sglang.kernels.ops.moe.kpool_topk_transform`
-   reached from `_get_topk_ragged_kpool_plan` via
-   `topk_from_pooled_history_logits`. See Failure 4 above for why neither a
-   plain restore of the upstream file nor the built-in fallback works, and
-   what the viable routes are. This must be resolved before GSM8K/MATH-500
-   evalscope runs, because GSM8K prompts plus reasoning exceed the threshold.
-2. **HiCache Mamba-backup VMFault is avoided, not fixed.**
+1. **OPEN, blocker for evals — long prompts (>~1280 tokens) kill the server.**
+   Confirmed to persist with HiCache disabled, so it is independent of
+   Failure 1. Signature:
+   `ModuleNotFoundError: sglang.kernels.ops.moe.kpool_topk_transform`, one per
+   rank, raised from `_get_topk_ragged_kpool_plan` ->
+   `topk_from_pooled_history_logits`. See Failure 4 for why neither a plain
+   restore of the two upstream files nor the built-in Python fallback works.
+2. **OPEN — the GSM8K evalscope run yields no score, and the cause is
+   throughput/timeout, not a crash.** 0/20 after 49 minutes with
+   `--eval-batch-size 1` and `max_tokens: 2048`; server healthy throughout
+   (`Scheduler hit an exception` = 0, decode advancing normally); no
+   predictions written. Needs a raised request timeout and a realistic
+   `max_tokens` before it can produce a number. Do **not** treat this as a
+   model-correctness signal either way - no answer was ever scored.
+3. **HiCache Mamba-backup VMFault is avoided, not fixed.**
    `transfer_mamba_backup_kernel` still faults on HCU with
-   `--enable-hierarchical-cache`. HiCache is disabled for now; re-enabling it
-   needs the fault diagnosed (likely an out-of-range `params.layer_ptrs[layer_id]`
-   read in `python/sglang/kernels/jit/csrc/kvcacheio/transfer_mamba.cuh`).
-3. Residual accuracy degradation on long greedy generations, as recorded
+   `--enable-hierarchical-cache` (81-token prompt, exit code -6). HiCache is
+   disabled for now; re-enabling it needs the fault diagnosed, likely an
+   out-of-range `params.layer_ptrs[layer_id]` read in
+   `python/sglang/kernels/jit/csrc/kvcacheio/transfer_mamba.cuh`.
+4. Residual accuracy degradation on long greedy generations, as recorded
    earlier in this document. Unchanged by this session's fixes.
-4. The `deepseek_v4.py` half of the norm fix is unverified (no DeepSeek-V4
+5. The `deepseek_v4.py` half of the norm fix is unverified (no DeepSeek-V4
    launch was run).
-5. `--kv-cache-dtype bfloat16` still cannot launch: the DSA indexer asserts
+6. `--kv-cache-dtype bfloat16` still cannot launch: the DSA indexer asserts
    `use_scaled_index_k_cache` unconditionally.
-6. Accuracy has not been validated against a trusted reference response or an
-   evaluation set. evalscope 1.11.1 is installed at
-   `/home/work/evalscope_uv/.venv` (uv 0.12.13) and both GSM8K (1319 rows) and
-   MATH-500 (500 rows) load, so the harness is ready as soon as issue 1 clears.
-7. The supplied `/home/work/glm/ifb.sh` warmup path now completes, but the full
-   `ifb.sh` (with HiCache) still hits the issue-2 VMFault on long prompts.
+7. Accuracy has **not** been validated against any reference or eval set.
+   evalscope 1.11.1 is installed at `/home/work/evalscope_uv/.venv`
+   (uv 0.12.13) and both GSM8K (1319 rows) and MATH-500 (500 rows) load, so
+   the harness itself is ready; it has simply never completed a question.
+8. The supplied `/home/work/glm/ifb.sh` warmup path completes, but the full
+   `ifb.sh` (with HiCache) still hits issue 3 on long prompts.
+
+## Next actions, in order
+
+1. Clear issue 1 (`kpool_topk_transform`) — it is the only thing standing
+   between the current tree and a runnable eval.
+2. Then clear issue 2: raise evalscope's request timeout and lower
+   `max_tokens` (a greedy GSM8K answer does not need 2048), and confirm the
+   run at limit 5-20 before scaling up.
+3. Only then read an accuracy number. Nothing measured so far is an accuracy
+   result.
 
 ## Operating notes (additions)
 
