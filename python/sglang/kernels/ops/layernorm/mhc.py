@@ -1069,7 +1069,16 @@ def mhc_pre(
             gemm_last_dim = hc_mult3
             big_fuse_n_splits = n_splits
 
-    if _is_hcu and _use_aiter_tilelang_mhc:
+    if _is_hcu and _use_aiter_tilelang_mhc and norm_weight is None:
+        # AITER's pre_big_fuse_tilelang has no norm_weight/norm_eps parameters
+        # and never RMSNorm-normalizes layer_input. Taking this branch while a
+        # norm weight was requested would still report norm_fused=True to
+        # hc_pre(), which suppresses the caller's separate input_layernorm /
+        # post_attention_layernorm application (see communicator_mhc.py) and
+        # leaves the whole residual stream unnormalized. When a norm weight is
+        # present, fall through to the branches below, which do fuse it
+        # (mhc_pre_big_fuse_with_norm_tilelang) or apply it explicitly.
+        #
         # AITER fixes the physical last dimension to hc_mult3. The small-batch
         # split-k GEMM pads it to 32, so compact its valid prefix before the
         # fused kernel instead of sending AITER a mismatched physical layout.
@@ -1820,7 +1829,14 @@ def _mhc_pre_dispatch(
         norm_weight=norm_weight,
         norm_eps=norm_eps,
     )
-    return post_mix, comb_mix, layer_input, norm_weight is not None
+    # Restores the upstream contract: the branches above fuse the model-layer
+    # RMSNorm into layer_input exactly when a norm weight was supplied, and the
+    # AITER HCU kernel is only taken when there is nothing to fuse. Reporting
+    # True for a backend that did not actually normalize would suppress the
+    # caller's fallback in communicator_mhc.py and silently unnormalize the
+    # residual stream.
+    norm_fused = norm_weight is not None
+    return post_mix, comb_mix, layer_input, norm_fused
 
 
 @torch._dynamo.disable
@@ -1830,6 +1846,11 @@ def _mhc_post_dispatch(
     post_layer_mix: torch.Tensor,
     comb_res_mix: torch.Tensor,
 ) -> torch.Tensor:
+    # Honour the same opt-out as the baseline: server_args / model_hook clear
+    # SGLANG_OPT_USE_TILELANG_MHC_POST on platforms where the tilelang kernel is
+    # not usable, and mhc_post_torch is the reference-equivalent fallback.
+    if not envs.SGLANG_OPT_USE_TILELANG_MHC_POST.get():
+        return mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
 
