@@ -421,47 +421,181 @@ Representative before/after on identical prompts:
 A 20-prompt sanity screen (ASCII-plausible, no repeated-token loop, no CJK
 bleed on English prompts) scores 15/20 after the fix.
 
+## 2026-09-13 (later): long-prompt crash — HiCache and a DSA kernel gap
+
+### Symptom
+
+The official `/home/work/glm/ifb.sh` starts cleanly and serves short requests,
+but any prompt above roughly 80-1300 tokens kills the server. Reproduced
+outside evalscope with plain `/generate`, so it is not an eval-harness
+concurrency artifact. Three distinct failures were peeled off in order.
+
+### Failure 1 — HiCache Mamba-backup VMFault (mitigated by disabling HiCache)
+
+With `--enable-hierarchical-cache`, a 81-token prefill faulted:
+
+```
+KERNEL VMFault, Invalid address access ... Error code: 3   (all 8 devices)
+Fatal Python error: Aborted / ROCR Runtime::VMFaultHandler segfault
+Subprocess scheduler_1 crashed with exit code -6
+```
+
+The VMFault analysis blocks repeatedly name `transfer_mamba_backup_kernel`
+(`python/sglang/kernels/jit/csrc/kvcacheio/transfer_mamba.cuh`), the HiCache
+Mamba-state write-back kernel. Not previously seen: every session-two log had
+VMFault count 0, but those runs only ever sent <=14-token prompts and never
+crossed the threshold where this path trips.
+
+Measured long-prompt survival with HiCache on vs off:
+
+| Configuration | Largest passing prompt |
+| --- | --- |
+| `--enable-hierarchical-cache` | 1281 tokens (dies at ~2561) |
+| `--disable-hierarchical-cache` | 1281 tokens, then later failure changed shape |
+
+Disabling HiCache removed the segfault entirely and raised the practical
+limit, so HiCache is currently left **off** (`ifb_nohicache.sh`, generated from
+`ifb.sh` by dropping the five `hicache`/`hierarchical-cache` arguments).
+The underlying HiCache VMFault is **not** fixed, only avoided.
+
+### Failure 2 — dangling `memory` config leaf (fixed)
+
+Turning HiCache off could not even start: `_should_elide_dsa_index_k` read
+`memory_config.enable_unified_cache_external_linker`, a leaf that does not
+exist in the published `memory` namespace. The identifier appears exactly once
+in the tree (that read) and nowhere in the upstream baseline; the GLM import
+commit `979baf5a81` introduced it as a dangling reference that only fires on
+the HiCache-off path. Fixed in `e256489848` by restoring the upstream
+predicate. Note this guard decides whether the DSA indexer K cache is elided,
+so it is on the correctness path for DSA, not just startup.
+
+### Failure 3 — `deep_gemm` used but never imported on HCU (fixed)
+
+Next the scheduler died with:
+
+```
+NameError: name 'deep_gemm' is not defined
+  at dsa_indexer_kpool.py:937, in _get_topk_ragged_kpool_plan
+```
+
+`deep_gemm` is imported only under `if is_cuda()`. On HCU `is_cuda()` is False
+and `is_hip()` is True, so the name is never bound — yet the ragged-extend
+path called `deep_gemm.fp8_mqa_logits` unconditionally. The paged/decode path
+in the same file *does* have an `is_hip()` fallback, and the non-kpool DSA
+indexer has one for both (`dsa_indexer.py`: `_hcu_paged_mqa_logits` /
+`_hcu_mqa_logits`); the ragged-extend path was simply never given one.
+
+This is why only long prompts died: short requests are served by the
+decode/kpool-paged branch, so `_get_topk_ragged_kpool_plan` is never reached.
+
+Fixed in `fe3abe5842` by gating both `deep_gemm.fp8_mqa_logits` calls on
+`_is_hcu` and calling `lightop_attention.mqa_logits`, the operator
+`dsa_indexer.py` already uses on HCU, imported at module scope under the same
+`is_hcu` guard. Verified at operator level against a torch reference over a
+ragged layout in FP8 e4m3 with per-K `kv_scale`: max abs diff 3.8e-06,
+output shape `(6, 40)` float32.
+
+**Semantics worth recording:** `clean_logit=True` applies **ReLU** to the
+dot products, i.e. the operator computes `sum_h w * relu(q.k) * k_scale` and
+does *not* prefill `-inf` outside each row's `[ks, ke)` window. The top-k
+transform masks via the `ks`/`ke` lengths instead. A first reference attempt
+that omitted the ReLU disagreed by 51.4 against a reference max of 28.1, which
+is what pinned the semantics down.
+
+### Failure 4 — missing `kpool_topk_transform` JIT module (OPEN, current blocker)
+
+With failures 1-3 cleared, a ~2561-token prompt advances one frame further and
+now dies at:
+
+```
+ModuleNotFoundError: No module named 'sglang.kernels.ops.moe.kpool_topk_transform'
+  at kpool_fp8_index.py:761, in topk_from_pooled_history_logits
+  <- dsa_indexer_kpool.py:986 _get_topk_ragged_kpool_plan
+```
+
+The GLM import commit `979baf5a81` **dropped three files** that the upstream
+GLM-5.3-Flash commit `0b9c38484e` shipped:
+
+| File | State in das |
+| --- | --- |
+| `python/sglang/kernels/ops/moe/kpool_topk_transform.py` | missing |
+| `python/sglang/kernels/jit/csrc/dsa/kpool_topk_transform.cuh` | missing |
+| `python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py` | present (fork's own version) |
+
+The two missing files do exist in this repo's history (`c66a285c94`,
+`ee0f2375e5`, on `remotes/origin/sync/official-main-daily-20260907`), but that
+branch is **not** an ancestor of the das `glm5.3-flash` branch.
+
+Why a plain restore is not the answer: the `.cuh` is CUDA-only C++
+(`__global__`, `cudaFuncSetAttribute`, `#include <cuda_fp16.h>`, SM90-era
+radix top-k), so it cannot JIT-compile on gfx938. And the Python fallback that
+`kpool_fp8_index.py` keeps is explicitly refused on this call path — the
+ragged-extend caller passes `row_starts=ks_per_q`, and the fallback does
+
+```python
+except ModuleNotFoundError:
+    if row_starts is not None or page_table_row_index is not None:
+        raise
+```
+
+so it re-raises rather than degrading. A torch top-k equivalent for the
+`row_starts` + pool-expansion case has to be written or routed to an existing
+HCU top-k (`DSATopKBackend` already has an HCU-aware `topk_func` and reserves
+`sgl-kernel`/`torch`/`flashinfer` implementations). **This is the current
+blocker and was not resolved before this report.**
+
+### Long-prompt threshold, measured
+
+| Prompt tokens | HiCache on | HiCache off, before fix 3 | HiCache off, after fix 3 |
+| --- | --- | --- | --- |
+| 11 | ok | ok | ok |
+| 41 | ok | ok | ok |
+| 81 | VMFault | ok | ok |
+| 161 / 321 / 641 | — | ok | ok |
+| 1281 | — | ok | ok |
+| 2561 | — | `deep_gemm` NameError | `kpool_topk_transform` ModuleNotFoundError |
+
+### Operational notes added this session
+
+- Hicache-off launcher: `/home/work/glm/ifb_nohicache.sh`, generated from
+  `ifb.sh` by deleting `--enable-hierarchical-cache`, `--hicache-size`,
+  `--hicache-write-policy`, `--hicache-io-backend`, `--hicache-mem-layout`.
+- The container checkout needs
+  `git fetch wl 'refs/heads/wl/glm5.3-flash'` followed by
+  `git reset --hard FETCH_HEAD`; a bare `git fetch wl` maps the branch to
+  `wl/wl/glm5.3-flash` and leaves the working tree behind. Always confirm with
+  `git log --oneline -1`.
+- On-HCU operator probes (`/tmp/vm3.py` style) settle a signature/semantics
+  question in seconds and caught the ReLU. Prefer them to end-to-end runs.
+- Server startup is ~7-8 minutes; keep the threshold probes batched so one
+  launch answers several questions.
+
 ## Known unresolved issues
 
-1. **Residual accuracy defect — long greedy generations still degrade.**
-   With the norm bug fixed, short generations are correct, but several
-   prompts still fall into repetition or derail past roughly 30-60 tokens:
-
-   ```
-   '2+2='                    -> '2+2=4\n\n2+2=4\n\n2+2=4\n\n2+2=4\n\n...'      (loop, but the first token is right)
-   '1+1='                    -> '+1+1+1+1+1+1+1+1+1+1+1+1'
-   'What is 2+2?'            -> ' 演 2 的 4 次方，即 16。...'                        (wrong + CJK bleed)
-   'Machine learning is a'   -> ' hot topic these days. 机器学习是当今的热门话题。...'
-   'The largest planet is'   -> ' Neptune, 4,498,396,441 km from the sun.'
-   ```
-
-   This is now a *different* and much narrower failure than the original
-   one, and the correct answer is frequently the **first** emitted token
-   (e.g. `2+2=` -> `4`), so a large part of the residual error sits
-   downstream of the first decode step. `/v1/chat/completions` delegates to
-   the same engine and shows the same symptom, so it is not a chat-template
-   or detokenizer artifact.
-
-   Ruled out for this residual: EP/DeepEP (see Step 1), EAGLE (present
-   target-only), and the mHC norm (see Step 3). Not yet ruled out: the
-   `attn_to_mlp` zero-pad workaround
-   (`communicator_mhc.py:94`, which pads `hidden_states` up to
-   `residual.shape[0]` with zeros rather than explaining the mismatch), the
-   KDA `forward_target_verify` zero-pad, the `kv_cache_scheme: null` vs
-   forced `--kv-cache-dtype fp8_e4m3` mismatch, and the
-   `--nsa-decode-backend flashmla_kv` -> `aiter` remap.
-2. **The `deepseek_v4.py` half of the fix is unverified.** It only affects
-   DeepSeek-V4 mHC on HCU and no DeepSeek-V4 launch was run. Confirm on a
-   DeepSeek-V4 start that `input_layernorm` is applied exactly once.
-3. `--kv-cache-dtype bfloat16` still cannot launch: the DSA indexer asserts
+1. **OPEN — long prompts (>~1280 tokens) still kill the server.** Current
+   blocker is `ModuleNotFoundError: sglang.kernels.ops.moe.kpool_topk_transform`
+   reached from `_get_topk_ragged_kpool_plan` via
+   `topk_from_pooled_history_logits`. See Failure 4 above for why neither a
+   plain restore of the upstream file nor the built-in fallback works, and
+   what the viable routes are. This must be resolved before GSM8K/MATH-500
+   evalscope runs, because GSM8K prompts plus reasoning exceed the threshold.
+2. **HiCache Mamba-backup VMFault is avoided, not fixed.**
+   `transfer_mamba_backup_kernel` still faults on HCU with
+   `--enable-hierarchical-cache`. HiCache is disabled for now; re-enabling it
+   needs the fault diagnosed (likely an out-of-range `params.layer_ptrs[layer_id]`
+   read in `python/sglang/kernels/jit/csrc/kvcacheio/transfer_mamba.cuh`).
+3. Residual accuracy degradation on long greedy generations, as recorded
+   earlier in this document. Unchanged by this session's fixes.
+4. The `deepseek_v4.py` half of the norm fix is unverified (no DeepSeek-V4
+   launch was run).
+5. `--kv-cache-dtype bfloat16` still cannot launch: the DSA indexer asserts
    `use_scaled_index_k_cache` unconditionally.
-4. The first request after model load can spend several minutes in lazy
-   compilation. This must not be mistaken for a scheduler deadlock.
-5. Accuracy has not yet been validated against a trusted reference response
-   or an evaluation set. A scored eval (e.g. GSM8K or an OpenCompass run on
-   the container) is the right next gate now that generation is coherent.
-6. The supplied `/home/work/glm/ifb.sh` warmup path has not yet completed in
-   this session; all validation used `--skip-server-warmup` launchers.
+6. Accuracy has not been validated against a trusted reference response or an
+   evaluation set. evalscope 1.11.1 is installed at
+   `/home/work/evalscope_uv/.venv` (uv 0.12.13) and both GSM8K (1319 rows) and
+   MATH-500 (500 rows) load, so the harness is ready as soon as issue 1 clears.
+7. The supplied `/home/work/glm/ifb.sh` warmup path now completes, but the full
+   `ifb.sh` (with HiCache) still hits the issue-2 VMFault on long prompts.
 
 ## Operating notes (additions)
 
