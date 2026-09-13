@@ -717,6 +717,92 @@ def _append_kpool_tail_to_topk_kernel(
     tl.store(out_ptr + row * out_stride_0 + cols * out_stride_1, value, mask=mask)
 
 
+def _torch_topk_pooled_history(
+    logits: torch.Tensor,
+    group_lengths: torch.Tensor,
+    pool_size: int,
+    topk: int,
+    page_table: torch.Tensor | None = None,
+    topk_offsets: torch.Tensor | None = None,
+    seq_lens: torch.Tensor | None = None,
+    row_starts: torch.Tensor | None = None,
+    out_rows: int | None = None,
+    page_table_row_index: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Torch fallback matching the pooled-history top-k transform semantics."""
+    rows, cols = logits.shape
+    group_topk = history_group_budget_for_topk(topk, pool_size)
+    device = logits.device
+
+    col_idx = torch.arange(cols, device=device, dtype=torch.int32)
+    if row_starts is None:
+        valid_lo = torch.zeros(rows, device=device, dtype=torch.int32)
+    else:
+        valid_lo = row_starts.to(torch.int32)
+    valid_hi = valid_lo + group_lengths.to(torch.int32)
+    valid_mask = (col_idx.unsqueeze(0) >= valid_lo.unsqueeze(1)) & (
+        col_idx.unsqueeze(0) < valid_hi.unsqueeze(1)
+    )
+
+    masked = torch.where(valid_mask, logits, torch.full_like(logits, float("-inf")))
+    selected_count = min(group_topk, cols)
+    _, group_ids = torch.topk(masked, k=selected_count, dim=1)
+    if selected_count < group_topk:
+        group_ids = torch.cat(
+            [
+                group_ids,
+                torch.zeros(
+                    (rows, group_topk - selected_count),
+                    device=device,
+                    dtype=group_ids.dtype,
+                ),
+            ],
+            dim=1,
+        )
+    group_ids = group_ids.to(torch.int32)
+
+    if row_starts is not None:
+        group_ids = group_ids - valid_lo.unsqueeze(1)
+
+    if page_table is not None and page_table_row_index is not None:
+        page_table = page_table.index_select(0, page_table_row_index.to(torch.int64))
+
+    rank = torch.arange(group_topk, device=device, dtype=torch.int32)
+    valid_counts = group_lengths.to(torch.int32).clamp(max=min(cols, group_topk))
+    group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
+    expanded = expand_pooled_groups_to_topk(
+        group_ids.contiguous(),
+        group_valid,
+        topk=topk,
+        pool_size=pool_size,
+        page_table=page_table,
+        topk_offsets=topk_offsets,
+    )
+    if seq_lens is None:
+        result = expanded
+    else:
+        result = append_kpool_tail_to_topk(
+            expanded,
+            seq_lens=seq_lens,
+            pool_lens=group_lengths,
+            pool_size=pool_size,
+            page_table=page_table,
+            topk_offsets=topk_offsets,
+        )
+
+    if out_rows is None or out_rows == result.shape[0]:
+        return result
+    assert out_rows >= result.shape[0]
+    padded = torch.full(
+        (out_rows, result.shape[1]),
+        -1,
+        dtype=result.dtype,
+        device=result.device,
+    )
+    padded[: result.shape[0]] = result
+    return padded
+
+
 def topk_from_pooled_history_logits(
     logits: torch.Tensor,
     group_lengths: torch.Tensor,
@@ -751,9 +837,17 @@ def topk_from_pooled_history_logits(
             f"(topk={topk}, pool_size={pool_size})."
         )
     if not logits.is_cuda or logits.dtype != torch.float32:
-        raise NotImplementedError(
-            "index_kpool topk requires CUDA float32 logits; PyTorch topk fallback "
-            f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
+        return _torch_topk_pooled_history(
+            logits=logits,
+            group_lengths=group_lengths,
+            pool_size=pool_size,
+            topk=topk,
+            page_table=page_table,
+            topk_offsets=topk_offsets,
+            seq_lens=seq_lens,
+            row_starts=row_starts,
+            out_rows=out_rows,
+            page_table_row_index=page_table_row_index,
         )
 
     if group_topk in (128, 160, 192, 224, 256, 512):
@@ -761,84 +855,38 @@ def topk_from_pooled_history_logits(
             from sglang.kernels.ops.moe.kpool_topk_transform import (
                 fast_kpool_topk_transform_fused,
             )
-
-            result = fast_kpool_topk_transform_fused(
-                score=logits,
-                lengths=group_lengths.to(torch.int32),
+        except (ImportError, AttributeError):
+            return _torch_topk_pooled_history(
+                logits=logits,
+                group_lengths=group_lengths,
                 pool_size=pool_size,
                 topk=topk,
-                page_table=page_table,
-                topk_indices_offset=topk_offsets,
-                row_starts=row_starts,
-                seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
-                page_table_row_index=page_table_row_index,
-            )
-            if out_rows is None or out_rows == result.shape[0]:
-                return result
-            padded = torch.full(
-                (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
-            )
-            padded[: result.shape[0]] = result
-            return padded
-        except ModuleNotFoundError:
-            if row_starts is not None or page_table_row_index is not None:
-                raise
-
-            group_rank = torch.arange(cols, device=logits.device).unsqueeze(0)
-            valid_logits = logits.masked_fill(
-                group_rank >= group_lengths.to(torch.int64).unsqueeze(1),
-                float("-inf"),
-            )
-            selected_count = min(cols, group_topk)
-            selected_groups = torch.topk(
-                valid_logits, k=selected_count, dim=1
-            ).indices.to(torch.int32)
-            if selected_count < group_topk:
-                selected_groups = torch.cat(
-                    [
-                        selected_groups,
-                        torch.zeros(
-                            logits.shape[0],
-                            group_topk - selected_count,
-                            dtype=torch.int32,
-                            device=logits.device,
-                        ),
-                    ],
-                    dim=1,
-                )
-            rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
-            max_valid_groups = min(cols, group_topk)
-            valid_counts = torch.minimum(
-                group_lengths.to(torch.int32),
-                torch.full_like(group_lengths.to(torch.int32), max_valid_groups),
-            )
-            group_valid = rank.unsqueeze(0) < valid_counts.unsqueeze(1)
-            expanded = expand_pooled_groups_to_topk(
-                selected_groups.contiguous(),
-                group_valid,
-                topk=topk,
-                pool_size=pool_size,
                 page_table=page_table,
                 topk_offsets=topk_offsets,
+                seq_lens=seq_lens,
+                row_starts=row_starts,
+                out_rows=out_rows,
+                page_table_row_index=page_table_row_index,
             )
-            if seq_lens is None:
-                result = expanded
-            else:
-                result = append_kpool_tail_to_topk(
-                    expanded,
-                    seq_lens=seq_lens,
-                    pool_lens=group_lengths,
-                    pool_size=pool_size,
-                    page_table=page_table,
-                    topk_offsets=topk_offsets,
-                )
-            if out_rows is None or out_rows == result.shape[0]:
-                return result
-            padded = torch.full(
-                (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
-            )
-            padded[: result.shape[0]] = result
-            return padded
+
+        result = fast_kpool_topk_transform_fused(
+            score=logits,
+            lengths=group_lengths.to(torch.int32),
+            pool_size=pool_size,
+            topk=topk,
+            page_table=page_table,
+            topk_indices_offset=topk_offsets,
+            row_starts=row_starts,
+            seq_lens=seq_lens.to(torch.int32) if seq_lens is not None else None,
+            page_table_row_index=page_table_row_index,
+        )
+        if out_rows is None or out_rows == result.shape[0]:
+            return result
+        padded = torch.full(
+            (out_rows, result.shape[1]), -1, dtype=result.dtype, device=result.device
+        )
+        padded[: result.shape[0]] = result
+        return padded
 
     assert (
         page_table_row_index is None

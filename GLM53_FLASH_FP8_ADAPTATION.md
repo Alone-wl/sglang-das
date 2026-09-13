@@ -34,14 +34,15 @@
 - 主配置：TP=8、EP=8、DeepEP normal、DSA/NSA、FP8-E4M3 KV cache、Mamba、EAGLE。
 - 当前临时关闭 HiCache，使用 `/home/work/glm/ifb_nohicache.sh`。这是规避 Mamba backup VMFault 的临时措施，不是最终配置。
 - 短 prompt 已能生成连贯文本；短输出乱码的根因已修复。
-- 当前正确性阻塞：约 2561-token prefill 缺少 HCU 可用的 `kpool_topk_transform`。
+- 约 2561-token prefill 的 `kpool_topk_transform` 缺失已在本地补齐 Torch fallback，等待 HCU 验证。
 - 当前评测阻塞：GSM8K 单请求解码过慢并触发 EvalScope 超时；没有得到有效评分，不能据此判断模型精度。
 
 ## Todo（每次提交必须更新）
 
 | 状态 | 优先级 | 事项 | 完成标准 |
 | --- | --- | --- | --- |
-| 待办 | P0 | 修复 HCU `kpool_topk_transform` 缺失 | 冷/热 prefill 均通过 2561、4096、8192 token；索引语义与参考实现一致；无 VMFault |
+| 进行中 | M1/P0 | **纯 TP 部署精度正常** | TP=8、EP=1、无 DeepEP、无 EAGLE；长 prompt 稳定；GSM8K/MATH-500 与可信基线对齐；记录配置、分数、截断率和失败样例 |
+| 本地完成，待 HCU 验证 | M1/P0 | 修复 HCU `kpool_topk_transform` 缺失 | 冷/热 prefill 均通过 2561、4096、8192 token；索引语义与参考实现一致；无 VMFault |
 | 待办 | P0 | 完成长 prompt 回归 | HiCache 关闭时按 11、81、641、1281、2561、4096、8192 token 分级验证并记录日志 |
 | 待办 | P1 | 定位 GSM8K 极低吞吐 | 分别测 target-only/完整配置的 TTFT、decode tok/s、EAGLE 接受率，明确瓶颈 |
 | 待办 | P1 | 完成 GSM8K smoke | 使用合理输出上限和超时先跑 5 条，再跑 20 条；记录截断率、失败样例和分数 |
@@ -196,7 +197,7 @@ sum_h weight * relu(q·k) * k_scale
 
 它不负责把行区间外填成 `-inf`；区间屏蔽由后续 top-k transform 根据 `ks`/`ke` 完成。
 
-#### 4.4 缺少 HCU `kpool_topk_transform`：当前 P0
+#### 4.4 缺少 HCU `kpool_topk_transform`：本地已修复，待 HCU 验证
 
 修复前述问题后，约 2561-token prefill 报：
 
@@ -217,7 +218,7 @@ _get_topk_ragged_kpool_plan
 
 当前 Python fallback 在 `row_starts` 或 `page_table_row_index` 非空时重新抛异常，而 ragged prefill 正好传入 `row_starts=ks_per_q`。
 
-建议复用 `/Users/wanglong/Code/sglang-model/python/sglang/srt/layers/attention/nsa/kpool/kernels.py` 中 `_torch_topk_pooled_history`，适配到 `dsa/kpool_fp8_index.py`。该实现已处理 `row_starts`、`group_lengths`、pool expansion、page table、tail 和 `out_rows`。正确性通过后，再按 DCU 参考尝试 `aiter.kpool_topk` 或 LightOp `fast_kpool_topk_transform_fused`；Torch 版本只作保底。
+本地已从 `/Users/wanglong/Code/sglang-model/python/sglang/srt/layers/attention/nsa/kpool/kernels.py` 移植 `_torch_topk_pooled_history` 到 `dsa/kpool_fp8_index.py`。该实现处理 `row_starts`、`group_lengths`、pool expansion、page table、tail 和 `out_rows`；融合模块导入失败时进入该 fallback。异常捕获只包围导入，已加载算子的运行错误不会被掩盖。正确性通过后，再按 DCU 参考尝试 `aiter.kpool_topk` 或 LightOp `fast_kpool_topk_transform_fused`；Torch 版本只作保底。
 
 必须测试：
 
@@ -226,6 +227,13 @@ _get_topk_ragged_kpool_plan
 - `page_table`、`page_table_row_index`、`topk_offsets` 和 `out_rows`。
 - 无 pooled history、列数小于 top-k、冷 prefill 和 prefix-cache prefill。
 - top-k 后将全局列号减去有效窗口起点，恢复局部 pooled-group 编号。
+
+本地验证：
+
+- 从实际源文件 AST 加载 fallback，CPU 语义测试通过。
+- 覆盖非零 `row_starts`、page-table 行重映射、`topk_offsets`、`out_rows`、空 history、列数小于 group top-k 和 tail append。
+- `compileall` 通过；本机没有 Triton，因此 HCU kernel helper 只能在服务器验证。
+- `git diff --check` 通过。
 
 #### 4.5 分级结果
 
@@ -286,7 +294,7 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 
 ## 未解决问题
 
-1. **P0：长 prompt 缺少 HCU `kpool_topk_transform`。** 约 2561 token 稳定触发，是执行评测前的正确性阻塞。
+1. **P0：HCU `kpool_topk_transform` fallback 待验证。** 本地实现和 CPU 语义测试已完成；约 2561 token 的 HCU 冷/热 prefill 尚未复测。
 2. **P1：解码吞吐异常低。** GSM8K 请求约 20-50 token/分钟，EvalScope 超时且未生成 prediction。
 3. **P2：HiCache Mamba backup VMFault。** 当前仅通过关闭 HiCache 规避。
 4. **P2：长生成仍有残余质量问题。** 20 条文本 sanity 仅 15/20，缺少失败样例分类和可信基线。
