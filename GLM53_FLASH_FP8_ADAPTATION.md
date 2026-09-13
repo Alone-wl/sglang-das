@@ -27,15 +27,16 @@
 ## 当前状态
 
 - 本地分支：`glm5.3-flash`；推送目标：`wl/glm5.3-flash`。
-- 当前本地基线：`082ef26dfd`；本提交修复 BF16 KV 下的 kpool index-K 分配。
-- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`082ef26dfd`。
+- 当前本地基线：`f17b2903b1`；本提交修复 KDA safe gate 和 raw beta 语义丢失。
+- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`f17b2903b1`。
 - 模型：`/home/work/GLM-5.3-Flash-Channel-FP8-w8a8`。
 - 硬件：8 张 HCU，`gfx938`。
 - 主配置：TP=8、EP=8、DeepEP normal、DSA/NSA、FP8-E4M3 KV cache、Mamba、EAGLE。
 - 当前临时关闭 HiCache，使用 `/home/work/glm/ifb_nohicache.sh`。这是规避 Mamba backup VMFault 的临时措施，不是最终配置。
-- 短 prompt 已能生成连贯文本；短输出乱码的根因已修复。
+- mHC 归一化缺失导致的首轮乱码已修复；后续精度评测暴露独立的 KDA 数值错误，当前短 chat 仍不正确。
 - AITER kpool top-k 已使纯 TP 的 2568/4109/8209-token 冷 prefill 和 8K prefix-cache 命中请求通过，无 OOM/VMFault。
-- TP 解码约 5 tok/s。EvalScope GSM8K 5 条均生成 256 个 `!` 并因 `max_tokens` 截断，得分 0%；当前阻塞是模型数值错误，不再是请求超时。
+- BF16 KV 配方已越过 index-K 分配断言；官方 TileLang DSA 在 gfx938 编译失败，替换为 AITER DSA 后服务可启动，但短 chat 仍错误。
+- 已定位当前最强数值根因：GLM 的 34 个 KDA 层丢失 safe-gate 选择，并吞掉 raw beta 的 sigmoid；本提交修复，待 HCU 端到端验证。
 
 ## Todo（每次提交必须更新）
 
@@ -44,7 +45,8 @@
 | 进行中 | M1/P0 | **纯 TP 部署精度正常** | TP=8、EP=1、无 DeepEP、无 EAGLE；长 prompt 稳定；GSM8K/MATH-500 与可信基线对齐；记录配置、分数、截断率和失败样例 |
 | 完成 | M1/P0 | 接入 HCU AITER kpool top-k | 2568/4109/8209-token 冷 prefill 和 8K cache hit 通过；无 OOM/VMFault |
 | 完成 | M1/P0 | 完成长 prompt 回归 | HiCache 关闭时 8K 冷/热 prefill 通过；低长度已由此前分级覆盖 |
-| 进行中 | M1/P0 | 修复 BF16 KV 下的 kpool index-K 分配 | 官方 AMD 配方可启动；短 chat 正确；8K 冷/热通过 |
+| 完成 | M1/P0 | 修复 BF16 KV 下的 kpool index-K 分配 | BF16 KV 已分配 scaled FP8 index-K，原断言消失并进入 DSA 执行 |
+| 进行中 | M1/P0 | 修复 KDA safe gate / raw beta 语义 | BF16 KV + AITER DSA 下短 chat 正确；GSM8K smoke 恢复 |
 | 完成 | P1 | 定位 GSM8K 极低吞吐 | 纯 TP 约 5 tok/s；5 条评测可完成，原 20-50 token/分钟来自完整配置/旧路径 |
 | 进行中 | M1/P0 | 完成 GSM8K smoke | BF16 KV 配方下先跑 5 条，再跑 20 条；记录截断率、失败样例和分数 |
 | 待办 | P1 | 完成 MATH-500 smoke | GSM8K 稳定后执行并记录配置、分数和失败样例 |
@@ -94,7 +96,8 @@
 | `a5f5c1f0dc` | 缺少融合模块时复用 Torch pooled-history top-k | CPU 语义测试、`compileall`、`git diff --check` 通过；待 HCU 验证 |
 | `729df85bdc` | 登记 TP 精度 milestone 与 kpool 修复 | 文档提交 |
 | `082ef26dfd` | HCU 长 prefill 使用 AITER kpool top-k | 8K 冷/热 prefill 通过；无 OOM/VMFault |
-| 本提交 | kpool compression 不再随主 KV dtype 错分配普通 BF16 index-K | 本地 `compileall`、`git diff --check`；HCU 待验证 |
+| `f17b2903b1` | kpool compression 不再随主 KV dtype 错分配普通 BF16 index-K | 原断言消失；TileLang 进入编译，AITER DSA 可启动 |
+| 本提交 | 补齐 KDA safe-gate 分支和 raw beta sigmoid | 与官方基线及 DCU `83b848c1a9` 对齐；本地静态检查，HCU 待验证 |
 
 ## 调试记录
 
@@ -292,7 +295,27 @@ AssertionError: Scaled index K cache is not enabled
 
 根因是 `0258c9987e` 引入的 HCU index-K 多格式逻辑按主 KV dtype 选择 index-K 格式。BF16 KV 因此分配普通 BF16 index-K；但 GLM-5.3 启用 kpool compression 后，写入/更新算子的 ABI 固定为 packed FP8 K + FP32 scale，必须使用 `IndexKeyCache`。官方基线的 index-K cache 也独立于主 KV dtype。
 
-本次修复仅在 `index_kpool > 1 && index_kpool_compress` 时把错误解析出的 BF16 index-K 改为 scaled FP8；普通 DSA BF16 cache 和 gfx936 INT8 opt-in 不变。HCU 验证结果待补。
+`f17b2903b1` 仅在 `index_kpool > 1 && index_kpool_compress` 时把错误解析出的 BF16 index-K 改为 scaled FP8；普通 DSA BF16 cache 和 gfx936 INT8 opt-in 不变。HCU 验证确认原断言消失，服务进入 DSA 执行。
+
+官方 TileLang DSA 随后在 gfx938 的 TileLang/TVM layout inference 中因 `FloorDiv` 除零崩溃，位置为 `tilelang_sparse_fwd -> sparse_mla_fwd_decode_partial`。该路径与 `sglang-model` 使用同一类实现，当前判断为编译器/架构兼容问题，不重写算子。仅把 DSA backend 换成 AITER 后，BF16 KV 服务可启动；短 chat 不再固定输出 `!`，但仍生成无关内容，说明 FP8 KV 不是唯一根因。
+
+### 4.8 KDA safe gate 和 raw beta 语义丢失
+
+模型配置含 34 个 KDA 层，且 `gate_lower_bound=-5.0`。调用端在 packed GLM extend 路径明确传入：
+
+```text
+lower_bound=-5.0
+beta_is_raw=True
+```
+
+当前 `chunk_kda()` 存在两个回归：
+
+1. 调用 `chunk_kda_fwd_intra()` 时未传 `safe_gate=lower_bound is not None`，导致 safe gate 错走普通 token-parallel intra 公式。
+2. 函数签名未声明 `beta_is_raw`，该值被 `**kwargs` 静默吞掉，raw beta 未执行 sigmoid。
+
+官方基线已包含这两处逻辑；DCU 参考提交 `83b848c1a9` 也专门修复 safe gate 向 intra 的传递。自然对数与 `exp2` 的底数转换并非当前问题：现有 `kda_gate_chunk_cumsum(..., scale=RCP_LN2)` 已完成转换。
+
+本提交按官方实现补齐两处语义，不修改 Triton 算子。待验证 BF16 KV + AITER DSA 下的短 chat、8K 冷/热和 GSM8K。
 
 ### 5. EvalScope：旧超时已解除，当前是确定性重复
 
@@ -316,7 +339,7 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 
 | 路径 | 结果 |
 | --- | --- |
-| `--kv-cache-dtype bfloat16` | kpool compression 错分配普通 BF16 index-K；已本地修复，待 HCU 验证 |
+| `--kv-cache-dtype bfloat16` | index-K 分配已修复；可配合 AITER DSA 启动 |
 | DSA `_forward_tilelang` | `libtilelang.so` 在 `GemmNode::InferLayout -> make_hcu_swizzled_layout` 崩溃；`D_V=512`、head 8/16 的 gfx938 路径不可用 |
 | `SGLANG_USE_AITER=1` | 当前 HCU AITER 缺少 `gemm_a8w8_blockscale`，导入阶段失败；继续使用细粒度 AITER 开关 |
 | 启动参数关闭 mHC post TileLang | 环境变量会在后续 hook 被重新设为 true；如需关闭必须改代码 |
@@ -346,8 +369,8 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 
 ## 未解决问题
 
-1. **P0：BF16 KV 的 kpool index-K 修复待验证。** 修复后需按官方数值配方完成启动、短 chat、8K 冷/热和 GSM8K。
-2. **P0：纯 TP 精度错误。** FP8 KV + AITER DSA 配置下 GSM8K 5 条均输出 256 个 `!`，得分 0%。
+1. **P0：KDA 修复待端到端验证。** 需确认 safe gate 和 raw beta 修复后短 chat 与 GSM8K 恢复。
+2. **P0：纯 TP 精度错误。** FP8 KV 下 GSM8K 5 条均输出 256 个 `!`；BF16 KV + AITER DSA 下输出模式改变但仍错误。
 3. **P2：HiCache Mamba backup VMFault。** 当前仅通过关闭 HiCache 规避。
 4. **P2：长生成仍有残余质量问题。** 20 条文本 sanity 仅 15/20，缺少失败样例分类和可信基线。
 5. **P2：DeepSeek-V4 norm 修复未验证。** `de651cb5e6` 可能影响该模型，需独立回归。
@@ -355,10 +378,10 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 
 ## 下一位开发者的执行顺序
 
-1. 验证 BF16 KV 下 kpool compression 仍分配 packed scaled index-K，普通 BF16 DSA 分配逻辑不变。
-2. 按官方数值配方启动 TP8：BF16 KV、TileLang DSA、Triton MoE、关闭 CUDA Graph；全局 AITER 开关在当前镜像不可用。
-3. 跑短 chat 和 8K 冷/热；若 TileLang 在 gfx938 崩溃，分别保留 BF16 KV，只替换 prefill/decode backend 定位。
-4. 精度恢复后运行 GSM8K 5/20 条，再运行 MATH-500；记录分数、stop rate、截断率和失败样例。
+1. 部署本提交，使用 BF16 KV + AITER DSA 跑短 chat，确认 KDA 修复是否恢复语义。
+2. 短 chat 正确后跑 8K 冷/热，再运行 GSM8K 5/20 条和 MATH-500；记录分数、stop rate、截断率和失败样例。
+3. 若仍错误，优先做 KDA 单算子/逐层对比，再检查 channel-FP8 expert，不回到已排除的 mHC/DeepGEMM/CUDA Graph 假设。
+4. TileLang DSA 的 gfx938 编译问题独立登记；首个 TP 精度 milestone 暂用 AITER DSA。
 5. 每次提交同步更新 Todo、调试记录、验证和未解决问题。
 
 ## 操作注意事项
