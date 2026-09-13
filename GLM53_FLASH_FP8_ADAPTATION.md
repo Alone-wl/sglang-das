@@ -1,209 +1,106 @@
-# GLM-5.3-Flash-FP8 HCU adaptation log
+# GLM-5.3-Flash-FP8 HCU 适配调试日志
 
-## Original request and operating constraints
+## 维护规则
 
-- Target: adapt the `glm5.3-flash-fp8` model until the supplied launch path is usable.
-- Remote host: `ssh nmz26`.
-- Runtime container: `dev-wl-glm2`.
-- Launch script: `/home/work/glm/ifb.sh`.
-- All source reading and edits must be performed in the local checkout at
-  `/Users/wanglong/Code/sglang-das`.
-- After each source fix, commit locally with a detailed commit message, push the
-  branch, then enter the remote container and pull the new commit.
-- For non-kernel problems, compare the official baseline at
-  `/Users/wanglong/Code/sglang` before designing a fix.
-- For unsupported or incompatible operators, first reuse the HCU/DCU GLM
-  implementation in `/Users/wanglong/Code/sglang-model`; do not write a new
-  operator when an established implementation exists.
-- Keep this document current with every reproduced problem, diagnosis, fix,
-  validation result, corresponding commit, and known unresolved issue so that a
-  different engineer can resume without reconstructing the history.
+本文档是本任务的交接入口。后续开发者必须遵守：
 
-- Keep this document current with every reproduced problem, diagnosis, fix,
-  validation result, corresponding commit, and known unresolved issue so that a
-  different engineer can resume without reconstructing the history.
+1. 开始工作前先读“当前状态”“Todo”“未解决问题”。
+2. 每次提交必须同步更新本文档，至少更新 Todo、调试记录、验证结果、对应 commit 和未解决问题。
+3. Todo 必须反映真实状态：开始处理时标记“进行中”，完成并验证后才能勾选；发现新问题立即追加。
+4. 失败实验只保留复现条件、结论和证据；被证伪的猜测移入“已排除项”。
+5. commit message 必须独立说明问题、根因、修改、验证和限制，做到 message 即文档。
 
-## Requirements added during the session
+## 原始需求与约束
 
-These were added by the operator after the original brief above and are
-binding in the same way:
+- 目标：完成 `glm5.3-flash-fp8` 模型适配，使指定启动和评测流程可用。
+- 服务器：`ssh nmz26`；容器：`dev-wl-glm2`。
+- 启动脚本：`/home/work/glm/ifb.sh`。
+- 代码阅读和修改只在本地 `/Users/wanglong/Code/sglang-das` 进行。修改后本地提交并推送，随后进入容器拉取最新代码。
+- 非算子问题先参考官方基线 `/Users/wanglong/Code/sglang`。
+- 算子缺失或不兼容先参考 DCU 适配 `/Users/wanglong/Code/sglang-model`，优先复用已有实现，禁止无必要地重写算子。
+- 必须从根因修复，禁止拟合输出、屏蔽症状或针对探针 prompt 特判。
+- 并行相关问题先回退到纯 TP 复现，再决定是否排查 EP、DeepEP 或 EAGLE。
+- SSH 登录失败后立即停止并交给用户处理，禁止重试。ProxyJump 使用 2FA，连续失败可能触发封禁。
+- 先运行原始 `ifb.sh`；成功后用 `uv` 创建虚拟环境、安装 EvalScope，并运行 GSM8K 和 MATH-500。流程异常时停止并报告，不私自更换流程。
+- 长 prompt 崩溃先关闭 HiCache 验证。关闭后仍失败则继续修复；若消失，记录 HiCache 问题并在关闭状态下继续。
 
-1. **Debug accuracy from the root cause; do not reward-hack.** No fitting the
-   output, no suppressing a symptom, no special-casing the probe prompts. When
-   a candidate is ruled out, record *how* it was ruled out, not just that it
-   was.
-2. **Regress the parallel scheme to plain TP first and check whether the bug
-   survives.** Only if it does, look further. (Done: the incoherent-output bug
-   reproduced with `--tp-size 8 --ep-size 1 --moe-a2a-backend none`, which
-   retired EP/DeepEP/EAGLE as causes before any deeper work.)
-3. **On node-login problems, stop and hand back for the operator to fix; do
-   not retry.** The 2FA ProxyJump blacklists repeated failures, so a retry can
-   lock the account out. (Applied once: the control socket disappeared and the
-   next attempt returned `Too many authentication failures`; work stopped
-   rather than retried.)
-4. **Run the supplied `ifb.sh` once; if it works, create a venv with `uv`,
-   install evalscope, and run GSM8K and MATH-500.** If anything is broken,
-   stop and report rather than improvising around it.
-5. **For the long-prompt crash: disable HiCache first and debug in that
-   configuration.** If the problem persists with HiCache off, keep fixing it;
-   if it clears, write the issue down and carry on with HiCache disabled.
-   Outcome recorded below under "final session": the VMFault clears, the
-   long-prompt failure does not, so both halves of the instruction were
-   followed.
+## 当前状态
 
-## Environment and branch
+- 本地分支：`glm5.3-flash`；推送目标：`wl/glm5.3-flash`。
+- 本次文档重构前的本地基线：`782f6c8577`。
+- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`191fc0cc91`，已落后于本地文档提交。
+- 模型：`/home/work/GLM-5.3-Flash-Channel-FP8-w8a8`。
+- 硬件：8 张 HCU，`gfx938`。
+- 主配置：TP=8、EP=8、DeepEP normal、DSA/NSA、FP8-E4M3 KV cache、Mamba、EAGLE。
+- 当前临时关闭 HiCache，使用 `/home/work/glm/ifb_nohicache.sh`。这是规避 Mamba backup VMFault 的临时措施，不是最终配置。
+- 短 prompt 已能生成连贯文本；短输出乱码的根因已修复。
+- 当前正确性阻塞：约 2561-token prefill 缺少 HCU 可用的 `kpool_topk_transform`。
+- 当前评测阻塞：GSM8K 单请求解码过慢并触发 EvalScope 超时；没有得到有效评分，不能据此判断模型精度。
 
-- Local branch: `glm5.3-flash`.
-- Push remote/branch: `wl/glm5.3-flash`.
-- Remote source checkout: `/home/work/code/sglang-das`.
-- Remote model: `/home/work/GLM-5.3-Flash-Channel-FP8-w8a8`.
-- Hardware visible to the container: 8 HCU devices (`gfx938`).
-- Main runtime configuration: TP=8, EP=8, DeepEP normal mode, DSA/NSA,
-  FP8-E4M3 KV cache, hierarchical cache, hybrid Mamba extra buffer, and EAGLE
-  speculative decoding.
-- **Current effective configuration (2026-09-13): hierarchical cache is
-  disabled.** `/home/work/glm/ifb_nohicache.sh` is `ifb.sh` minus
-  `--enable-hierarchical-cache`, `--hicache-size`, `--hicache-write-policy`,
-  `--hicache-io-backend` and `--hicache-mem-layout`. This is a deliberate
-  workaround for the Mamba-backup VMFault (known issue 3), not a config
-  preference; re-enable HiCache once that fault is diagnosed. The commit on
-  the remote checkout is `191fc0cc91`.
+## Todo（每次提交必须更新）
 
-## Inherited work before this debugging session
+| 状态 | 优先级 | 事项 | 完成标准 |
+| --- | --- | --- | --- |
+| 待办 | P0 | 修复 HCU `kpool_topk_transform` 缺失 | 冷/热 prefill 均通过 2561、4096、8192 token；索引语义与参考实现一致；无 VMFault |
+| 待办 | P0 | 完成长 prompt 回归 | HiCache 关闭时按 11、81、641、1281、2561、4096、8192 token 分级验证并记录日志 |
+| 待办 | P1 | 定位 GSM8K 极低吞吐 | 分别测 target-only/完整配置的 TTFT、decode tok/s、EAGLE 接受率，明确瓶颈 |
+| 待办 | P1 | 完成 GSM8K smoke | 使用合理输出上限和超时先跑 5 条，再跑 20 条；记录截断率、失败样例和分数 |
+| 待办 | P1 | 完成 MATH-500 smoke | GSM8K 稳定后执行并记录配置、分数和失败样例 |
+| 待办 | P2 | 修复 HiCache Mamba backup VMFault | 开启 HiCache 后长 prompt 不再触发 `transfer_mamba_backup_kernel` VMFault |
+| 待办 | P2 | 验证 DeepSeek-V4 norm 修复 | 启动对应模型确认不存在重复归一化 |
+| 待办 | P2 | 修复 BF16 KV cache 路径 | `--kv-cache-dtype bfloat16` 不再触发 scaled index K cache 断言 |
+| 待办 | P2 | 建立可信精度基线 | 与可信实现、相同 prompt 和采样参数对齐，不只检查文本可读性 |
 
-The branch already contained the upstream GLM-5.3-Flash import and a sequence of
-compatibility restores. The most relevant commits immediately preceding this
-session are:
+## 已完成工作与提交
 
-| Commit | Purpose |
+### 继承的适配提交
+
+| Commit | 内容 |
 | --- | --- |
-| `979baf5a81` | Import upstream GLM-5.3-Flash support. |
-| `0258c9987e` | Restore HCU DSA index-cache compatibility. |
-| `cfcfc6d93d` | Restore GLM FP8 no-RoPE quantization helper. |
-| `f5fd9d01a3` | Port the GLM DSA K-pool FP8 index path. |
-| `1d85638859` | Restore DSA top-k backend resolution. |
-| `f076f02e3b` | Make the HCU KDA fused operator import optional. |
-| `8bdf7af339` | Complete GLM MTP linear-attention compatibility. |
-| `2b74702266` | Normalize the Mamba hierarchical-cache layout. |
-| `83cc033742` | Add the SWA branching match-result field. |
-| `3514a56c13` | Default the DSA K-pool page size. |
-| `69bfa861a1` | Permit page size 1 in the HCU DSA K-pool. |
-| `1d79fe4681` | Remap CUDA-only FlashMLA backend names on HCU. |
+| `979baf5a81` | 引入上游 GLM-5.3-Flash 支持 |
+| `0258c9987e` | 恢复 HCU DSA index-cache 兼容 |
+| `cfcfc6d93d` | 恢复 GLM FP8 no-RoPE 量化辅助逻辑 |
+| `f5fd9d01a3` | 移植 GLM DSA K-pool FP8 index 路径 |
+| `1d85638859` | 恢复 DSA top-k backend 选择 |
+| `f076f02e3b` | HCU 下允许 KDA fused operator 缺失 |
+| `8bdf7af339` | 补齐 GLM MTP linear-attention 兼容 |
+| `2b74702266` | 统一 Mamba HiCache 布局 |
+| `83cc033742` | 增加 SWA branching match 字段 |
+| `3514a56c13` | 设置 DSA K-pool 默认 page size |
+| `69bfa861a1` | HCU DSA K-pool 支持 page size 1 |
+| `1d79fe4681` | HCU 下重映射 CUDA-only FlashMLA backend |
 
-At session start, 20 tracked files also contained an uncommitted compatibility
-checkpoint (963 insertions and 271 deletions). It covers HCU DSA K-pool planning
-and FP8 index storage, HCU DSA backend metadata and buffers, KDA/Mamba/MHC
-compatibility, DeepEP channel-FP8 MoE weight preparation, scheduler KV/Mamba
-bookkeeping, logits chunking, and hierarchical-cache allocation. These changes
-were present in both the local and remote checkouts and were preserved intact.
+本轮开始时另有 20 个 tracked 文件组成未提交 checkpoint，共 963 行新增、271 行删除；内容覆盖 DSA K-pool/FP8 index、DSA backend、KDA/Mamba/mHC、DeepEP channel-FP8 MoE、scheduler KV/Mamba bookkeeping、logits chunking 和 HiCache allocation。该 checkpoint 在本地与远端均存在，随后由 `2bc63d475f` 保存。
 
-## Debugging chronology
+### 本轮提交
 
-### 2026-09-12: establish the real runtime state
+| Commit | 内容 | 验证 |
+| --- | --- | --- |
+| `2bc63d475f` | 保存 20 个文件的 HCU 兼容 checkpoint | `compileall`、`git diff --check`、8 卡服务 `/health` 通过；生成文本错误 |
+| `7bedab73d1` | 记录 target-only 首次 prefill 卡死 | 定位到 KDA/DeepEP 等待，随后确认是残留共享内存导致 |
+| `3297fc7235` | 记录清理 `/dev/shm` 后 prefill 恢复 | 三组固定 prompt 可重复生成 |
+| `a3249b3ccf` | 记录已排除的数值假设 | 多组路径对比，见“已排除项” |
+| `e164539dec` | 修复 CUDA graph batch-size helper 的过期参数 | 启动路径验证 |
+| `7c68b1bab4` | 适配 schedule batch 重命名后的 CUDA graph 字段 | 启动路径验证 |
+| `7d6c10fea3` | 修复 HCU AITER TileLang mHC pre 跳过 layernorm | 单算子及端到端生成验证 |
+| `de651cb5e6` | 删除 DeepSeek-V4 已冗余的 HCU `norm_fused` workaround | GLM 已验证；DeepSeek-V4 尚未验证 |
+| `0e0835a41c` | 记录 mHC 根因和验证结果 | 文档提交 |
+| `e256489848` | 删除 HiCache-off 路径中不存在的 memory 配置字段 | HiCache-off 服务可继续启动 |
+| `fe3abe5842` | HCU ragged MQA logits 改用 LightOp | 对 Torch 参考最大绝对误差 `3.8e-06` |
+| `191fc0cc91` | 记录四个长 prompt 故障和当前阻塞 | 文档提交 |
+| `782f6c8577` | 修正 HiCache-off 和 EvalScope 结论 | 文档提交 |
 
-1. Inspected the local branch, worktree, recent commits, remote configuration,
-   container launch script, and the actual `PYTHONPATH` from `common.sh`.
-2. Found an already running diagnostic server on port 18082. It used the same
-   model and source checkout as `ifb.sh`, with `--skip-server-warmup` substituted
-   for the configured warmup.
-3. An initial `/health` request appeared to hang. `py-spy` showed scheduler
-   ranks in HiCache synchronization and MLP-sync collectives. A later request
-   and timestamps established that this was not a permanent collective
-   deadlock: the first one-token request spent approximately 3 minutes 47
-   seconds compiling/initializing, after which `/health` returned HTTP 200.
-4. Sent deterministic generation smoke tests through `/generate`:
-   - Prompt `Hello`, greedy, 8 output tokens: request completed, but output was
-     incoherent; EAGLE accepted no draft tokens.
-   - Prompt `1+1=`, greedy, 16 output tokens: request completed, but output was
-     incoherent; EAGLE acceptance remained 0%.
-5. Conclusion: startup and request plumbing now work, but numerical correctness
-   is not yet established. The next isolation step is to compare target-only
-   generation and operator-path variants, beginning with the existing DCU GLM
-   implementations for MoE, DSA indexing/attention, and Mamba.
+## 调试记录
 
-Validation of the inherited checkpoint before committing it:
+### 1. 初始现象：服务可用，但生成乱码
 
-- `python3 -m compileall` passed for every modified Python file.
-- `git diff --check` passed.
-- The 8-device service loaded the model and returned HTTP 200 from `/health`.
-- End-to-end generation completed, but the text was numerically incorrect.
+2026-09-12，8 卡服务启动后首次请求需要约 3 分 47 秒编译和初始化，之后 `/health` 返回 HTTP 200。固定 greedy 请求均完成，但输出为确定性乱码，EAGLE 接受率为 0。
 
-Corresponding checkpoint commit: this document's initial checkpoint commit
-(`wip(hcu): checkpoint GLM-5.3 Flash FP8 runtime adaptation`).
+随后构造 target-only 启动脚本，去掉四个 `--speculative-*` 参数。首次 prefill 曾分别卡在 `causal_conv1d_fn` 和 DeepEP `Buffer.__init__` 的 `all_gather_object`。根因不是模型数值或集合通信实现，而是此前异常退出遗留的共享内存和信号量。
 
-### 2026-09-12 (session two): target-only isolation
+清理以下文件后，target-only 服务恢复：
 
-To decide whether the earlier incoherent output originates in the target
-path or the EAGLE draft path, the launcher was copied and stripped of the
-four `--speculative-*` flags into `/home/work/glm/target_only.sh`. The
-env is identical to `ifb.sh` (`SGLANG_USE_DEEPGEMM_MOE=1`, aiter/hip
-FlashMLA remap, DeepEP normal on eight ranks, FP8 KV cache).
-
-Two runs were captured:
-
-1. `target_only_v2.log` first attempt sent a single-token prompt (`Hello`).
-   All eight TP ranks stalled inside `causal_conv1d_fn` at
-   `python/sglang/srt/layers/attention/linear/kda_backend.py`
-   for the full 300-second scheduler watchdog. `causal_conv1d_fn` is a
-   Triton kernel with a hard-coded convolution width of four, and a
-   1-token prefill is a corner case where the queried window is shorter
-   than the kernel. The scheduler debug at kill time reported
-   `leaked_mamba_pages={2, 3, 4}`; the mamba pool held the request but
-   forward never returned.
-2. A rerun with multi-token prompts (`"The quick brown fox …"`, etc.) hung
-   identically, this time in the first MoE layer: all eight ranks blocked
-   in `torch.distributed.all_gather_object` inside DeepEP's `Buffer.__init__`
-   (`python/sglang/srt/layers/moe/token_dispatcher/deepep.py:379`).
-   The MainThread native frames were only `libc.so.6`; every rank was
-   stuck in the same collective, not diverging. NCCL logs report the
-   NUMA-balancing warning and the missing `iommu=pt` boot flag but no
-   fatal error before the hang.
-
-Both hangs happen on the first prefill and both start from the same
-pretrained-weight state, so they are unlikely to be caused by
-per-request state divergence. The plausible root causes are:
-
-- A stale DeepEP shared-memory / semaphore layout left by earlier kills
-  that the new run inherits (`/dev/shm/sem.mp-*` was populated). Cleaning
-  those between runs is now a required step for the isolation harness.
-- A collective-timing dependency where the first DeepEP `Buffer` init
-  races the HCU custom-allreduce fence and one rank temporarily leaves
-  the collective, blocking `all_gather_object` forever. `common.sh`
-  disables the DCU custom allreduce (`USE_DCU_CUSTOM_ALLREDUCE=0`),
-  but `parallel_state.py` still defaults to disabling pynccl on HCU
-  (`SGLANG_HCU_DISABLE_PYNCCL=true`), routing collectives through NCCL /
-  Gloo instead. The earlier successful `target_only.log` run at 11:11
-  had run once and then died at 11:24; subsequent starts have never
-  reached generation.
-
-Neither corresponds to a numerical bug in the target model. Until a
-prefill returns, target-vs-draft correctness cannot be isolated at all,
-so the immediate priority is unblocking the first prefill on the
-current commit rather than chasing dequant paths.
-
-Candidate divergences flagged from source-only review (all still
-unverified — none reproduce standalone without the server):
-
-- `_forward_aiter_torch_fallback` in
-  `python/sglang/srt/layers/attention/dsa_backend.py:3140` skips a KV
-  scale when casting FP8 KV to bfloat16. On the primary MLA path
-  (`layer.head_dim != layer.v_head_dim`) this is used unconditionally
-  whenever `aiter.mla_decode_stage1_asm_fwd` is missing.
-- `communicator_mhc.attn_to_mlp` zero-pads hidden_states to residual's
-  batch size before `hc_post`, papering over a shape mismatch whose
-  root cause is not documented (see
-  `python/sglang/srt/layers/communicator_mhc.py:94`).
-- KDA `forward_target_verify` pads `core_attn_out` with zeros to
-  `physical_seq_len`, which sends zero-attention outputs into the sampler
-  for the padded positions (see `linear/kda_backend.py:1067`).
-
-### 2026-09-12 (session two, later): first prefill unblocked
-
-The DeepEP `Buffer.__init__` `all_gather_object` hang and the KDA
-`causal_conv1d_fn` hang both cleared after clearing the stale sglang
-shared-memory state that earlier crashed sglang runs had left behind:
-
-```
+```bash
 rm -f /dev/shm/sglang_loads_*.shm \
       /dev/shm/sgl_shm_mm_* \
       /dev/shm/sgl_shm_mq_* \
@@ -211,562 +108,214 @@ rm -f /dev/shm/sglang_loads_*.shm \
       /dev/shm/torch_*
 ```
 
-A fresh `target_only.sh` after that cleanup reached
-"fired up and ready to roll" and returned three deterministic /generate
-responses back-to-back on port 8080. Because the token IDs match on
-repeated runs of the same prompts, the pipeline is deterministic —
-subsequent numerical work can rely on that.
+后续每次重启服务前都要清理上述残留，但执行前必须确认没有其他任务正在使用这些对象。
 
-The observed outputs (greedy, temperature=0, top_k=1):
+### 2. 纯 TP 复现：排除 EP、DeepEP 和 EAGLE
 
-```
-'The quick brown fox jumps over the lazy' -> '漂浮umo phen率umuwesen禹 SF'
-'1 + 1 = 2. 2 + 2 ='                       -> '-minRONinisubstLOTSiple意ortun'
-'Once upon a time in a'                    -> ' secondary âanolick inquire goose珍aniwargsSubsetikhbih'
+2026-09-13，使用：
+
+```text
+--tp-size 8 --ep-size 1 --moe-a2a-backend none
 ```
 
-So there is definitely a numerical bug on the target path, independent
-of EAGLE: this is target-only. The suspects flagged from source review
-(aiter torch MLA fallback missing KV scale, MHC `attn_to_mlp` zero pad,
-KDA `target_verify` zero pad) can now be tested for real.
+纯 TP 仍产生同类确定性乱码，因此问题位于单 rank 张量路径，与 EP、DeepEP、MoE dispatch 和 EAGLE 无关。
 
-Operational rule for the isolation harness going forward: **always
-clean `/dev/shm` before starting a new sglang run**; skipping this step
-is what caused the earlier "target model hangs on first prefill"
-symptom that was misread as a KDA / DeepEP correctness bug.
+### 3. 乱码根因：mHC 错误报告已融合归一化
 
-### 2026-09-12 (session two, still later): numerical hypotheses ruled out
+真实 GLM 形状下调用 `hc_pre(out_norm_weight=w)`：
 
-Ran the target-only launcher with `--kv-cache-dtype fp8_e4m3` in a stable
-loop (post-shm-cleanup) against three fixed multi-token prompts. The
-output is deterministic and identical run-to-run:
-
-```
-'The quick brown fox jumps over the lazy' -> '漂浮umo phen率umuwesen禹 SF'
-'1 + 1 = 2. 2 + 2 ='                       -> '-minRONinisubstLOTSiple意ortun'
-'Once upon a time in a'                    -> ' secondary âanolick inquire goose珍aniwargsSubsetikhbih'
+```text
+norm_fused=True
+max|layer_input - RMSNorm reference| = 2.1094
+max|layer_input - unnormalized reference| = 0.003906
 ```
 
-Verified against sources; ruled out:
+根因链路：
 
-- **`_forward_aiter_torch_fallback` KV scale.** For GLM-5.3-Flash
-  `qk_rope_head_dim == 0`, so `attn_mqa.head_dim == kv_lora_rank == 512
-  == v_head_dim`. That takes the `triton_sparse_mla_fwd` branch, not
-  the einsum loop. The kernel decodes FP8 via `.to(bfloat16)` on the
-  raw `float8_e4m3fn`-view KV buffer, which is arithmetically correct
-  because `set_mla_kv_buffer_triton_fp8_quant` writes the raw MLA KV
-  layout without per-block scales and stores as uint8 aliased to
-  `torch.float8_e4m3fn` via `store_dtype`.
-- **`_forward_aiter_torch_fallback` head-count MFMA.** `need_pad_heads`
-  fires (`num_q_heads = 8 < 16`) and `repeat_interleave` duplicates
-  each head so the kernel sees `H=16`; the output stride `[:, ::factor,
-  :]` picks the correct duplicate.
-- **Tilelang MHC pre.** Rerun with `SGLANG_OPT_USE_TILELANG_MHC_PRE=0`
-  produced bit-identical garbled output. (`SGLANG_OPT_USE_TILELANG_MHC_POST=0`
-  was not honored — `envs.SGLANG_OPT_USE_TILELANG_MHC_POST.set(True)` runs
-  somewhere later in model_hook or server_args; that specific flag is not
-  disable-able from the launcher alone. Model-hook line 400 only fires
-  for DeepseekV4, not `GlmMoeDsaForCausalLM`.)
-- **MHC hc_pre/hc_post kernels.** `sglang-das` diff vs upstream in
-  `mhc.py` is a cosmetic refactor; the tilelang and torch dispatches
-  are semantically identical.
-- **DeepGEMM channel-FP8 MoE weight prep.** The DCU reference at
-  `/Users/wanglong/Code/sglang-model` uses the same
-  `pack_int8_weight_enk_to_w6_low_latency` packer against FP8 weights
-  in `_prepare_dsv4_channel_fp8_deepgemm_weights` and feeds the same
-  `m_grouped_fp8_gemm_nt_contiguous`. Packer-name mismatch is not the
-  bug.
-- **kpool_bf16_paged_mqa_logits kernel.** The FP8 K decode path (bit
-  extraction, subnormal handling, NaN sentinel) matches the E4M3FN
-  spec; the K side applies its per-slot scale; the Q side folds
-  `q_scale` into `weights` via `_get_logits_head_gate`, so the
-  algebraic identity `max(q_r·k_r, 0)·w = max(q_fp8·k_fp8, 0)·(w·q_s·k_s)`
-  holds.
-- **FP8 KV write kernel `set_mla_kv_buffer_fp8_quant_kernel`.** Handles
-  the `rope_dim == 0` case (GLM-5.3-Flash's layout) by taking the
-  `base + BLOCK <= nope_dim` early branch; the BF16→FP8 downcast is
-  done via a typed `tl.store` with no manual scaling, matching how the
-  fallback reads it back.
-- **bf16 KV variant.** Falls over on the DSA indexer with
-  `AssertionError: Scaled index K cache is not enabled` in
-  `memory_pool.py:5089` -- the indexer read path assumes the scaled
-  index K path but the pool only allocates it in FP8 mode. This is a
-  separate correctness bug in the bf16 KV path, not a workaround for
-  the FP8 accuracy problem.
-- **`_forward_tilelang`.** Crashes in `libtilelang.so`
-  `GemmNode::InferLayout` → `make_hcu_swizzled_layout` for the
-  gemm_hcu_mmac shape (D_V=512, H=8-or-16). Tilelang DSA prefill/decode
-  is not viable on gfx938 at this shape.
-- **`SGLANG_USE_DEEPGEMM_MOE=0` variant.** Hard-crashes at the DeepEP
-  dispatch: `Dispatch output is not supported: quant_config=...
-  scheme=CompressedTensorsW8A8Fp8MoE, use_fp8_w8a8=False,
-  has_deepgemm_weights=False`. `deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM`
-  is False on HCU, so this scheme has no working dispatch branch
-  besides `SGLANG_USE_DEEPGEMM_MOE=1`.
-- **`forward_mla_rocm.py` drift.** `md5 diff` vs upstream shows two
-  attribute-access diffs only (`get_parallel().dcp_replicate_q_proj`
-  vs `get_parallel().config.dcp_replicate_q_proj`); no semantic
-  divergence.
+1. `ifb.sh` 设置 `SGLANG_ROCM_USE_AITER_TILELANG_MHC=1`。
+2. `mhc_pre()` 进入 AITER `pre_big_fuse_tilelang`。
+3. 该算子没有 `norm_weight`/`norm_eps` 参数，实际未执行归一化。
+4. `_mhc_pre_dispatch()` 却返回 `norm_fused=True`。
+5. `MHCState.attn_split()` 和 `attn_to_mlp()` 因此跳过显式 layernorm，45 层的 `input_layernorm` 和 `post_attention_layernorm` 全部失效。
 
-Suspects that remain unverified but still possible:
+修复：
 
-- **Aiter DeepEP normal-mode dispatch payload shape / stride.** The
-  scheme's forward path is `deepep dispatch → forward_impl → forward_groupgemm_w8a8_fp8_contiguous`;
-  we compared the das and DCU-reference forward_groupgemm bodies and
-  they match, but the `pack_int8_weight_enk_to_w6_low_latency` packer
-  is called on **compressed-tensors channel-FP8** weights (per token
-  `strategy: token`, per channel `strategy: channel`). Whether the
-  packer really preserves FP8 magnitude for these strategies on HCU
-  gfx938 wasn't validated at the tensor level — a smoke test that
-  dumps `w13_weight_deepgemm.dequantize()` vs the original per-channel
-  bf16 weight for one expert would settle this.
-- **Compressed-tensors kv_cache_scheme is null.** But the launcher
-  forces `--kv-cache-dtype fp8_e4m3` regardless. If the model
-  checkpoint expects a different KV quantization convention than
-  `mla_quantize_for_fp8_no_rope`'s plain `.to(float8_e4m3fn)` cast,
-  that would look exactly like this bug. No public description of the
-  intended KV quantization was found in the checkpoint's
-  `quantization_config`.
-- **DSA indexer `weights_proj` path.** `_get_logits_head_gate` uses
-  `self.weights_proj(x.float())`. If `weights_proj` weights are
-  channel-FP8 quantized, casting `x` to float in Python and doing the
-  linear in FP32 while the weights are FP8 (via bf16 upcast) may work,
-  but validate that this path exists on HCU.
-- **Deep model divergence points not yet inspected:**
-  `Glm5NextForConditionalGeneration.__init__` weight-loader mapping,
-  the `fused_qkvbfg_a_proj` packed slice ordering, the MTP eh_proj /
-  enorm / hnorm paths (excluded from quantization per the config
-  `ignore` list — need to confirm they are loaded in bf16).
+- `7d6c10fea3`：存在 `norm_weight` 时不走不带归一化的 AITER 分支，并恢复 mHC post opt-out。
+- `de651cb5e6`：删除 DeepSeek-V4 已冗余的调用侧 workaround，防止双重归一化。
 
-Operational notes:
+验证：
 
-- Always clean `/dev/shm` (`sglang_loads_*.shm`, `sgl_shm_mm_*`,
-  `sgl_shm_mq_*`, `sem.mp-*`, `torch_*`) before starting a new run.
-- `SGLANG_OPT_USE_TILELANG_MHC_POST` cannot be disabled from the
-  launcher; toggling it requires a code change in `environ.py` or
-  `arg_groups/model_hook.py`.
-- SSH goes through a 2FA `zz_jump_wl` ProxyJump. Do not retry after a
-  failed attempt (the jump blacklists brute force); when the
-  ControlMaster socket at `~/.ssh/control-wanglong3@42.228.13.241:65024`
-  is gone, ask the user to `ssh nmz26` once from their terminal to
-  rebuild it.
-
-## 2026-09-13: root cause found and fixed
-
-### Step 1 — EP/DeepEP ruled out (pure-TP regression)
-
-Per the operating constraint that the parallel scheme should first be
-regressed to plain TP, the launcher was copied with the expert-parallel
-path removed to `/home/work/glm/target_tponly.sh`:
-
-```
---tp-size 8 --ep-size 1 --moe-a2a-backend none   # (no deepep, no ep_config.json)
-```
-
-Post-`/dev/shm`-cleanup, this server reached "fired up" and produced the
-**same deterministic garble** as the TP8/EP8 launcher:
-
-```
-'The quick brown fox jumps over the lazy' -> ' bes Pick keisheti=httpsgest禹禹 ） hey heir喜好 ） in组成'
-'1 + 1 = 2. 2 + 2 ='                     -> 'igoeta份流出egg (?)genofnfionialist̶|\nchas游人qs'
-'Once upon a time in a'                  -> '1igogenres bekv者 hug申nanNd阁 solvevantm弱势olini'
-```
-
-So the defect is in the per-rank tensor path, independent of EP, DeepEP,
-the MoE dispatch, and EAGLE. This retired the whole DeepEP-dispatch branch
-of the suspect list.
-
-### Step 2 — root cause: every `input_layernorm` / `post_attention_layernorm` was skipped
-
-The earlier hidden-state probe conclusion ("plausible magnitude, wrong
-direction, cosine ~0.088 against the lm_head basis") pointed at the mHC
-residual-stream accumulation. That is what it was.
-
-Reproduced directly on the HCU host, using the real GLM-5.3-Flash mHC
-shape (`hc_mult=4`, `hidden_size=4096`) and calling the top-level `hc_pre`
-exactly as the model does (`out_norm_weight` supplied):
-
-```
-hc_pre(out_norm_weight=w) ->  norm_fused=True
-  max|layer_input - reference_rmsnorm|        = 2.1094e+00   # S=8
-  max|layer_input - reference_un-normalized|  = 3.9062e-03
-```
-
-`layer_input` was bit-for-bit the **un-normalized** mixing result while the
-function reported `norm_fused=True`. Mechanism:
-
-1. `/home/work/glm/ifb.sh` exports `SGLANG_ROCM_USE_AITER_TILELANG_MHC=1`, so
-   `mhc_pre()` in `python/sglang/kernels/ops/layernorm/mhc.py` took the
-   `_is_hcu and _use_aiter_tilelang_mhc` branch and called AITER's
-   `pre_big_fuse_tilelang`.
-2. That kernel's signature (dumped on the host) has **no `norm_weight` /
-   `norm_eps` parameter at all** — the norm-fusing variant is a different
-   kernel, `mhc_pre_big_fuse_with_norm_tilelang`.
-3. `_mhc_pre_dispatch()` nonetheless returned
-   `norm_weight is not None` as `norm_fused`.
-4. `hc_pre()` forwards that flag to `MHCState.attn_split()` /
-   `attn_to_mlp()`, which guard the explicit norm with
-   `if out_norm is not None and not norm_fused`. `norm_fused=True` therefore
-   suppressed `input_layernorm` and `post_attention_layernorm` in **all 45
-   layers**, leaving the entire residual stream unnormalized.
-
-The DCU reference at `/Users/wanglong/Code/sglang-model` already guarded
-both halves of this; the HCU fork had dropped the guard. The reference's
-`sglang/srt/models/deepseek_v4.py` even carried a call-site workaround
-(`norm_fused = norm is not None and not (_is_dcu and _use_aiter_tilelang_mhc)`)
-for the same defect.
-
-### Step 3 — fix
-
-Commit `7d6c10fea3`:
-
-- `mhc_pre()`: only take the AITER HCU branch when `norm_weight is None`.
-  With a norm weight present the existing with-norm tilelang kernel runs.
-- `_mhc_pre_dispatch()`: `norm_fused` mirrors whether a norm weight was
-  supplied, now that the branch selection actually honours it.
-- `_mhc_post_dispatch()`: restore the baseline's
-  `SGLANG_OPT_USE_TILELANG_MHC_POST` opt-out, which the fork had dropped.
-
-Commit `de651cb5e6`: drop the now-redundant `deepseek_v4.py` call-site
-workaround, which would otherwise double-normalize DeepSeek-V4 on HCU.
-
-Because that DeepSeek-V4 change is *not* exercised by a GLM launch, it is
-flagged as unverified in the known-issues list below.
-
-### Step 4 — validation
-
-| Check | Before | After |
+| 检查 | 修复前 | 修复后 |
 | --- | --- | --- |
-| Unit repro, S=8/64/512, `max\|li - ref_NORM\|` | 2.11 / 2.62 / 3.13 | 1.56e-2 / 3.13e-2 / 3.13e-2 |
-| `norm_fused` returned without a norm weight | False | False (unchanged) |
-| Greedy text, pure TP | deterministic garble | coherent |
-| Greedy text, TP8/EP8 + DeepEP + FP8 KV | deterministic garble | coherent |
-| Greedy text, full config + EAGLE | deterministic garble | coherent |
-| EAGLE `spec_accept_rate` | 0.0 | 0.176 / 0.194 |
-| EAGLE `spec_accept_length` | ~1.0 | 1.88 / 2.00 |
+| S=8/64/512，`max|output-reference RMSNorm|` | 2.11 / 2.62 / 3.13 | 0.0156 / 0.0313 / 0.0313 |
+| 纯 TP greedy 输出 | 确定性乱码 | 连贯 |
+| TP8/EP8 + DeepEP + FP8 KV | 确定性乱码 | 连贯 |
+| 完整配置 + EAGLE | 确定性乱码 | 连贯 |
+| EAGLE 接受率 | 0 | 0.176 / 0.194；后续观测 0.23-0.28 |
+| 20 条文本 sanity | 未通过 | 15/20；不能代替精度评测 |
 
-Representative before/after on identical prompts:
+代表性结果：
 
-```
-'The capital of France is'
-  before: 'mosself [ eitherNAS4~\n\nuur†/brrardia;Relationicles'
-  after : ' Paris. The official language is French.\n\nCurrency: Euro (€)\n\nTime Zone'
-
-'Once upon a time in a'
-  before: ' secondary âanolick inquire goose珍aniwargsSubsetikhbih'
-  after : " late 70's, a young man named John was walking down the street."
+```text
+Prompt: The capital of France is
+修复前: mosself [ eitherNAS4~\n\nuur†/brrardia;Relationicles
+修复后: Paris. The official language is French. Currency: Euro (€)...
 ```
 
-A 20-prompt sanity screen (ASCII-plausible, no repeated-token loop, no CJK
-bleed on English prompts) scores 15/20 after the fix.
+### 4. 长 prompt 故障链
 
-## 2026-09-13 (later): long-prompt crash — HiCache and a DSA kernel gap
+#### 4.1 HiCache Mamba backup VMFault：已规避，未修复
 
-### Symptom
+开启 HiCache 时，81-token prefill 曾在所有设备触发：
 
-The official `/home/work/glm/ifb.sh` starts cleanly and serves short requests,
-but any prompt above roughly 80-1300 tokens kills the server. Reproduced
-outside evalscope with plain `/generate`, so it is not an eval-harness
-concurrency artifact. Three distinct failures were peeled off in order.
-
-### Failure 1 — HiCache Mamba-backup VMFault (mitigated by disabling HiCache)
-
-With `--enable-hierarchical-cache`, a 81-token prefill faulted:
-
-```
-KERNEL VMFault, Invalid address access ... Error code: 3   (all 8 devices)
-Fatal Python error: Aborted / ROCR Runtime::VMFaultHandler segfault
-Subprocess scheduler_1 crashed with exit code -6
+```text
+KERNEL VMFault, Invalid address access, Error code: 3
+transfer_mamba_backup_kernel
+scheduler_1 exit code -6
 ```
 
-The VMFault analysis blocks repeatedly name `transfer_mamba_backup_kernel`
-(`python/sglang/kernels/jit/csrc/kvcacheio/transfer_mamba.cuh`), the HiCache
-Mamba-state write-back kernel. Not previously seen: every session-two log had
-VMFault count 0, but those runs only ever sent <=14-token prompts and never
-crossed the threshold where this path trips.
+关闭 HiCache 后，同一分级测试中 VMFault 数为 0，1281 token 可通过，因此当前使用 `ifb_nohicache.sh`。底层问题仍在 `transfer_mamba_backup_kernel` 路径。
 
-Measured long-prompt survival with HiCache on vs off:
+早期测试曾记录“HiCache 开启时 1281 token 可通过、2561 token 失败”，与后续干净复核的 81-token VMFault 冲突。当前以可重复的后续复核为准；该阈值可能受缓存和请求状态影响，修复 HiCache 时必须重新测冷、热请求，不能把 81 当作固定边界。
 
-| Configuration | Largest passing prompt |
+#### 4.2 HiCache-off 读取不存在的配置：已修复
+
+关闭 HiCache 后，`_should_elide_dsa_index_k` 读取不存在的 `memory_config.enable_unified_cache_external_linker`。该字段仅在 GLM 导入代码中出现，官方基线没有。`e256489848` 恢复官方判断条件。
+
+#### 4.3 HCU ragged MQA logits 调用未导入的 `deep_gemm`：已修复
+
+长 prefill 进入 `_get_topk_ragged_kpool_plan` 后，无条件调用只在 CUDA 下导入的 `deep_gemm.fp8_mqa_logits`，HCU 因此报 `NameError`。
+
+`fe3abe5842` 将 HCU 分支改为已有的 `lightop_attention.mqa_logits`。独立算子测试对 Torch 参考的最大绝对误差为 `3.8e-06`。
+
+`clean_logit=True` 的语义是：
+
+```text
+sum_h weight * relu(q·k) * k_scale
+```
+
+它不负责把行区间外填成 `-inf`；区间屏蔽由后续 top-k transform 根据 `ks`/`ke` 完成。
+
+#### 4.4 缺少 HCU `kpool_topk_transform`：当前 P0
+
+修复前述问题后，约 2561-token prefill 报：
+
+```text
+ModuleNotFoundError:
+sglang.kernels.ops.moe.kpool_topk_transform
+```
+
+调用链：
+
+```text
+_get_topk_ragged_kpool_plan
+  -> topk_from_pooled_history_logits
+  -> kpool_topk_transform
+```
+
+上游 GLM 提交包含 Python wrapper 和 CUDA `.cuh`，但本分支未带入。不能直接恢复 `.cuh`：其中使用 CUDA C++、`cuda_fp16.h` 和 SM90 radix top-k，无法在 `gfx938` JIT 编译。
+
+当前 Python fallback 在 `row_starts` 或 `page_table_row_index` 非空时重新抛异常，而 ragged prefill 正好传入 `row_starts=ks_per_q`。
+
+建议复用 `/Users/wanglong/Code/sglang-model/python/sglang/srt/layers/attention/nsa/kpool/kernels.py` 中 `_torch_topk_pooled_history`，适配到 `dsa/kpool_fp8_index.py`。该实现已处理 `row_starts`、`group_lengths`、pool expansion、page table、tail 和 `out_rows`。正确性通过后，再按 DCU 参考尝试 `aiter.kpool_topk` 或 LightOp `fast_kpool_topk_transform_fused`；Torch 版本只作保底。
+
+必须测试：
+
+- `row_starts` 为 0 和非零。
+- 不同 `group_lengths`，`pool_size=4`，tail 长度 0/1/2/3。
+- `page_table`、`page_table_row_index`、`topk_offsets` 和 `out_rows`。
+- 无 pooled history、列数小于 top-k、冷 prefill 和 prefix-cache prefill。
+- top-k 后将全局列号减去有效窗口起点，恢复局部 pooled-group 编号。
+
+#### 4.5 分级结果
+
+HiCache 关闭且修复 ragged MQA logits 后：
+
+| Prompt token | 结果 |
+| ---: | --- |
+| 11、41、81、161、321、641、1281 | 通过，约 3.0-3.8 秒 |
+| 2561 | `kpool_topk_transform` ModuleNotFoundError；8 个 rank 各一次；无 VMFault |
+
+641-token 记录中出现 `#cached-token: 640`，说明至少部分测试走了 prefix cache。修复后必须补充清空缓存的冷 prefill。
+
+### 5. EvalScope：没有崩溃，实际是超时
+
+GSM8K smoke 配置为 20 条、batch size 1、`max_tokens=2048`。运行 49 分钟仍为 0/20，EvalScope 多次报告请求超时，prediction 目录为空。
+
+服务日志显示：
+
+- `Scheduler hit an exception`：0。
+- `Fatal Python error`：0。
+- `KERNEL VMFault`：0。
+- decode token 持续增加，并非死锁。
+- 观测吞吐约 20-50 token/分钟；生成 2048 token 可能需要接近一小时。
+
+结论：这次 GSM8K 没有产生可评分答案，不能算作崩溃，也不能判断正确性。下一次先定位 target-only 与完整配置的吞吐差异，再把 smoke 输出上限设为 256 或 512，并提高请求超时；同时记录 `finish_reason` 和截断率，确认没有系统性截断后再扩大样本。
+
+EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.13；GSM8K 1319 条、MATH-500 500 条均能加载。
+
+## 已知不可用或受限路径
+
+| 路径 | 结果 |
 | --- | --- |
-| `--enable-hierarchical-cache` | 1281 tokens (dies at ~2561) |
-| `--disable-hierarchical-cache` | 1281 tokens, then later failure changed shape |
+| `--kv-cache-dtype bfloat16` | DSA indexer 报 `Scaled index K cache is not enabled`；不能作为 FP8 KV 问题的绕行方案 |
+| DSA `_forward_tilelang` | `libtilelang.so` 在 `GemmNode::InferLayout -> make_hcu_swizzled_layout` 崩溃；`D_V=512`、head 8/16 的 gfx938 路径不可用 |
+| `SGLANG_USE_DEEPGEMM_MOE=0` | DeepEP dispatch 不支持当前 `CompressedTensorsW8A8Fp8MoE`，且 HCU 上 JIT DeepGEMM 关闭 |
+| 启动参数关闭 mHC post TileLang | 环境变量会在后续 hook 被重新设为 true；如需关闭必须改代码 |
 
-Disabling HiCache removed the segfault entirely and raised the practical
-limit, so HiCache is currently left **off** (`ifb_nohicache.sh`, generated from
-`ifb.sh` by dropping the five `hicache`/`hierarchical-cache` arguments).
-The underlying HiCache VMFault is **not** fixed, only avoided.
+## 待复核的数值路径
 
-### Failure 2 — dangling `memory` config leaf (fixed)
+以下项尚无独立证据证明有错，但在建立精度基线前不能删除：
 
-Turning HiCache off could not even start: `_should_elide_dsa_index_k` read
-`memory_config.enable_unified_cache_external_linker`, a leaf that does not
-exist in the published `memory` namespace. The identifier appears exactly once
-in the tree (that read) and nowhere in the upstream baseline; the GLM import
-commit `979baf5a81` introduced it as a dangling reference that only fires on
-the HiCache-off path. Fixed in `e256489848` by restoring the upstream
-predicate. Note this guard decides whether the DSA indexer K cache is elided,
-so it is on the correctness path for DSA, not just startup.
+- channel-FP8 权重经 `pack_int8_weight_enk_to_w6_low_latency` 后是否保持幅值；应对单个 expert 比较 packed dequant 与原始按通道 BF16 权重。
+- checkpoint 的 `kv_cache_scheme` 为 null，但启动参数强制使用 FP8-E4M3 KV；需确认模型期望的 KV 量化约定。
+- DSA indexer `weights_proj(x.float())` 与 channel-FP8 权重组合的 HCU 数值行为。
+- `Glm5NextForConditionalGeneration` 权重映射、`fused_qkvbfg_a_proj` slice 顺序，以及 MTP `eh_proj/enorm/hnorm` 的 BF16 加载结果。
 
-### Failure 3 — `deep_gemm` used but never imported on HCU (fixed)
+## 已排除项
 
-Next the scheduler died with:
+- EP、DeepEP、MoE dispatch、EAGLE：纯 TP 仍复现乱码。
+- `_forward_aiter_torch_fallback` KV scale：GLM 的 `qk_rope_head_dim=0`，实际走 `triton_sparse_mla_fwd`，不进入怀疑的 einsum 分支。
+- AITER fallback head padding：8 个 Q head 扩到 16，输出按相同 factor 取回，索引对应正确。
+- TileLang mHC pre 数值实现：关闭该路径时乱码不变；真正问题是错误的 `norm_fused` 状态。
+- DeepGEMM channel-FP8 MoE 权重准备：与 DCU 参考使用相同 packer 和 grouped GEMM 调用。
+- `kpool_bf16_paged_mqa_logits` FP8 解码、Q/K scale 组合：与 E4M3FN 和算子代数一致。
+- `set_mla_kv_buffer_fp8_quant_kernel` 的 `rope_dim=0` 分支：覆盖 GLM 的实际布局。
+- `forward_mla_rocm.py` 漂移：仅为配置字段访问方式差异，无数值语义变化。
+- GSM8K 服务崩溃：评测对应日志中没有 scheduler exception、fatal error 或 VMFault。
 
-```
-NameError: name 'deep_gemm' is not defined
-  at dsa_indexer_kpool.py:937, in _get_topk_ragged_kpool_plan
-```
+## 未解决问题
 
-`deep_gemm` is imported only under `if is_cuda()`. On HCU `is_cuda()` is False
-and `is_hip()` is True, so the name is never bound — yet the ragged-extend
-path called `deep_gemm.fp8_mqa_logits` unconditionally. The paged/decode path
-in the same file *does* have an `is_hip()` fallback, and the non-kpool DSA
-indexer has one for both (`dsa_indexer.py`: `_hcu_paged_mqa_logits` /
-`_hcu_mqa_logits`); the ragged-extend path was simply never given one.
+1. **P0：长 prompt 缺少 HCU `kpool_topk_transform`。** 约 2561 token 稳定触发，是执行评测前的正确性阻塞。
+2. **P1：解码吞吐异常低。** GSM8K 请求约 20-50 token/分钟，EvalScope 超时且未生成 prediction。
+3. **P2：HiCache Mamba backup VMFault。** 当前仅通过关闭 HiCache 规避。
+4. **P2：长生成仍有残余质量问题。** 20 条文本 sanity 仅 15/20，缺少失败样例分类和可信基线。
+5. **P2：DeepSeek-V4 norm 修复未验证。** `de651cb5e6` 可能影响该模型，需独立回归。
+6. **P2：BF16 KV cache 不可用。** DSA indexer 断言 `use_scaled_index_k_cache`。
+7. **P2：精度尚未验证。** GSM8K 和 MATH-500 都没有完成有效评分。
 
-This is why only long prompts died: short requests are served by the
-decode/kpool-paged branch, so `_get_topk_ragged_kpool_plan` is never reached.
+## 下一位开发者的执行顺序
 
-Fixed in `fe3abe5842` by gating both `deep_gemm.fp8_mqa_logits` calls on
-`_is_hcu` and calling `lightop_attention.mqa_logits`, the operator
-`dsa_indexer.py` already uses on HCU, imported at module scope under the same
-`is_hcu` guard. Verified at operator level against a torch reference over a
-ragged layout in FP8 e4m3 with per-K `kv_scale`: max abs diff 3.8e-06,
-output shape `(6, 40)` float32.
+1. 更新 Todo，将当前事项标记为进行中。
+2. 从 `sglang-model` 移植并验证 `_torch_topk_pooled_history`，不要恢复 CUDA `.cuh`，不要另写新算子。
+3. 本地执行语义单测、`compileall`、`git diff --check`；更新本文档并提交，commit message 写清根因、索引语义、验证和限制。
+4. 推送 `wl/glm5.3-flash`。进入容器后拉取并用 `git log --oneline -1` 确认 commit。
+5. 确认没有其他任务使用相关共享内存后清理 sglang `/dev/shm` 残留，使用 HiCache-off 脚本启动。
+6. 先跑独立 HCU 算子 probe，再跑 11 至 8192 token 的冷/热 prefill 分级回归。
+7. 正确性通过后定位吞吐，再运行 GSM8K 5/20 条和 MATH-500；每一步同步更新 Todo 和本文档。
 
-**Semantics worth recording:** `clean_logit=True` applies **ReLU** to the
-dot products, i.e. the operator computes `sum_h w * relu(q.k) * k_scale` and
-does *not* prefill `-inf` outside each row's `[ks, ke)` window. The top-k
-transform masks via the `ks`/`ke` lengths instead. A first reference attempt
-that omitted the ReLU disagreed by 51.4 against a reference max of 28.1, which
-is what pinned the semantics down.
+## 操作注意事项
 
-### Failure 4 — missing `kpool_topk_transform` JIT module (OPEN, current blocker)
+- 服务启动约 7-8 分钟。一次启动内批量完成分级探针。
+- HCU 算子签名和语义优先用独立 probe 验证，避免用完整服务反复猜测。
+- 容器曾需要：
 
-With failures 1-3 cleared, a ~2561-token prompt advances one frame further and
-now dies at:
-
-```
-ModuleNotFoundError: No module named 'sglang.kernels.ops.moe.kpool_topk_transform'
-  at kpool_fp8_index.py:761, in topk_from_pooled_history_logits
-  <- dsa_indexer_kpool.py:986 _get_topk_ragged_kpool_plan
-```
-
-The GLM import commit `979baf5a81` **dropped three files** that the upstream
-GLM-5.3-Flash commit `0b9c38484e` shipped:
-
-| File | State in das |
-| --- | --- |
-| `python/sglang/kernels/ops/moe/kpool_topk_transform.py` | missing |
-| `python/sglang/kernels/jit/csrc/dsa/kpool_topk_transform.cuh` | missing |
-| `python/sglang/srt/layers/attention/dsa/kpool_fp8_index.py` | present (fork's own version) |
-
-The two missing files do exist in this repo's history (`c66a285c94`,
-`ee0f2375e5`, on `remotes/origin/sync/official-main-daily-20260907`), but that
-branch is **not** an ancestor of the das `glm5.3-flash` branch.
-
-Why a plain restore is not the answer: the `.cuh` is CUDA-only C++
-(`__global__`, `cudaFuncSetAttribute`, `#include <cuda_fp16.h>`, SM90-era
-radix top-k), so it cannot JIT-compile on gfx938. And the Python fallback that
-`kpool_fp8_index.py` keeps is explicitly refused on this call path — the
-ragged-extend caller passes `row_starts=ks_per_q`, and the fallback does
-
-```python
-except ModuleNotFoundError:
-    if row_starts is not None or page_table_row_index is not None:
-        raise
-```
-
-so it re-raises rather than degrading. A torch top-k equivalent for the
-`row_starts` + pool-expansion case has to be written or routed to an existing
-HCU top-k (`DSATopKBackend` already has an HCU-aware `topk_func` and reserves
-`sgl-kernel`/`torch`/`flashinfer` implementations). **This is the current
-blocker and was not resolved before this report.**
-
-### Long-prompt threshold, measured
-
-| Prompt tokens | HiCache on | HiCache off, before fix 3 | HiCache off, after fix 3 |
-| --- | --- | --- | --- |
-| 11 | ok | ok | ok |
-| 41 | ok | ok | ok |
-| 81 | VMFault | ok | ok |
-| 161 / 321 / 641 | — | ok | ok |
-| 1281 | — | ok | ok |
-| 2561 | — | `deep_gemm` NameError | `kpool_topk_transform` ModuleNotFoundError |
-
-### Operational notes added this session
-
-- Hicache-off launcher: `/home/work/glm/ifb_nohicache.sh`, generated from
-  `ifb.sh` by deleting `--enable-hierarchical-cache`, `--hicache-size`,
-  `--hicache-write-policy`, `--hicache-io-backend`, `--hicache-mem-layout`.
-- The container checkout needs
-  `git fetch wl 'refs/heads/wl/glm5.3-flash'` followed by
-  `git reset --hard FETCH_HEAD`; a bare `git fetch wl` maps the branch to
-  `wl/wl/glm5.3-flash` and leaves the working tree behind. Always confirm with
-  `git log --oneline -1`.
-- On-HCU operator probes (`/tmp/vm3.py` style) settle a signature/semantics
-  question in seconds and caught the ReLU. Prefer them to end-to-end runs.
-- Server startup is ~7-8 minutes; keep the threshold probes batched so one
-  launch answers several questions.
-
-## 2026-09-13 (final session): HiCache-off re-verification and the eval stall
-
-This section continues directly from the Failure 1-4 sequence above. Operating
-instruction for this session: **turn HiCache off and re-verify the long-prompt
-crash; if HiCache-off still fails, keep fixing it; if it clears, record the
-issue and continue with HiCache off.**
-
-### HiCache-off re-verification (a clean confirmation of Failure 1)
-
-HiCache-off was already in place via `ifb_nohicache.sh` (confirmed: zero
-`hierarchical-cache`/`hicache-*` flags in the launcher). Restarted clean after
-`/dev/shm` cleanup and re-ran the threshold ladder twice.
-
-Server: `fired up` = 1, `VMFault` = **0**, no startup errors.
-
-```
-reps=  1  prompt_tok=  11 -> OK  3.1s
-reps=  4  prompt_tok=  41 -> OK  3.0s
-reps=  8  prompt_tok=  81 -> OK  3.1s     <-- died here with HiCache ON
-reps= 16  prompt_tok= 161 -> OK  3.1s
-reps= 32  prompt_tok= 321 -> OK  3.1s
-reps= 64  prompt_tok= 641 -> OK  3.3s
-reps=128  prompt_tok=1281 -> OK  3.8s
-reps=256               -> CRASH
-```
-
-So the answer to the instruction is unambiguous:
-
-- **HiCache off removes the VMFault entirely.** `KERNEL VMFault` count is 0
-  across the whole session, versus repeated kernel VMFaults plus
-  `transfer_mamba_backup_kernel` and exit code -6 with HiCache on. The
-  practical prompt limit moves from 81 to 1281 tokens.
-- **HiCache off does NOT remove the long-prompt problem.** The 2561-token
-  rung still kills the server, with the identical Failure 4 signature and
-  nothing else:
-
-  ```
-  ModuleNotFoundError: No module named
-    'sglang.kernels.ops.moe.kpool_topk_transform'      (x8, one per rank)
-  VMFault count: 0
+  ```bash
+  git fetch wl 'refs/heads/wl/glm5.3-flash'
+  git reset --hard FETCH_HEAD
+  git log --oneline -1
   ```
 
-  Per the instruction ("if it still fails, keep fixing"), diagnosis continued;
-  see the route analysis under Failure 4 above. No fix was landed this session.
-
-Also worth recording: the failing prefill is a **cached** one
-(`#cached-token: 640` on the 641-token rung), i.e. chunked/prefix-cached
-prefill reaches `_get_topk_ragged_kpool_plan` just as a cold one does.
-
-### The evalscope GSM8K run did not fail because of a crash
-
-This corrects an earlier reading of this session. The GSM8K smoke run
-(limit 20, `--eval-batch-size 1`, `max_tokens: 2048`) was labelled a crash -
-by-association because the separate threshold ladder crashes. It was not.
-
-What actually happened, from `out_gsm8k_smoke/logs/eval_log.log` and
-`/tmp/glm53_eval.log`:
-
-- The server did **not** crash: `Scheduler hit an exception` = 0,
-  `Fatal Python error` = 0, `KERNEL VMFault` = 0.
-- The server did **not** stall: the decode batches are progressing normally
-  (`#full token` advancing 1978 -> 2018 -> 2058 at a steady ~50s/step, mamba
-  num 4).
-- evalscope simply made no measurable progress: 49+ minutes elapsed, still
-  `0/20`, with `Attempt 1 / 5 failed: Request timed out.. Retrying...`.
-- No predictions were written: `out_gsm8k_smoke/predictions/` is empty; only
-  `configs/task_config.yaml` and `logs/eval_log.log` exist.
-
-So the real symptom is **throughput, not correctness**: with
-`--eval-batch-size 1` and `max_tokens: 2048`, a single GSM8K request needs
-thousands of decode steps at roughly 20 tokens/minute on this box, which is
-far outside evalscope's request timeout. Three separate concerns are tangled
-here and must not be conflated:
-
-| Concern | Evidence | Status |
-| --- | --- | --- |
-| Long-prompt crash (>~1280 tok) | Failure 4 ModuleNotFoundError | real, open |
-| GSM8K eval produces no score | 0/20 after 49 min, retry timeouts | real, open - a throughput/config problem |
-| GSM8K crash | none observed | not a thing |
-
-### Throughput numbers measured this session
-
-These matter for sizing the eval run and are the reason a 20-question smoke
-test could not finish:
-
-- Short-prompt request, 8 output tokens: ~3.1-3.8 s (all rungs).
-- GSM8K-shaped request (`max_tokens: 2048`): decode advanced ~40 tokens per
-  ~50 s, i.e. **roughly 20-50 tokens/minute**. A full 2048-token answer would
-take on the order of an hour.
-- EAGLE acceptance was 0.23-0.28 / accept length 2.2-2.4 during these runs.
-
-Before any further eval attempt, the timeout must be raised well beyond
-evalscope's default and `max_tokens` cut to something a greedy GSM8K answer
-actually needs, otherwise every request will time out and retry regardless of
-whether the model is correct.
-
-### Correction to the record above
-
-An earlier turn of this session reported the GSM8K smoke run as having
-crashed the server. That was wrong, and it was wrong in a way worth naming:
-the crash was inferred from the *separate* threshold ladder rather than read
-off the eval's own log. The eval server log shows no crash at all. The
-unresolved-issue entry for the eval was rewritten accordingly.
-
-## Known unresolved issues
-
-1. **OPEN, blocker for evals — long prompts (>~1280 tokens) kill the server.**
-   Confirmed to persist with HiCache disabled, so it is independent of
-   Failure 1. Signature:
-   `ModuleNotFoundError: sglang.kernels.ops.moe.kpool_topk_transform`, one per
-   rank, raised from `_get_topk_ragged_kpool_plan` ->
-   `topk_from_pooled_history_logits`. See Failure 4 for why neither a plain
-   restore of the two upstream files nor the built-in Python fallback works.
-2. **OPEN — the GSM8K evalscope run yields no score, and the cause is
-   throughput/timeout, not a crash.** 0/20 after 49 minutes with
-   `--eval-batch-size 1` and `max_tokens: 2048`; server healthy throughout
-   (`Scheduler hit an exception` = 0, decode advancing normally); no
-   predictions written. Needs a raised request timeout and a realistic
-   `max_tokens` before it can produce a number. Do **not** treat this as a
-   model-correctness signal either way - no answer was ever scored.
-3. **HiCache Mamba-backup VMFault is avoided, not fixed.**
-   `transfer_mamba_backup_kernel` still faults on HCU with
-   `--enable-hierarchical-cache` (81-token prompt, exit code -6). HiCache is
-   disabled for now; re-enabling it needs the fault diagnosed, likely an
-   out-of-range `params.layer_ptrs[layer_id]` read in
-   `python/sglang/kernels/jit/csrc/kvcacheio/transfer_mamba.cuh`.
-4. Residual accuracy degradation on long greedy generations, as recorded
-   earlier in this document. Unchanged by this session's fixes.
-5. The `deepseek_v4.py` half of the norm fix is unverified (no DeepSeek-V4
-   launch was run).
-6. `--kv-cache-dtype bfloat16` still cannot launch: the DSA indexer asserts
-   `use_scaled_index_k_cache` unconditionally.
-7. Accuracy has **not** been validated against any reference or eval set.
-   evalscope 1.11.1 is installed at `/home/work/evalscope_uv/.venv`
-   (uv 0.12.13) and both GSM8K (1319 rows) and MATH-500 (500 rows) load, so
-   the harness itself is ready; it has simply never completed a question.
-8. The supplied `/home/work/glm/ifb.sh` warmup path completes, but the full
-   `ifb.sh` (with HiCache) still hits issue 3 on long prompts.
-
-## Next actions, in order
-
-1. Clear issue 1 (`kpool_topk_transform`) — it is the only thing standing
-   between the current tree and a runnable eval.
-2. Then clear issue 2: raise evalscope's request timeout and lower
-   `max_tokens` (a greedy GSM8K answer does not need 2048), and confirm the
-   run at limit 5-20 before scaling up.
-3. Only then read an accuracy number. Nothing measured so far is an accuracy
-   result.
-
-## Operating notes (additions)
-
-- The container checkout needed `git reset --hard FETCH_HEAD` after
-  `git fetch wl 'refs/heads/wl/glm5.3-flash'`; a plain `git fetch wl` on this
-  remote maps the branch to `wl/wl/glm5.3-flash` and leaves the local branch
-  behind. Verify with `git log --oneline -1` after pulling.
-- Validate `mhc_pre` changes with a standalone on-HCU script that stubs
-  `get_tp_group` / `is_allocation_symmetric` / `use_symmetric_memory` and
-  sets `SGLANG_ROCM_USE_AITER_TILELANG_MHC=1` *before* importing sglang, so
-  the real branch selection is exercised without launching a server.
-- The mHC unit repro is cheap (seconds) compared to a server launch
-  (~8 minutes). Prefer it for any further mHC/kernel work.
+  普通 `git fetch wl` 会把目标映射到 `wl/wl/glm5.3-flash`，可能不更新工作树。执行 `reset --hard` 前必须确认工作树没有需要保留的远端修改。
+- SSH ControlMaster socket 消失或出现 `Too many authentication failures` 时立即停止，请用户从终端手动执行一次 `ssh nmz26`，禁止自动重试。
+- mHC 单测必须在导入 sglang 前设置 `SGLANG_ROCM_USE_AITER_TILELANG_MHC=1`，否则不会覆盖真实分支。
