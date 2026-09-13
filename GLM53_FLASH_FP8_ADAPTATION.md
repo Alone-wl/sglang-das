@@ -27,29 +27,29 @@
 ## 当前状态
 
 - 本地分支：`glm5.3-flash`；推送目标：`wl/glm5.3-flash`。
-- 当前本地代码提交：`a5f5c1f0dc`；其后只有本文档的状态更新。
-- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`191fc0cc91`，已落后于本地文档提交。
+- 当前本地基线：`082ef26dfd`；本提交修复 BF16 KV 下的 kpool index-K 分配。
+- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`082ef26dfd`。
 - 模型：`/home/work/GLM-5.3-Flash-Channel-FP8-w8a8`。
 - 硬件：8 张 HCU，`gfx938`。
 - 主配置：TP=8、EP=8、DeepEP normal、DSA/NSA、FP8-E4M3 KV cache、Mamba、EAGLE。
 - 当前临时关闭 HiCache，使用 `/home/work/glm/ifb_nohicache.sh`。这是规避 Mamba backup VMFault 的临时措施，不是最终配置。
 - 短 prompt 已能生成连贯文本；短输出乱码的根因已修复。
-- Torch fallback 已使纯 TP 冷 prefill 通过 2566/4107 token，但约 8200 token 因复制宽 page table 申请 32.06 GiB 而 OOM；本地已接入现有 AITER top-k，等待 HCU 端到端复测。
-- 当前评测阻塞：GSM8K 单请求解码过慢并触发 EvalScope 超时；没有得到有效评分，不能据此判断模型精度。
+- AITER kpool top-k 已使纯 TP 的 2568/4109/8209-token 冷 prefill 和 8K prefix-cache 命中请求通过，无 OOM/VMFault。
+- TP 解码约 5 tok/s。EvalScope GSM8K 5 条均生成 256 个 `!` 并因 `max_tokens` 截断，得分 0%；当前阻塞是模型数值错误，不再是请求超时。
 
 ## Todo（每次提交必须更新）
 
 | 状态 | 优先级 | 事项 | 完成标准 |
 | --- | --- | --- | --- |
 | 进行中 | M1/P0 | **纯 TP 部署精度正常** | TP=8、EP=1、无 DeepEP、无 EAGLE；长 prompt 稳定；GSM8K/MATH-500 与可信基线对齐；记录配置、分数、截断率和失败样例 |
-| 进行中 | M1/P0 | 接入 HCU AITER kpool top-k | 冷/热 prefill 均通过 2561、4096、8192 token；索引语义与参考实现一致；无 OOM/VMFault |
-| 待办 | P0 | 完成长 prompt 回归 | HiCache 关闭时按 11、81、641、1281、2561、4096、8192 token 分级验证并记录日志 |
-| 待办 | P1 | 定位 GSM8K 极低吞吐 | 分别测 target-only/完整配置的 TTFT、decode tok/s、EAGLE 接受率，明确瓶颈 |
-| 待办 | P1 | 完成 GSM8K smoke | 使用合理输出上限和超时先跑 5 条，再跑 20 条；记录截断率、失败样例和分数 |
+| 完成 | M1/P0 | 接入 HCU AITER kpool top-k | 2568/4109/8209-token 冷 prefill 和 8K cache hit 通过；无 OOM/VMFault |
+| 完成 | M1/P0 | 完成长 prompt 回归 | HiCache 关闭时 8K 冷/热 prefill 通过；低长度已由此前分级覆盖 |
+| 进行中 | M1/P0 | 修复 BF16 KV 下的 kpool index-K 分配 | 官方 AMD 配方可启动；短 chat 正确；8K 冷/热通过 |
+| 完成 | P1 | 定位 GSM8K 极低吞吐 | 纯 TP 约 5 tok/s；5 条评测可完成，原 20-50 token/分钟来自完整配置/旧路径 |
+| 进行中 | M1/P0 | 完成 GSM8K smoke | BF16 KV 配方下先跑 5 条，再跑 20 条；记录截断率、失败样例和分数 |
 | 待办 | P1 | 完成 MATH-500 smoke | GSM8K 稳定后执行并记录配置、分数和失败样例 |
 | 待办 | P2 | 修复 HiCache Mamba backup VMFault | 开启 HiCache 后长 prompt 不再触发 `transfer_mamba_backup_kernel` VMFault |
 | 待办 | P2 | 验证 DeepSeek-V4 norm 修复 | 启动对应模型确认不存在重复归一化 |
-| 待办 | P2 | 修复 BF16 KV cache 路径 | `--kv-cache-dtype bfloat16` 不再触发 scaled index K cache 断言 |
 | 待办 | P2 | 建立可信精度基线 | 与可信实现、相同 prompt 和采样参数对齐，不只检查文本可读性 |
 
 ## 已完成工作与提交
@@ -92,6 +92,9 @@
 | `782f6c8577` | 修正 HiCache-off 和 EvalScope 结论 | 文档提交 |
 | `7a03aa8469` | 将调试日志重构为精简中文交接文档 | `git diff --check`；未修改代码 |
 | `a5f5c1f0dc` | 缺少融合模块时复用 Torch pooled-history top-k | CPU 语义测试、`compileall`、`git diff --check` 通过；待 HCU 验证 |
+| `729df85bdc` | 登记 TP 精度 milestone 与 kpool 修复 | 文档提交 |
+| `082ef26dfd` | HCU 长 prefill 使用 AITER kpool top-k | 8K 冷/热 prefill 通过；无 OOM/VMFault |
+| 本提交 | kpool compression 不再随主 KV dtype 错分配普通 BF16 index-K | 本地 `compileall`、`git diff --check`；HCU 待验证 |
 
 ## 调试记录
 
@@ -267,9 +270,31 @@ page table 宽度为 1M；约 8K 个 query 行会先复制成约 `8K x 1M x int3
 
 容器中的 `aiter.kpool_topk` 和 LightOp `fast_kpool_topk_transform_fused` 均存在。独立 HCU 测试确认 AITER 支持 `row_starts`、`page_table_row_index`、`seq_lens` 和 tail；有效 group 数超过 128 时，其最终 token 集合与 Torch fallback 完全一致。AITER 会整理输出顺序，因此不能按 Torch `topk` 的分数顺序逐项比较。
 
-本地已按 `sglang-model` 接入 `aiter.kpool_topk`：由 `SGLANG_NSA_KPOOL_AITER_TOPK=1` 控制，仅在 `index_kpool` 为 4/16、`index_topk=2048` 且存在 `seq_lens` 时启用；算子缺失时保留 Torch fallback。待重新提交并执行 8K 冷/热 prefill。
+`082ef26dfd` 已按 `sglang-model` 接入 `aiter.kpool_topk`：由 `SGLANG_NSA_KPOOL_AITER_TOPK=1` 控制，仅在 `index_kpool` 为 4/16、`index_topk=2048` 且存在 `seq_lens` 时启用；算子缺失时保留 Torch fallback。
 
-### 5. EvalScope：没有崩溃，实际是超时
+端到端结果：
+
+| Prompt token | 缓存 | 结果 |
+| ---: | ---: | --- |
+| 2568 / 4109 / 8209 | 0 | HTTP 200，分别 4.68 / 5.92 / 11.13 秒 |
+| 8205，首次 / 再次 | 0 / 8192 | HTTP 200，11.02 / 1.51 秒 |
+
+### 4.7 官方 AMD 精度配方暴露 BF16 index-K 分配错误
+
+官方仓库 `b26cb8d0d3` 的 GLM-5.3 AMD nightly 使用 TP8、BF16 KV、TileLang DSA、Triton MoE、关闭 CUDA Graph；MI300X/MI355X 的 GSM8K 实测约 97%。当前 TP 脚本使用 FP8 KV 和 AITER DSA，与可信配方不一致。
+
+对齐配方时，服务在 warmup 稳定报错：
+
+```text
+get_index_k_with_scale_buffer
+AssertionError: Scaled index K cache is not enabled
+```
+
+根因是 `0258c9987e` 引入的 HCU index-K 多格式逻辑按主 KV dtype 选择 index-K 格式。BF16 KV 因此分配普通 BF16 index-K；但 GLM-5.3 启用 kpool compression 后，写入/更新算子的 ABI 固定为 packed FP8 K + FP32 scale，必须使用 `IndexKeyCache`。官方基线的 index-K cache 也独立于主 KV dtype。
+
+本次修复仅在 `index_kpool > 1 && index_kpool_compress` 时把错误解析出的 BF16 index-K 改为 scaled FP8；普通 DSA BF16 cache 和 gfx936 INT8 opt-in 不变。HCU 验证结果待补。
+
+### 5. EvalScope：旧超时已解除，当前是确定性重复
 
 GSM8K smoke 配置为 20 条、batch size 1、`max_tokens=2048`。运行 49 分钟仍为 0/20，EvalScope 多次报告请求超时，prediction 目录为空。
 
@@ -281,7 +306,9 @@ GSM8K smoke 配置为 20 条、batch size 1、`max_tokens=2048`。运行 49 分�
 - decode token 持续增加，并非死锁。
 - 观测吞吐约 20-50 token/分钟；生成 2048 token 可能需要接近一小时。
 
-结论：这次 GSM8K 没有产生可评分答案，不能算作崩溃，也不能判断正确性。下一次先定位 target-only 与完整配置的吞吐差异，再把 smoke 输出上限设为 256 或 512，并提高请求超时；同时记录 `finish_reason` 和截断率，确认没有系统性截断后再扩大样本。
+纯 TP 下重新运行 5 条、`max_tokens=256` 后，评测在 4 分 14 秒内完成，平均输入 587 token、输出 256 token、约 5.1 tok/s。5 条输出均为连续 `!`，全部因 `max_tokens` 截断，得分 0%。因此旧记录中的超时不是当前主要阻塞，模型数值仍不正确。
+
+隔离结果：关闭 `SGLANG_USE_DEEPGEMM_MOE` 或 CUDA Graph 均不能恢复短 chat 精度；mHC 融合 norm 与 `sglang-model` 的 AITER mHC + 显式 RMSNorm 对纯 Torch 参考的平均误差均约 `0.00112`、最大误差均 `0.03125`，不支持再次修改 mHC。
 
 EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.13；GSM8K 1319 条、MATH-500 500 条均能加载。
 
@@ -289,9 +316,9 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 
 | 路径 | 结果 |
 | --- | --- |
-| `--kv-cache-dtype bfloat16` | DSA indexer 报 `Scaled index K cache is not enabled`；不能作为 FP8 KV 问题的绕行方案 |
+| `--kv-cache-dtype bfloat16` | kpool compression 错分配普通 BF16 index-K；已本地修复，待 HCU 验证 |
 | DSA `_forward_tilelang` | `libtilelang.so` 在 `GemmNode::InferLayout -> make_hcu_swizzled_layout` 崩溃；`D_V=512`、head 8/16 的 gfx938 路径不可用 |
-| `SGLANG_USE_DEEPGEMM_MOE=0` | DeepEP dispatch 不支持当前 `CompressedTensorsW8A8Fp8MoE`，且 HCU 上 JIT DeepGEMM 关闭 |
+| `SGLANG_USE_AITER=1` | 当前 HCU AITER 缺少 `gemm_a8w8_blockscale`，导入阶段失败；继续使用细粒度 AITER 开关 |
 | 启动参数关闭 mHC post TileLang | 环境变量会在后续 hook 被重新设为 true；如需关闭必须改代码 |
 
 ## 待复核的数值路径
@@ -314,26 +341,25 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 - `set_mla_kv_buffer_fp8_quant_kernel` 的 `rope_dim=0` 分支：覆盖 GLM 的实际布局。
 - `forward_mla_rocm.py` 漂移：仅为配置字段访问方式差异，无数值语义变化。
 - GSM8K 服务崩溃：评测对应日志中没有 scheduler exception、fatal error 或 VMFault。
+- DeepGEMM MoE 和 CUDA Graph：纯 TP 分别关闭后，短 chat 的错误输出不变。
+- mHC norm 计算精度：融合路径与显式 RMSNorm 路径对 Torch 参考误差相当，不是当前 0% GSM8K 的证据链。
 
 ## 未解决问题
 
-1. **P0：AITER kpool top-k 待端到端验证。** Torch fallback 已通过 2566/4107-token 冷 prefill，但 8K 因 page-table 完整复制 OOM；AITER 独立算子测试通过。
-2. **P1：解码吞吐异常低。** GSM8K 请求约 20-50 token/分钟，EvalScope 超时且未生成 prediction。
+1. **P0：BF16 KV 的 kpool index-K 修复待验证。** 修复后需按官方数值配方完成启动、短 chat、8K 冷/热和 GSM8K。
+2. **P0：纯 TP 精度错误。** FP8 KV + AITER DSA 配置下 GSM8K 5 条均输出 256 个 `!`，得分 0%。
 3. **P2：HiCache Mamba backup VMFault。** 当前仅通过关闭 HiCache 规避。
 4. **P2：长生成仍有残余质量问题。** 20 条文本 sanity 仅 15/20，缺少失败样例分类和可信基线。
 5. **P2：DeepSeek-V4 norm 修复未验证。** `de651cb5e6` 可能影响该模型，需独立回归。
-6. **P2：BF16 KV cache 不可用。** DSA indexer 断言 `use_scaled_index_k_cache`。
-7. **P2：精度尚未验证。** GSM8K 和 MATH-500 都没有完成有效评分。
+6. **P2：MATH-500 尚未执行。** 先完成 TP GSM8K 精度门槛。
 
 ## 下一位开发者的执行顺序
 
-1. 更新 Todo，将当前事项标记为进行中。
-2. 从 `sglang-model` 移植并验证 `_torch_topk_pooled_history`，不要恢复 CUDA `.cuh`，不要另写新算子。
-3. 本地执行语义单测、`compileall`、`git diff --check`；更新本文档并提交，commit message 写清根因、索引语义、验证和限制。
-4. 推送 `wl/glm5.3-flash`。进入容器后拉取并用 `git log --oneline -1` 确认 commit。
-5. 确认没有其他任务使用相关共享内存后清理 sglang `/dev/shm` 残留，使用 HiCache-off 脚本启动。
-6. 先跑独立 HCU 算子 probe，再跑 11 至 8192 token 的冷/热 prefill 分级回归。
-7. 正确性通过后定位吞吐，再运行 GSM8K 5/20 条和 MATH-500；每一步同步更新 Todo 和本文档。
+1. 验证 BF16 KV 下 kpool compression 仍分配 packed scaled index-K，普通 BF16 DSA 分配逻辑不变。
+2. 按官方数值配方启动 TP8：BF16 KV、TileLang DSA、Triton MoE、关闭 CUDA Graph；全局 AITER 开关在当前镜像不可用。
+3. 跑短 chat 和 8K 冷/热；若 TileLang 在 gfx938 崩溃，分别保留 BF16 KV，只替换 prefill/decode backend 定位。
+4. 精度恢复后运行 GSM8K 5/20 条，再运行 MATH-500；记录分数、stop rate、截断率和失败样例。
+5. 每次提交同步更新 Todo、调试记录、验证和未解决问题。
 
 ## 操作注意事项
 

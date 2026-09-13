@@ -4795,6 +4795,16 @@ class DSATokenToKVPool(MLATokenToKVPool):
         self.index_k_cache_mode = resolve_index_k_cache_mode(
             dtype, page_size, index_head_dim
         )
+        # K-pool compression has a packed FP8-K + FP32-scale cache ABI that is
+        # independent of the latent KV-cache dtype.  In particular, a BF16
+        # latent KV cache must not select the plain BF16 index-K allocation:
+        # the k-pool write/update kernels consume IndexKeyCache storage.
+        if (
+            self.index_kpool > 1
+            and self.index_kpool_compress
+            and self.index_k_cache_mode is IndexKCacheMode.BF16
+        ):
+            self.index_k_cache_mode = IndexKCacheMode.FP8_SCALED
         self.use_fp8_index_k_cache = (
             self.index_k_cache_mode is IndexKCacheMode.FP8_SCALED
         )
