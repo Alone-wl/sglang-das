@@ -1802,19 +1802,18 @@ def fused_moe_fp8_w8a8(
             topk,
             cuda_config1,
         )
-        if swiglu_limit is None:
-            from lightop.activation import fuse_silu_mul_fp8_quant
+        from lightop.activation import fuse_silu_mul_fp8_quant
 
-            fp8_cache2, fp8_cache2_scale = fuse_silu_mul_fp8_quant(
-                intermediate_cache1, fp8type=0
+        if swiglu_limit is not None:
+            half = intermediate_cache1.shape[-1] // 2
+            intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
+            intermediate_cache1[:, half:].clamp_(
+                min=-swiglu_limit,
+                max=swiglu_limit,
             )
-        else:
-            from lightop import fuse_silu_mul_clamp_quant
-
-            fp8_cache2, fp8_cache2_scale = fuse_silu_mul_clamp_quant(
-                intermediate_cache1,
-                float(swiglu_limit),
-            )
+        fp8_cache2, fp8_cache2_scale = fuse_silu_mul_fp8_quant(
+            intermediate_cache1, fp8type=0
+        )
 
         intermediate_cache3 = moe_gemm_marlin_w8a8_fp8(
             fp8_cache2,

@@ -27,8 +27,8 @@
 ## 当前状态
 
 - 本地分支：`glm5.3-flash`；推送目标：`wl/glm5.3-flash`。
-- 当前本地基线：`3cfabe3094`；本提交适配 FP8 fused MoE 使用的 LightOp align 接口。
-- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`3cfabe3094`。
+- 当前本地基线：`fe54e1f611`；本提交修正 SwiGLU limit 后的激活量化 dtype。
+- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`fe54e1f611`。
 - 模型：`/home/work/GLM-5.3-Flash-Channel-FP8-w8a8`。
 - 硬件：8 张 HCU，`gfx938`。
 - 主配置：TP=8、EP=8、DeepEP normal、DSA/NSA、FP8-E4M3 KV cache、Mamba、EAGLE。
@@ -102,8 +102,9 @@
 | `f17b2903b1` | kpool compression 不再随主 KV dtype 错分配普通 BF16 index-K | 原断言消失；TileLang 进入编译，AITER DSA 可启动 |
 | `aa8cc413ba` | 补齐 KDA safe-gate 分支和 raw beta sigmoid | HCU 服务启动；三条短 chat 仍错误，输出形态改变 |
 | `009b187323` | 移植 DCU `30a5b3e3704` 的 GLM KDA 精度修复 | KDA 回归测试通过；真实 GLM 形状与 naive recurrent 相对误差低于 0.0038；端到端短 chat 仍错误 |
-| `3cfabe3094` | TP 旧 FP8 fused MoE 补齐 GLM SwiGLU limit | 本地静态检查通过；HCU warmup 已进入该路径，随后暴露 LightOp align 接口漂移 |
-| 本提交 | FP8 fused MoE align 调用适配当前 LightOp | 本地静态检查；HCU 端到端待验证 |
+| `3cfabe3094` | TP 旧 FP8 fused MoE 补齐 GLM SwiGLU limit | HCU warmup 进入该路径；首次实现误用了 INT8 clamp+quant，已在后续提交修正 |
+| `fe54e1f611` | FP8 fused MoE align 调用适配当前 LightOp | TP8 服务越过 warmup 并就绪；短 probe 仍乱码，随后定位到激活量化 dtype 错误 |
+| 本提交 | SwiGLU clamp 后保持 FP8 per-token 量化 | 本地静态检查；HCU 端到端待验证 |
 
 ## 调试记录
 
@@ -351,7 +352,7 @@ beta_is_raw=True
 
 - TP 启用既有 `SGLANG_USE_FP8_W8A8_MOE=1` 路径。
 - 将 `MoeRunnerConfig.swiglu_limit` 经普通 W8A8 和 compressed-tensors 两个入口传入 `fused_moe_fp8_w8a8`。
-- limit 存在时复用 LightOp `fuse_silu_mul_clamp_quant`；无 limit 的模型保持原 `fuse_silu_mul_fp8_quant` 路径。
+- limit 存在时先按官方语义原地 clamp gate/up，再复用 LightOp `fuse_silu_mul_fp8_quant`；无 limit 的模型保持原路径。
 - HCU 端到端验证必须确认启动环境同时包含 `SGLANG_USE_FP8_W8A8_MOE=1`，否则不会覆盖本次修复。
 
 首次 HCU 启动在 warmup 确认进入 `fused_moe_fp8_w8a8`，随后报错：
@@ -361,6 +362,15 @@ AttributeError: module 'lightop.op' has no attribute 'moe_align_block_size_out'
 ```
 
 当前 LightOp 导出的接口已改为 `moe_align_block_size(..., Is_EP=False, Is_fuse_fill=True)`。`sglang-model` 的旧 FP8 fused MoE 已使用该接口，并在调用前用无效 token id 初始化 padding，避免 LightOp 未写 padding 槽时 GEMM 读取垃圾索引。本次按参考实现同步这两项兼容，不改 align 算法。
+
+align 修复后 TP8 服务成功就绪，但三条固定 probe 仍输出重复乱码。独立 dtype 探针确认首次 limit 实现选错了算子：
+
+```text
+fuse_silu_mul_clamp_quant -> torch.int8, max=127
+fuse_silu_mul_fp8_quant   -> torch.float8_e4m3fn, max=448
+```
+
+前者服务于 W4A8/INT8 激活链路，不能喂给 `moe_gemm_marlin_w8a8_fp8`；将 INT8 字节按 FP8 解释会直接破坏幅值。当前 LightOp 没有 clamp+SiLU+FP8-quant 一体接口，因此按官方通用 MoE 的已有做法，先对 GEMM1 BF16 输出的 gate/up 两半原地限幅，再调用既有 `fuse_silu_mul_fp8_quant`。这只增加 clamp，不新增算子，并保持 GEMM2 输入为 E4M3FN。
 
 ### 5. EvalScope：旧超时已解除，当前是确定性重复
 
