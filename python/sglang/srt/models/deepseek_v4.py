@@ -2037,13 +2037,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 sinkhorn_repeat=self.hc_sinkhorn_iters,
                 **norm_kwargs,
             )
-            # The HCU compatibility path inside mhc_pre dispatches to AITER's
-            # pre_big_fuse_tilelang, which computes MHC pre but does not fuse
-            # the decoder RMSNorm.  Keep the validated v0.5.15.post1_dev
-            # contract so the caller still applies input_layernorm on HCU.
-            norm_fused = norm is not None and not (
-                _is_hcu and _use_aiter_tilelang_mhc
-            )
+            # mhc_pre() now only dispatches to AITER's pre_big_fuse_tilelang
+            # when there is no norm weight to fuse; with a norm weight it takes
+            # the with-norm tilelang kernel, which really does fold the decoder
+            # RMSNorm into y. Reporting False here would make the caller apply
+            # input_layernorm a second time.
+            norm_fused = norm is not None
             return y, post.squeeze(-1), comb, norm_fused
 
         if _is_hip:
