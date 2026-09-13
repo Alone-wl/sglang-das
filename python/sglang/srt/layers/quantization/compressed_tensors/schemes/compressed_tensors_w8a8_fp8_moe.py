@@ -698,6 +698,7 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     bias=bias,
                     hidden_states_fp8_input=i_q if use_prequant_input else None,
                     hidden_states_scale_fp8_input=i_s if use_prequant_input else None,
+                    swiglu_limit=moe_runner_config.swiglu_limit,
                 )
                 from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
 

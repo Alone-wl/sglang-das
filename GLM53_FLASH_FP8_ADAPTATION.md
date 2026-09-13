@@ -27,8 +27,8 @@
 ## 当前状态
 
 - 本地分支：`glm5.3-flash`；推送目标：`wl/glm5.3-flash`。
-- 当前本地基线：`aa8cc413ba`；本提交移植 DCU GLM KDA 精度修复。
-- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`aa8cc413ba`。
+- 当前本地基线：`009b187323`；本提交修复 TP FP8 fused MoE 的 SwiGLU limit 语义。
+- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`009b187323`。
 - 模型：`/home/work/GLM-5.3-Flash-Channel-FP8-w8a8`。
 - 硬件：8 张 HCU，`gfx938`。
 - 主配置：TP=8、EP=8、DeepEP normal、DSA/NSA、FP8-E4M3 KV cache、Mamba、EAGLE。
@@ -36,7 +36,8 @@
 - mHC 归一化缺失导致的首轮乱码已修复；后续精度评测暴露独立的 KDA 数值错误，当前短 chat 仍不正确。
 - AITER kpool top-k 已使纯 TP 的 2568/4109/8209-token 冷 prefill 和 8K prefix-cache 命中请求通过，无 OOM/VMFault。
 - BF16 KV 配方已越过 index-K 分配断言；官方 TileLang DSA 在 gfx938 编译失败，替换为 AITER DSA 后服务可启动，但短 chat 仍错误。
-- `aa8cc413ba` 补齐 safe gate / raw beta 后短 chat 仍错误；继续移植 DCU 已验证的 GLM KDA 精度修复，待 HCU 验证。
+- KDA 已通过真实 GLM 形状的 HCU 参考对比，不再是当前排查方向。
+- 当前最高置信根因是 TP channel-FP8 MoE：BF16/HCU 隐式进入 AITER，且旧 FP8 fused MoE 忽略 `swiglu_limit=10.0`。本提交复用旧 fused MoE，并把 limit 传入已有 LightOp clamp+quant 算子。
 
 ## Todo（每次提交必须更新）
 
@@ -47,7 +48,8 @@
 | 完成 | M1/P0 | 完成长 prompt 回归 | HiCache 关闭时 8K 冷/热 prefill 通过；低长度已由此前分级覆盖 |
 | 完成 | M1/P0 | 修复 BF16 KV 下的 kpool index-K 分配 | BF16 KV 已分配 scaled FP8 index-K，原断言消失并进入 DSA 执行 |
 | 完成 | M1/P0 | 修复 KDA safe gate / raw beta 语义 | 调用契约已与官方一致；端到端输出变化但未恢复 |
-| 进行中 | M1/P0 | 移植 DCU GLM KDA 精度修复 | 关闭 HCU 小网格融合并保留 FP32 中间量；短 chat/GSM8K 恢复 |
+| 完成 | M1/P0 | 移植并验证 DCU GLM KDA 精度修复 | 关闭 HCU 小网格融合、保留 FP32 中间量；真实 GLM 形状与 naive recurrent 对齐 |
+| 进行中 | M1/P0 | 复用 TP FP8 fused MoE 并保留 SwiGLU limit | `SGLANG_USE_FP8_W8A8_MOE=1`；`swiglu_limit=10.0` 进入 clamp+quant；短 chat 和评测恢复 |
 | 完成 | P1 | 定位 GSM8K 极低吞吐 | 纯 TP 约 5 tok/s；5 条评测可完成，原 20-50 token/分钟来自完整配置/旧路径 |
 | 进行中 | M1/P0 | 完成 GSM8K smoke | BF16 KV 配方下先跑 5 条，再跑 20 条；记录截断率、失败样例和分数 |
 | 待办 | P1 | 完成 MATH-500 smoke | GSM8K 稳定后执行并记录配置、分数和失败样例 |
@@ -99,7 +101,8 @@
 | `082ef26dfd` | HCU 长 prefill 使用 AITER kpool top-k | 8K 冷/热 prefill 通过；无 OOM/VMFault |
 | `f17b2903b1` | kpool compression 不再随主 KV dtype 错分配普通 BF16 index-K | 原断言消失；TileLang 进入编译，AITER DSA 可启动 |
 | `aa8cc413ba` | 补齐 KDA safe-gate 分支和 raw beta sigmoid | HCU 服务启动；三条短 chat 仍错误，输出形态改变 |
-| 本提交 | 移植 DCU `30a5b3e3704` 的 GLM KDA 精度修复 | 本地静态检查；HCU 待验证 |
+| `009b187323` | 移植 DCU `30a5b3e3704` 的 GLM KDA 精度修复 | KDA 回归测试通过；真实 GLM 形状与 naive recurrent 相对误差低于 0.0038；端到端短 chat 仍错误 |
+| 本提交 | TP 旧 FP8 fused MoE 补齐 GLM SwiGLU limit | 本地静态检查；HCU 端到端待验证 |
 
 ## 调试记录
 
@@ -328,6 +331,28 @@ beta_is_raw=True
 
 当前代码已具备该提交中的 IEEE dot 配置，因此本次只在 HCU 关闭小网格融合，并删除上述 BF16 强制降精度。门控累加仍沿用当前主线的 `RCP_LN2 + exp2` 约定，不照搬旧分支的 `exp_e`，避免重复乘 `log2(e)`。
 
+验证结果：
+
+- `TestKDAChunkExponentDomain` 三组 HCU 子测试通过。
+- 真实 GLM 单 rank 形状 `H=8, K=V=128`，序列长 31/129，启用 `lower_bound=-5` 和 raw beta；对 naive recurrent 的 output 相对误差为 `0.00375/0.00378`，state 相对误差为 `0.00246/0.00232`，最大绝对误差 `3.05e-05`，无非有限值。
+- BF16 KV + AITER DSA 的端到端短 chat 仍错误。KDA 单算子证据已充分，停止继续修改 KDA。
+
+### 4.10 TP channel-FP8 MoE 丢失 SwiGLU limit
+
+模型配置声明 `swiglu_limit=10.0`，`glm5_next.py` 已将其写入 `MoeRunnerConfig`。但当前 TP 执行存在两条错误路径：
+
+1. `--moe-runner-backend triton` 并不保证使用 Triton。BF16/HCU 下通用 `fused_moe` 会因 `_use_aiter_moe` 自动转入 AITER；该旧接口只接收 `gemm1_alpha/gemm1_limit`，没有传递 `swiglu_limit`。
+2. 可复用的 HCU FP8 fused MoE 由 `SGLANG_USE_FP8_W8A8_MOE=1` 启用，但其 GEMM1 后固定调用无 clamp 的 `fuse_silu_mul_fp8_quant`，同样丢失 limit。
+
+独立检查表明 DSA 不是当前根因：现有 AITER 不含 MLA stage1 ASM，实际回退到 `triton_sparse_mla_fwd`；真实 head dim 下对 Torch 的相对误差约 `0.0022`。相反，GLM 真实 MoE 形状的 AITER channel-FP8 探针与 Torch 参考严重偏离；仓库对应 HCU BF16/channel-FP8 测试也被明确禁用，注明尚需数值验证。
+
+处理方式遵循 DCU 参考实现，不增加新算子：
+
+- TP 启用既有 `SGLANG_USE_FP8_W8A8_MOE=1` 路径。
+- 将 `MoeRunnerConfig.swiglu_limit` 经普通 W8A8 和 compressed-tensors 两个入口传入 `fused_moe_fp8_w8a8`。
+- limit 存在时复用 LightOp `fuse_silu_mul_clamp_quant`；无 limit 的模型保持原 `fuse_silu_mul_fp8_quant` 路径。
+- HCU 端到端验证必须确认启动环境同时包含 `SGLANG_USE_FP8_W8A8_MOE=1`，否则不会覆盖本次修复。
+
 ### 5. EvalScope：旧超时已解除，当前是确定性重复
 
 GSM8K smoke 配置为 20 条、batch size 1、`max_tokens=2048`。运行 49 分钟仍为 0/20，EvalScope 多次报告请求超时，prediction 目录为空。
@@ -380,8 +405,8 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 
 ## 未解决问题
 
-1. **P0：DCU GLM KDA 精度修复待验证。** 需确认拆分 kernel 和 FP32 中间量能否恢复短 chat 与 GSM8K。
-2. **P0：纯 TP 精度错误。** FP8 KV 下 GSM8K 5 条均输出 256 个 `!`；BF16 KV + AITER DSA 下输出模式改变但仍错误。
+1. **P0：TP FP8 fused MoE + SwiGLU limit 待端到端验证。** 需启用 `SGLANG_USE_FP8_W8A8_MOE=1`，确认服务实际进入 marlin FP8 MoE 和 clamp+quant 分支。
+2. **P0：纯 TP 精度错误。** FP8 KV 下 GSM8K 5 条均输出 256 个 `!`；BF16 KV + AITER DSA 下输出模式改变但仍错误。KDA 和 DSA 单算子已排除。
 3. **P2：HiCache Mamba backup VMFault。** 当前仅通过关闭 HiCache 规避。
 4. **P2：长生成仍有残余质量问题。** 20 条文本 sanity 仅 15/20，缺少失败样例分类和可信基线。
 5. **P2：DeepSeek-V4 norm 修复未验证。** `de651cb5e6` 可能影响该模型，需独立回归。
@@ -389,9 +414,9 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 
 ## 下一位开发者的执行顺序
 
-1. 部署 DCU GLM KDA 精度修复，使用 BF16 KV + AITER DSA 跑短 chat。
+1. 部署 TP FP8 fused MoE limit 修复，以 `SGLANG_USE_FP8_W8A8_MOE=1` 启动 BF16 KV + AITER DSA 服务，先跑短 chat。
 2. 短 chat 正确后跑 8K 冷/热，再运行 GSM8K 5/20 条和 MATH-500；记录分数、stop rate、截断率和失败样例。
-3. 若仍错误，优先做 KDA 单算子/逐层对比，再检查 channel-FP8 expert，不回到已排除的 mHC/DeepGEMM/CUDA Graph 假设。
+3. 若仍错误，先确认 marlin packed channel-FP8 expert 的解量化幅值和 GEMM 输出；不回到已通过参考对比的 KDA、DSA、mHC 路径。
 4. TileLang DSA 的 gfx938 编译问题独立登记；首个 TP 精度 milestone 暂用 AITER DSA。
 5. 每次提交同步更新 Todo、调试记录、验证和未解决问题。
 

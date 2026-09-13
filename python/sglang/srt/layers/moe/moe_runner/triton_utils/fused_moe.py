@@ -1695,6 +1695,7 @@ def fused_moe_fp8_w8a8(
     bias: Optional[torch.Tensor] = None,
     hidden_states_fp8_input: Optional[torch.Tensor] = None,
     hidden_states_scale_fp8_input: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[float] = None,
 ) -> torch.Tensor:
     """
     This function computes a Mixture of Experts (MoE) layer using two sets of
@@ -1801,11 +1802,19 @@ def fused_moe_fp8_w8a8(
             topk,
             cuda_config1,
         )
-        from lightop.activation import fuse_silu_mul_fp8_quant
+        if swiglu_limit is None:
+            from lightop.activation import fuse_silu_mul_fp8_quant
 
-        fp8_cache2, fp8_cache2_scale = fuse_silu_mul_fp8_quant(
-            intermediate_cache1, fp8type=0
-        )
+            fp8_cache2, fp8_cache2_scale = fuse_silu_mul_fp8_quant(
+                intermediate_cache1, fp8type=0
+            )
+        else:
+            from lightop import fuse_silu_mul_clamp_quant
+
+            fp8_cache2, fp8_cache2_scale = fuse_silu_mul_clamp_quant(
+                intermediate_cache1,
+                float(swiglu_limit),
+            )
 
         intermediate_cache3 = moe_gemm_marlin_w8a8_fp8(
             fp8_cache2,

@@ -552,6 +552,7 @@ class W8A8FP8MoEMethod(FusedMoEMethodBase):
                     bias=bias,
                     hidden_states_fp8_input=i_q if use_prequant_input else None,
                     hidden_states_scale_fp8_input=i_s if use_prequant_input else None,
+                    swiglu_limit=moe_runner_config.swiglu_limit,
                 )
                 return StandardCombineInput(hidden_states=output)
         quant_info = TritonMoeQuantInfo(
