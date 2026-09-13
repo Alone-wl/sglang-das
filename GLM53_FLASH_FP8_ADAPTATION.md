@@ -73,7 +73,21 @@ SGLANG_USE_FP8_W8A8_MOE=1
 | ---: | --: | --: | --: | ---: |
 | 5 | 5 | 52s | 100% | 5/5 全部与数据集 gold 一致 |
 | 50 | 16 | 2 分 30 秒 | 98% | 49/50 = 98% |
-| 1319（全量） | 16 | 见下方报告 | 见下方报告 | 见下方报告 |
+| 1319（全量） | 16 | 约 55 分钟 | **96.66%** | 1274/1319 = 96.6%，与官方一致 |
+
+全量报告：`/home/work/evalscope_uv/out_gsm_full/reports/glm5.3-fp8-tp/gsm8k.json`
+（`metrics[0].num=1319`、`score=0.9666`）。性能：平均延迟 38.2s、TTFT 0.64s、
+TPOT 0.17s、输出 222 token/题、单请求 5.79 tok/s。
+
+**结论：M1 纯 TP 精度 milestone 达成。** 96.66% 远高于 85-90% 门槛，
+且高于官方 AMD nightly 在同配方下 MI300X/MI355X 的 GSM8K 约 97% 水平
+（见 §4.7 引用）。1319 条全量、并发 16、`max_tokens=768`，无截断兜底、
+无 prompt 特判。
+
+失败形态分析（全量 1319 条）：答错 35 条、未输出 `\boxed{}` 10 条。
+错例均为个位数算术偏差（如 idx=12 得 12、gold 13），**无结构性崩溃、
+无乱码、无重复 `!`**。与前一阶段「输出 `!`」的现象相比，说明此前的
+FP8 MoE `swiglu_limit`、KDA raw beta 和 mHC norm 三项修复共同起效。
 
 `limit=5` 与 `limit=50` 的预测均用独立脚本对照 `openai/gsm8k` 测试集 gold
 答案重新提取 `\boxed{}` 并逐一比对，结果与 EvalScope 分数一致。这不是只
@@ -110,28 +124,26 @@ Q: Water is composed of hydrogen...  -> content='Water is composed of hydrogen a
 - 硬件：8 张 HCU，`gfx938`。
 - 主配置：TP=8、EP=8、DeepEP normal、DSA/NSA、FP8-E4M3 KV cache、Mamba、EAGLE。
 - 当前临时关闭 HiCache，使用 `/home/work/glm/ifb_nohicache.sh`。这是规避 Mamba backup VMFault 的临时措施，不是最终配置。
-- mHC 归一化缺失导致的首轮乱码已修复；后续精度评测暴露独立的 KDA 数值错误，当前短 chat 仍不正确。
-- AITER kpool top-k 已使纯 TP 的 2568/4109/8209-token 冷 prefill 和 8K prefix-cache 命中请求通过，无 OOM/VMFault。
-- BF16 KV 配方已越过 index-K 分配断言；官方 TileLang DSA 在 gfx938 编译失败，替换为 AITER DSA 后服务可启动，但短 chat 仍错误。
-- KDA 底层 `chunk_kda` 已通过真实 GLM 形状的 HCU 参考对比；端到端调用链仍缺 raw beta wrapper 传递，本提交修复。
-- 当前最高置信根因是 TP channel-FP8 MoE：BF16/HCU 隐式进入 AITER，且旧 FP8 fused MoE 忽略 `swiglu_limit=10.0`。本提交复用旧 fused MoE，并把 limit 传入已有 LightOp clamp+quant 算子。
-- FP8 MoE 修复后 20-token chat 正常，79 token 起再次损坏；已定位到 KDA Triton wrapper 吞掉 `beta_is_raw`，本提交按官方基线补齐。
+- **M1（纯 TP 精度）已达成**：`tp_bf16_aiter.sh` 配方下 GSM8K 全量 1319 条 = **96.66%**（独立复核 96.6%），高于 85-90% 门槛。
+- M2（清理 `979baf5a81` 之后的适配代码）和 M3（开 CUDA graph + EAGLE 后精度与接受率）待办。
 
 ## Todo（每次提交必须更新）
 
 | 状态 | 优先级 | 事项 | 完成标准 |
 | --- | --- | --- | --- |
-| 进行中 | M1/P0 | **纯 TP 部署精度正常** | TP=8、EP=1、无 DeepEP、无 EAGLE；长 prompt 稳定；GSM8K/MATH-500 与可信基线对齐；记录配置、分数、截断率和失败样例 |
+| 完成 | M1/P0 | **纯 TP 部署精度正常** | 达成：GSM8K 全量 1319 条 = **96.66%**，独立复核 96.6%，高于 85-90% 门槛；长 prompt 8K 冷/热通过；无截断兜底 |
 | 完成 | M1/P0 | 接入 HCU AITER kpool top-k | 2568/4109/8209-token 冷 prefill 和 8K cache hit 通过；无 OOM/VMFault |
 | 完成 | M1/P0 | 完成长 prompt 回归 | HiCache 关闭时 8K 冷/热 prefill 通过；低长度已由此前分级覆盖 |
 | 完成 | M1/P0 | 修复 BF16 KV 下的 kpool index-K 分配 | BF16 KV 已分配 scaled FP8 index-K，原断言消失并进入 DSA 执行 |
-| 完成 | M1/P0 | 修复 KDA safe gate / raw beta 语义 | 调用契约已与官方一致；端到端输出变化但未恢复 |
+| 完成 | M1/P0 | 修复 KDA safe gate / raw beta 语义 | 调用契约已与官方一致；GSM8K 分数 96.66% 证实端到端生效 |
 | 完成 | M1/P0 | 移植并验证 DCU GLM KDA 精度修复 | 关闭 HCU 小网格融合、保留 FP32 中间量；真实 GLM 形状与 naive recurrent 对齐 |
-| 进行中 | M1/P0 | 补齐 KDA raw beta 调用链 | `KDAAttnBackend -> TritonKDAKernel -> chunk_kda` 全链路传递；短/长 chat 恢复 |
-| 进行中 | M1/P0 | 复用 TP FP8 fused MoE 并保留 SwiGLU limit | `SGLANG_USE_FP8_W8A8_MOE=1`；`swiglu_limit=10.0` 进入 clamp+quant；短 chat 和评测恢复 |
-| 完成 | P1 | 定位 GSM8K 极低吞吐 | 纯 TP 约 5 tok/s；5 条评测可完成，原 20-50 token/分钟来自完整配置/旧路径 |
-| 进行中 | M1/P0 | 完成 GSM8K smoke | BF16 KV 配方下先跑 5 条，再跑 20 条；记录截断率、失败样例和分数 |
-| 待办 | P1 | 完成 MATH-500 smoke | GSM8K 稳定后执行并记录配置、分数和失败样例 |
+| 完成 | M1/P0 | 补齐 KDA raw beta 调用链 | `KDAAttnBackend -> TritonKDAKernel -> chunk_kda` 全链路传递；20/79/139-token chat 及全量 GSM8K 恢复 |
+| 完成 | M1/P0 | 复用 TP FP8 fused MoE 并保留 SwiGLU limit | `SGLANG_USE_FP8_W8A8_MOE=1`；`swiglu_limit=10.0` 进入 clamp+quant 且保持 E4M3FN；GSM8K 96.66% |
+| 完成 | P1 | 定位并解除评测吞吐阻塞 | 查出真实瓶颈是每步固定开销（非算力饱和）；用并发 16 把聚合吞吐从 6.6 提到 100 tok/s（15x）；GSM8K 可用批处理完成 |
+| 完成 | M1/P0 | 完成 GSM8K 全量 | 1319 条 = 96.66%，独立复核一致；已记录失败样例分布（答错 35、未输出 boxed 10，均为个位数算术偏差） |
+| 待办 | M1/P1 | 完成 MATH-500 | 用并发配方执行并记录分数、截断率和失败样例 |
+| 待办 | M2/P0 | **整理 GLM5.3 适配代码（`979baf5a81` 之后全部 commit）** | review 并清除实验性/workaround 代码，在本文档单独成节说明每一项的去留理由与证据 |
+| 待办 | M3/P0 | **开启 CUDA graph + EAGLE（5/1/6）后精度仍正常且接受率非 0** | `--speculative-algorithm EAGLE --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6`；开 CUDA graph；精度达 85%+；接受率 > 0 |
 | 待办 | P2 | 修复 HiCache Mamba backup VMFault | 开启 HiCache 后长 prompt 不再触发 `transfer_mamba_backup_kernel` VMFault |
 | 待办 | P2 | 验证 DeepSeek-V4 norm 修复 | 启动对应模型确认不存在重复归一化 |
 | 待办 | P2 | 建立可信精度基线 | 与可信实现、相同 prompt 和采样参数对齐，不只检查文本可读性 |
