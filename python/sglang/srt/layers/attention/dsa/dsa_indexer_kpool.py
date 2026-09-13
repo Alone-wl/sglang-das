@@ -48,6 +48,15 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_device
 
+_aiter_kpool_topk = None
+if _is_hcu and envs.SGLANG_NSA_KPOOL_AITER_TOPK.get():
+    try:
+        import aiter
+
+        _aiter_kpool_topk = aiter.kpool_topk
+    except (ImportError, AttributeError):
+        pass
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
@@ -645,6 +654,7 @@ class IndexerKPool(MultiPlatformOp):
         row_starts: Optional[torch.Tensor] = None,
         out_rows: Optional[int] = None,
         page_table_row_index: Optional[torch.Tensor] = None,
+        allow_aiter_topk: bool = False,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             topk_from_pooled_history_logits,
@@ -661,6 +671,47 @@ class IndexerKPool(MultiPlatformOp):
             topk_offsets = topk_offsets[:n_rows]
         if page_table_row_index is not None and page_table_row_index.shape[0] != n_rows:
             page_table_row_index = page_table_row_index[:n_rows]
+
+        if (
+            allow_aiter_topk
+            and _aiter_kpool_topk is not None
+            and self.index_kpool in (4, 16)
+            and self.index_topk == 2048
+            and seq_lens is not None
+        ):
+
+            def as_i32(tensor: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+                if tensor is None:
+                    return None
+                return tensor.to(dtype=torch.int32).contiguous()
+
+            topk_indices = _aiter_kpool_topk(
+                score=logits,
+                lengths=as_i32(pool_lens),
+                pool_size=self.index_kpool,
+                topk=self.index_topk,
+                page_table=page_table,
+                topk_indices_offset=as_i32(topk_offsets),
+                row_starts=as_i32(row_starts),
+                seq_lens=as_i32(seq_lens),
+                page_table_row_index=as_i32(page_table_row_index),
+            )
+            if out_rows is None or topk_indices.shape[0] == out_rows:
+                return topk_indices
+
+            assert topk_indices.shape[0] < out_rows
+            return torch.cat(
+                (
+                    topk_indices,
+                    torch.full(
+                        (out_rows - topk_indices.shape[0], topk_indices.shape[1]),
+                        -1,
+                        dtype=topk_indices.dtype,
+                        device=topk_indices.device,
+                    ),
+                ),
+                dim=0,
+            )
 
         return topk_from_pooled_history_logits(
             logits=logits,
@@ -880,6 +931,7 @@ class IndexerKPool(MultiPlatformOp):
             seq_lens=seqlens_32,
             page_table=page_table_1,
             topk_offsets=topk_offsets,
+            allow_aiter_topk=True,
             out_rows=num_q_padded if num_q_padded != n_real else None,
         )
         return topk_result
@@ -992,6 +1044,7 @@ class IndexerKPool(MultiPlatformOp):
             row_starts=ks_per_q,
             out_rows=total_q,
             page_table_row_index=page_table_row_index_all,
+            allow_aiter_topk=True,
         )
 
     def _get_topk_ragged_kpool(
@@ -1244,6 +1297,7 @@ class IndexerKPool(MultiPlatformOp):
                 seq_lens=local_seqlens,
                 page_table=page_table_local,
                 topk_offsets=topk_offsets_local,
+                allow_aiter_topk=True,
             )
 
             topk_result[q_slice] = local_topk

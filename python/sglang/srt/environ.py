@@ -935,6 +935,7 @@ class Envs:
     SGLANG_LIGHTOP_TOPK = EnvBool(False)
     SGLANG_OPT_SWA_EVICT_DROP_PAGE_MARGIN = EnvBool(False)
     SGLANG_HCU_MEGA_MOE_RUNTIME = EnvStr("deep_gemm")
+    SGLANG_NSA_KPOOL_AITER_TOPK = EnvBool(False)
 
     # ===================================================================
     # MUSA

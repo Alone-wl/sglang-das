@@ -34,7 +34,7 @@
 - 主配置：TP=8、EP=8、DeepEP normal、DSA/NSA、FP8-E4M3 KV cache、Mamba、EAGLE。
 - 当前临时关闭 HiCache，使用 `/home/work/glm/ifb_nohicache.sh`。这是规避 Mamba backup VMFault 的临时措施，不是最终配置。
 - 短 prompt 已能生成连贯文本；短输出乱码的根因已修复。
-- 约 2561-token prefill 的 `kpool_topk_transform` 缺失已在本地补齐 Torch fallback，等待 HCU 验证。
+- Torch fallback 已使纯 TP 冷 prefill 通过 2566/4107 token，但约 8200 token 因复制宽 page table 申请 32.06 GiB 而 OOM；本地已接入现有 AITER top-k，等待 HCU 端到端复测。
 - 当前评测阻塞：GSM8K 单请求解码过慢并触发 EvalScope 超时；没有得到有效评分，不能据此判断模型精度。
 
 ## Todo（每次提交必须更新）
@@ -42,7 +42,7 @@
 | 状态 | 优先级 | 事项 | 完成标准 |
 | --- | --- | --- | --- |
 | 进行中 | M1/P0 | **纯 TP 部署精度正常** | TP=8、EP=1、无 DeepEP、无 EAGLE；长 prompt 稳定；GSM8K/MATH-500 与可信基线对齐；记录配置、分数、截断率和失败样例 |
-| 本地完成，待 HCU 验证 | M1/P0 | 修复 HCU `kpool_topk_transform` 缺失 | 冷/热 prefill 均通过 2561、4096、8192 token；索引语义与参考实现一致；无 VMFault |
+| 进行中 | M1/P0 | 接入 HCU AITER kpool top-k | 冷/热 prefill 均通过 2561、4096、8192 token；索引语义与参考实现一致；无 OOM/VMFault |
 | 待办 | P0 | 完成长 prompt 回归 | HiCache 关闭时按 11、81、641、1281、2561、4096、8192 token 分级验证并记录日志 |
 | 待办 | P1 | 定位 GSM8K 极低吞吐 | 分别测 target-only/完整配置的 TTFT、decode tok/s、EAGLE 接受率，明确瓶颈 |
 | 待办 | P1 | 完成 GSM8K smoke | 使用合理输出上限和超时先跑 5 条，再跑 20 条；记录截断率、失败样例和分数 |
@@ -248,6 +248,27 @@ HiCache 关闭且修复 ragged MQA logits 后：
 
 641-token 记录中出现 `#cached-token: 640`，说明至少部分测试走了 prefix cache。修复后必须补充清空缓存的冷 prefill。
 
+#### 4.6 Torch fallback 的 8K OOM：已定位，AITER 修复待验证
+
+提交 `a5f5c1f0dc` 部署后，纯 TP、无 EAGLE、无 DeepEP、无 HiCache 的冷 prefill 结果：
+
+| Prompt token | 缓存 | 结果 |
+| ---: | ---: | --- |
+| 16、86、646、1286、2566、4107 | 0 | HTTP 200；无 VMFault |
+| 约 8200 | 0 | 所有 rank OOM，进程退出 137 |
+
+OOM 位于 `_torch_topk_pooled_history` 的：
+
+```python
+page_table.index_select(0, page_table_row_index)
+```
+
+page table 宽度为 1M；约 8K 个 query 行会先复制成约 `8K x 1M x int32`，单 rank 申请 32.06 GiB。该实现语义正确，但不能用于长上下文。
+
+容器中的 `aiter.kpool_topk` 和 LightOp `fast_kpool_topk_transform_fused` 均存在。独立 HCU 测试确认 AITER 支持 `row_starts`、`page_table_row_index`、`seq_lens` 和 tail；有效 group 数超过 128 时，其最终 token 集合与 Torch fallback 完全一致。AITER 会整理输出顺序，因此不能按 Torch `topk` 的分数顺序逐项比较。
+
+本地已按 `sglang-model` 接入 `aiter.kpool_topk`：由 `SGLANG_NSA_KPOOL_AITER_TOPK=1` 控制，仅在 `index_kpool` 为 4/16、`index_topk=2048` 且存在 `seq_lens` 时启用；算子缺失时保留 Torch fallback。待重新提交并执行 8K 冷/热 prefill。
+
 ### 5. EvalScope：没有崩溃，实际是超时
 
 GSM8K smoke 配置为 20 条、batch size 1、`max_tokens=2048`。运行 49 分钟仍为 0/20，EvalScope 多次报告请求超时，prediction 目录为空。
@@ -296,7 +317,7 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 
 ## 未解决问题
 
-1. **P0：HCU `kpool_topk_transform` fallback 待验证。** 本地实现和 CPU 语义测试已完成；约 2561 token 的 HCU 冷/热 prefill 尚未复测。
+1. **P0：AITER kpool top-k 待端到端验证。** Torch fallback 已通过 2566/4107-token 冷 prefill，但 8K 因 page-table 完整复制 OOM；AITER 独立算子测试通过。
 2. **P1：解码吞吐异常低。** GSM8K 请求约 20-50 token/分钟，EvalScope 超时且未生成 prediction。
 3. **P2：HiCache Mamba backup VMFault。** 当前仅通过关闭 HiCache 规避。
 4. **P2：长生成仍有残余质量问题。** 20 条文本 sanity 仅 15/20，缺少失败样例分类和可信基线。
