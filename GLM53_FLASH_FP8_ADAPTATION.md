@@ -27,8 +27,8 @@
 ## 当前状态
 
 - 本地分支：`glm5.3-flash`；推送目标：`wl/glm5.3-flash`。
-- 当前本地基线：`fe54e1f611`；本提交修正 SwiGLU limit 后的激活量化 dtype。
-- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`fe54e1f611`。
+- 当前本地基线：`1eaf649dc7`；本提交补齐 KDA Triton wrapper 的 raw beta 传递。
+- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`1eaf649dc7`。
 - 模型：`/home/work/GLM-5.3-Flash-Channel-FP8-w8a8`。
 - 硬件：8 张 HCU，`gfx938`。
 - 主配置：TP=8、EP=8、DeepEP normal、DSA/NSA、FP8-E4M3 KV cache、Mamba、EAGLE。
@@ -36,8 +36,9 @@
 - mHC 归一化缺失导致的首轮乱码已修复；后续精度评测暴露独立的 KDA 数值错误，当前短 chat 仍不正确。
 - AITER kpool top-k 已使纯 TP 的 2568/4109/8209-token 冷 prefill 和 8K prefix-cache 命中请求通过，无 OOM/VMFault。
 - BF16 KV 配方已越过 index-K 分配断言；官方 TileLang DSA 在 gfx938 编译失败，替换为 AITER DSA 后服务可启动，但短 chat 仍错误。
-- KDA 已通过真实 GLM 形状的 HCU 参考对比，不再是当前排查方向。
+- KDA 底层 `chunk_kda` 已通过真实 GLM 形状的 HCU 参考对比；端到端调用链仍缺 raw beta wrapper 传递，本提交修复。
 - 当前最高置信根因是 TP channel-FP8 MoE：BF16/HCU 隐式进入 AITER，且旧 FP8 fused MoE 忽略 `swiglu_limit=10.0`。本提交复用旧 fused MoE，并把 limit 传入已有 LightOp clamp+quant 算子。
+- FP8 MoE 修复后 20-token chat 正常，79 token 起再次损坏；已定位到 KDA Triton wrapper 吞掉 `beta_is_raw`，本提交按官方基线补齐。
 
 ## Todo（每次提交必须更新）
 
@@ -49,6 +50,7 @@
 | 完成 | M1/P0 | 修复 BF16 KV 下的 kpool index-K 分配 | BF16 KV 已分配 scaled FP8 index-K，原断言消失并进入 DSA 执行 |
 | 完成 | M1/P0 | 修复 KDA safe gate / raw beta 语义 | 调用契约已与官方一致；端到端输出变化但未恢复 |
 | 完成 | M1/P0 | 移植并验证 DCU GLM KDA 精度修复 | 关闭 HCU 小网格融合、保留 FP32 中间量；真实 GLM 形状与 naive recurrent 对齐 |
+| 进行中 | M1/P0 | 补齐 KDA raw beta 调用链 | `KDAAttnBackend -> TritonKDAKernel -> chunk_kda` 全链路传递；短/长 chat 恢复 |
 | 进行中 | M1/P0 | 复用 TP FP8 fused MoE 并保留 SwiGLU limit | `SGLANG_USE_FP8_W8A8_MOE=1`；`swiglu_limit=10.0` 进入 clamp+quant；短 chat 和评测恢复 |
 | 完成 | P1 | 定位 GSM8K 极低吞吐 | 纯 TP 约 5 tok/s；5 条评测可完成，原 20-50 token/分钟来自完整配置/旧路径 |
 | 进行中 | M1/P0 | 完成 GSM8K smoke | BF16 KV 配方下先跑 5 条，再跑 20 条；记录截断率、失败样例和分数 |
@@ -104,7 +106,8 @@
 | `009b187323` | 移植 DCU `30a5b3e3704` 的 GLM KDA 精度修复 | KDA 回归测试通过；真实 GLM 形状与 naive recurrent 相对误差低于 0.0038；端到端短 chat 仍错误 |
 | `3cfabe3094` | TP 旧 FP8 fused MoE 补齐 GLM SwiGLU limit | HCU warmup 进入该路径；首次实现误用了 INT8 clamp+quant，已在后续提交修正 |
 | `fe54e1f611` | FP8 fused MoE align 调用适配当前 LightOp | TP8 服务越过 warmup 并就绪；短 probe 仍乱码，随后定位到激活量化 dtype 错误 |
-| 本提交 | SwiGLU clamp 后保持 FP8 per-token 量化 | 本地静态检查；HCU 端到端待验证 |
+| `1eaf649dc7` | SwiGLU clamp 后保持 FP8 per-token 量化 | 20-token chat 恢复；79/139/259/506/1287/7K/10K token 仍逐步退化或输出 `!` |
+| 本提交 | KDA Triton wrapper 继续传递 raw beta | 本地静态检查；HCU 端到端待验证 |
 
 ## 调试记录
 
@@ -372,6 +375,14 @@ fuse_silu_mul_fp8_quant   -> torch.float8_e4m3fn, max=448
 
 前者服务于 W4A8/INT8 激活链路，不能喂给 `moe_gemm_marlin_w8a8_fp8`；将 INT8 字节按 FP8 解释会直接破坏幅值。当前 LightOp 没有 clamp+SiLU+FP8-quant 一体接口，因此按官方通用 MoE 的已有做法，先对 GEMM1 BF16 输出的 gate/up 两半原地限幅，再调用既有 `fuse_silu_mul_fp8_quant`。这只增加 clamp，不新增算子，并保持 GEMM2 输入为 E4M3FN。
 
+修正 dtype 后，20-token chat 已能正确生成 `Paris`，但 79 token 开始出现重复片段，139 token 以上稳定输出 `!`；1.3K/3.3K/7.1K/10K 均复现。marlin GEMM2 配置 A/B 证伪了错误配置猜测：79-token 使用的 `MODE=56` 对 Torch 参考相对误差约 `0.026`，强制换成短请求的 `MODE=57` 反而约为 `1.01`。
+
+### 4.11 KDA Triton wrapper 吞掉 raw beta
+
+长度分级将剩余错误定位到 KDA 状态累计。`KDAAttnBackend.forward_extend()` 根据 gate 布局传入 `beta_is_raw=gate_was_flat`，底层 `chunk_kda()` 也已在 `aa8cc413ba` 支持 raw beta sigmoid，但中间的 `TritonKDAKernel.extend()` 未声明该参数，导致它被 `**kwargs` 静默吞掉。
+
+官方基线提交 `c66a285c94` 明确补齐了 wrapper 的形参和向下传递。本次照搬这两行契约修复，不修改 KDA 算子。此前 KDA 单算子通过只能证明传入正确 beta 后数值正常，不能覆盖这个服务调用链缺口。
+
 ### 5. EvalScope：旧超时已解除，当前是确定性重复
 
 GSM8K smoke 配置为 20 条、batch size 1、`max_tokens=2048`。运行 49 分钟仍为 0/20，EvalScope 多次报告请求超时，prediction 目录为空。
@@ -424,8 +435,8 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 
 ## 未解决问题
 
-1. **P0：TP FP8 fused MoE + SwiGLU limit 待端到端验证。** 需启用 `SGLANG_USE_FP8_W8A8_MOE=1`，确认服务实际进入 marlin FP8 MoE 和 clamp+quant 分支。
-2. **P0：纯 TP 精度错误。** FP8 KV 下 GSM8K 5 条均输出 256 个 `!`；BF16 KV + AITER DSA 下输出模式改变但仍错误。KDA 和 DSA 单算子已排除。
+1. **P0：KDA raw beta wrapper 修复待端到端验证。** FP8 MoE 修复后 20 token 正常，但 79 token 起状态累计仍异常；官方缺失调用契约已补齐。
+2. **P0：纯 TP 精度错误。** 旧配方 GSM8K 5 条均输出 256 个 `!`；当前配方尚未完成 wrapper 修复后的长 chat 和评测验证。
 3. **P2：HiCache Mamba backup VMFault。** 当前仅通过关闭 HiCache 规避。
 4. **P2：长生成仍有残余质量问题。** 20 条文本 sanity 仅 15/20，缺少失败样例分类和可信基线。
 5. **P2：DeepSeek-V4 norm 修复未验证。** `de651cb5e6` 可能影响该模型，需独立回归。
@@ -433,9 +444,9 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 
 ## 下一位开发者的执行顺序
 
-1. 部署 TP FP8 fused MoE limit 修复，以 `SGLANG_USE_FP8_W8A8_MOE=1` 启动 BF16 KV + AITER DSA 服务，先跑短 chat。
-2. 短 chat 正确后跑 8K 冷/热，再运行 GSM8K 5/20 条和 MATH-500；记录分数、stop rate、截断率和失败样例。
-3. 若仍错误，先确认 marlin packed channel-FP8 expert 的解量化幅值和 GEMM 输出；不回到已通过参考对比的 KDA、DSA、mHC 路径。
+1. 部署 KDA wrapper 修复，以 `SGLANG_USE_FP8_W8A8_MOE=1` 启动 BF16 KV + AITER DSA 服务，复跑 20/79/139-token chat。
+2. 分级 chat 正确后跑 8K 冷/热，再运行 GSM8K 5/20 条和 MATH-500；记录分数、stop rate、截断率和失败样例。
+3. 若仍错误，继续核对官方 KDA wrapper 和服务实际张量契约；MoE GEMM 配置 A/B 已证伪，不按输出猜测硬改配置。
 4. TileLang DSA 的 gfx938 编译问题独立登记；首个 TP 精度 milestone 暂用 AITER DSA。
 5. 每次提交同步更新 Todo、调试记录、验证和未解决问题。
 
