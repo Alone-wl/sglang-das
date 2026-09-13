@@ -312,22 +312,166 @@ Operational notes:
   is gone, ask the user to `ssh nmz26` once from their terminal to
   rebuild it.
 
+## 2026-09-13: root cause found and fixed
+
+### Step 1 — EP/DeepEP ruled out (pure-TP regression)
+
+Per the operating constraint that the parallel scheme should first be
+regressed to plain TP, the launcher was copied with the expert-parallel
+path removed to `/home/work/glm/target_tponly.sh`:
+
+```
+--tp-size 8 --ep-size 1 --moe-a2a-backend none   # (no deepep, no ep_config.json)
+```
+
+Post-`/dev/shm`-cleanup, this server reached "fired up" and produced the
+**same deterministic garble** as the TP8/EP8 launcher:
+
+```
+'The quick brown fox jumps over the lazy' -> ' bes Pick keisheti=httpsgest禹禹 ） hey heir喜好 ） in组成'
+'1 + 1 = 2. 2 + 2 ='                     -> 'igoeta份流出egg (?)genofnfionialist̶|\nchas游人qs'
+'Once upon a time in a'                  -> '1igogenres bekv者 hug申nanNd阁 solvevantm弱势olini'
+```
+
+So the defect is in the per-rank tensor path, independent of EP, DeepEP,
+the MoE dispatch, and EAGLE. This retired the whole DeepEP-dispatch branch
+of the suspect list.
+
+### Step 2 — root cause: every `input_layernorm` / `post_attention_layernorm` was skipped
+
+The earlier hidden-state probe conclusion ("plausible magnitude, wrong
+direction, cosine ~0.088 against the lm_head basis") pointed at the mHC
+residual-stream accumulation. That is what it was.
+
+Reproduced directly on the HCU host, using the real GLM-5.3-Flash mHC
+shape (`hc_mult=4`, `hidden_size=4096`) and calling the top-level `hc_pre`
+exactly as the model does (`out_norm_weight` supplied):
+
+```
+hc_pre(out_norm_weight=w) ->  norm_fused=True
+  max|layer_input - reference_rmsnorm|        = 2.1094e+00   # S=8
+  max|layer_input - reference_un-normalized|  = 3.9062e-03
+```
+
+`layer_input` was bit-for-bit the **un-normalized** mixing result while the
+function reported `norm_fused=True`. Mechanism:
+
+1. `/home/work/glm/ifb.sh` exports `SGLANG_ROCM_USE_AITER_TILELANG_MHC=1`, so
+   `mhc_pre()` in `python/sglang/kernels/ops/layernorm/mhc.py` took the
+   `_is_hcu and _use_aiter_tilelang_mhc` branch and called AITER's
+   `pre_big_fuse_tilelang`.
+2. That kernel's signature (dumped on the host) has **no `norm_weight` /
+   `norm_eps` parameter at all** — the norm-fusing variant is a different
+   kernel, `mhc_pre_big_fuse_with_norm_tilelang`.
+3. `_mhc_pre_dispatch()` nonetheless returned
+   `norm_weight is not None` as `norm_fused`.
+4. `hc_pre()` forwards that flag to `MHCState.attn_split()` /
+   `attn_to_mlp()`, which guard the explicit norm with
+   `if out_norm is not None and not norm_fused`. `norm_fused=True` therefore
+   suppressed `input_layernorm` and `post_attention_layernorm` in **all 45
+   layers**, leaving the entire residual stream unnormalized.
+
+The DCU reference at `/Users/wanglong/Code/sglang-model` already guarded
+both halves of this; the HCU fork had dropped the guard. The reference's
+`sglang/srt/models/deepseek_v4.py` even carried a call-site workaround
+(`norm_fused = norm is not None and not (_is_dcu and _use_aiter_tilelang_mhc)`)
+for the same defect.
+
+### Step 3 — fix
+
+Commit `7d6c10fea3`:
+
+- `mhc_pre()`: only take the AITER HCU branch when `norm_weight is None`.
+  With a norm weight present the existing with-norm tilelang kernel runs.
+- `_mhc_pre_dispatch()`: `norm_fused` mirrors whether a norm weight was
+  supplied, now that the branch selection actually honours it.
+- `_mhc_post_dispatch()`: restore the baseline's
+  `SGLANG_OPT_USE_TILELANG_MHC_POST` opt-out, which the fork had dropped.
+
+Commit `de651cb5e6`: drop the now-redundant `deepseek_v4.py` call-site
+workaround, which would otherwise double-normalize DeepSeek-V4 on HCU.
+
+Because that DeepSeek-V4 change is *not* exercised by a GLM launch, it is
+flagged as unverified in the known-issues list below.
+
+### Step 4 — validation
+
+| Check | Before | After |
+| --- | --- | --- |
+| Unit repro, S=8/64/512, `max\|li - ref_NORM\|` | 2.11 / 2.62 / 3.13 | 1.56e-2 / 3.13e-2 / 3.13e-2 |
+| `norm_fused` returned without a norm weight | False | False (unchanged) |
+| Greedy text, pure TP | deterministic garble | coherent |
+| Greedy text, TP8/EP8 + DeepEP + FP8 KV | deterministic garble | coherent |
+| Greedy text, full config + EAGLE | deterministic garble | coherent |
+| EAGLE `spec_accept_rate` | 0.0 | 0.176 / 0.194 |
+| EAGLE `spec_accept_length` | ~1.0 | 1.88 / 2.00 |
+
+Representative before/after on identical prompts:
+
+```
+'The capital of France is'
+  before: 'mosself [ eitherNAS4~\n\nuur†/brrardia;Relationicles'
+  after : ' Paris. The official language is French.\n\nCurrency: Euro (€)\n\nTime Zone'
+
+'Once upon a time in a'
+  before: ' secondary âanolick inquire goose珍aniwargsSubsetikhbih'
+  after : " late 70's, a young man named John was walking down the street."
+```
+
+A 20-prompt sanity screen (ASCII-plausible, no repeated-token loop, no CJK
+bleed on English prompts) scores 15/20 after the fix.
+
 ## Known unresolved issues
 
-1. Greedy target output is deterministically incoherent on simple
-   prompts. The list of possible root causes has narrowed but no
-   candidate has been confirmed. Highest-yield next probes: dump
-   `w13_weight_deepgemm.dequantize()` for one expert and compare
-   against the raw channel-FP8 weight; then dump the FP8 KV buffer
-   after the first write, cast back to bf16, and compare against
-   `(cache_k_nope || cache_k_rope).to(bf16)`.
-2. `--kv-cache-dtype bfloat16` cannot currently launch: the DSA
-   indexer asserts `use_scaled_index_k_cache` unconditionally.
-3. The first request after model load can spend several minutes in
-   lazy compilation. This must not be mistaken for a scheduler
-   deadlock; subsequent requests are fast.
-4. Accuracy has not yet been validated against a trusted reference
-   response or evaluation set.
-5. The supplied `/home/work/glm/ifb.sh` warmup path has not yet
-   completed in this session; the inherited server used
-   `--skip-server-warmup`.
+1. **Residual accuracy defect — long greedy generations still degrade.**
+   With the norm bug fixed, short generations are correct, but several
+   prompts still fall into repetition or derail past roughly 30-60 tokens:
+
+   ```
+   '2+2='                    -> '2+2=4\n\n2+2=4\n\n2+2=4\n\n2+2=4\n\n...'      (loop, but the first token is right)
+   '1+1='                    -> '+1+1+1+1+1+1+1+1+1+1+1+1'
+   'What is 2+2?'            -> ' 演 2 的 4 次方，即 16。...'                        (wrong + CJK bleed)
+   'Machine learning is a'   -> ' hot topic these days. 机器学习是当今的热门话题。...'
+   'The largest planet is'   -> ' Neptune, 4,498,396,441 km from the sun.'
+   ```
+
+   This is now a *different* and much narrower failure than the original
+   one, and the correct answer is frequently the **first** emitted token
+   (e.g. `2+2=` -> `4`), so a large part of the residual error sits
+   downstream of the first decode step. `/v1/chat/completions` delegates to
+   the same engine and shows the same symptom, so it is not a chat-template
+   or detokenizer artifact.
+
+   Ruled out for this residual: EP/DeepEP (see Step 1), EAGLE (present
+   target-only), and the mHC norm (see Step 3). Not yet ruled out: the
+   `attn_to_mlp` zero-pad workaround
+   (`communicator_mhc.py:94`, which pads `hidden_states` up to
+   `residual.shape[0]` with zeros rather than explaining the mismatch), the
+   KDA `forward_target_verify` zero-pad, the `kv_cache_scheme: null` vs
+   forced `--kv-cache-dtype fp8_e4m3` mismatch, and the
+   `--nsa-decode-backend flashmla_kv` -> `aiter` remap.
+2. **The `deepseek_v4.py` half of the fix is unverified.** It only affects
+   DeepSeek-V4 mHC on HCU and no DeepSeek-V4 launch was run. Confirm on a
+   DeepSeek-V4 start that `input_layernorm` is applied exactly once.
+3. `--kv-cache-dtype bfloat16` still cannot launch: the DSA indexer asserts
+   `use_scaled_index_k_cache` unconditionally.
+4. The first request after model load can spend several minutes in lazy
+   compilation. This must not be mistaken for a scheduler deadlock.
+5. Accuracy has not yet been validated against a trusted reference response
+   or an evaluation set. A scored eval (e.g. GSM8K or an OpenCompass run on
+   the container) is the right next gate now that generation is coherent.
+6. The supplied `/home/work/glm/ifb.sh` warmup path has not yet completed in
+   this session; all validation used `--skip-server-warmup` launchers.
+
+## Operating notes (additions)
+
+- The container checkout needed `git reset --hard FETCH_HEAD` after
+  `git fetch wl 'refs/heads/wl/glm5.3-flash'`; a plain `git fetch wl` on this
+  remote maps the branch to `wl/wl/glm5.3-flash` and leaves the local branch
+  behind. Verify with `git log --oneline -1` after pulling.
+- Validate `mhc_pre` changes with a standalone on-HCU script that stubs
+  `get_tp_group` / `is_allocation_symmetric` / `use_symmetric_memory` and
+  sets `SGLANG_ROCM_USE_AITER_TILELANG_MHC=1` *before* importing sglang, so
+  the real branch selection is exercised without launching a server.
+- The mHC unit repro is cheap (seconds) compared to a server launch
+  (~8 minutes). Prefer it for any further mHC/kernel work.
