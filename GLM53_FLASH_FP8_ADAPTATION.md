@@ -23,6 +23,83 @@
 - SSH 登录失败后立即停止并交给用户处理，禁止重试。ProxyJump 使用 2FA，连续失败可能触发封禁。
 - 先运行原始 `ifb.sh`；成功后用 `uv` 创建虚拟环境、安装 EvalScope，并运行 GSM8K 和 MATH-500。流程异常时停止并报告，不私自更换流程。
 - 长 prompt 崩溃先关闭 HiCache 验证。关闭后仍失败则继续修复；若消失，记录 HiCache 问题并在关闭状态下继续。
+- 精度门槛：数据集得分在 85-90% 之间即认为精度正常，可推进到后续 milestone。
+- 禁止无脑等待。发请求前必须能区分「处理慢」与「真 hang」：优先用流式读取并设置硬性 wall-clock 预算，一旦超出预算就报告状态而不是继续等到超时。单个实验的 timeout 不得设成小时级。
+
+## 性能基准：批处理是当前唯一必要条件（2026-09-13）
+
+在 `tp_bf16_aiter.sh`（TP=8、EP=1、无 DeepEP、BF16 KV、AITER DSA、
+**关闭 CUDA graph**、无 EAGLE）上，用流式请求实测并发扩展性。同一状态
+重测两轮（`max_tokens` 64 与 128），形状一致：
+
+| 并发 | wall | 生成 token | 聚合 tok/s | 单请求 tok/s |
+| --: | --: | --: | --: | --: |
+| 1 | 19.2s | 127 | 6.62 | 6.62 |
+| 2 | 19.6s | 254 | 12.97 | 6.49 |
+| 4 | 19.7s | 502 | 25.53 | 6.38 |
+| 8 | 19.8s | 1002 | 50.69 | 6.34 |
+| 12 | 20.6s | 1508 | 73.37 | 6.11 |
+| 16 | 20.1s | 2016 | 100.38 | 6.27 |
+
+结论：
+
+1. **聚合吞吐随并发线性增长**，到 `--max-running-requests=16` 仍未饱和；
+   并发 16 相对串行是 **~15x**。
+2. **单请求延迟几乎不随批次变化**（持续 ~6.3 tok/s），说明 bs=1 时约 6s/step
+   的耗时主要来自固定的每步开销（launch、dispatch、集合通信延迟），而不是
+   算力饱和。
+3. 因此 **先说不用做 profiling**：批处理本身就能把验证速度提上来，零代码
+   改动、零精度风险。热点算子调优是另一条独立优化路径，不得与「先拿到精度
+   数字」混为一谈。
+
+因此评测必须以并发方式运行，不能再用 `--eval-batch-size 1`。此前文档中
+「20-50 token/分钟」的旧数字来自完整配置和其他路径，纯 TP 串行实际约
+6.3 tok/s。
+
+## Milestone 1 结果：纯 TP 精度
+
+配置（`tp_bf16_aiter.sh`，服务已包含至 `44e500b0f3` 的全部修复）：
+
+```text
+--tp-size 8 --ep-size 1 --moe-a2a-backend none --moe-runner-backend triton
+--kv-cache-dtype bfloat16 --disable-cuda-graph --disable-piecewise-cuda-graph
+（无 EAGLE、无 DeepEP、无 HiCache）
+SGLANG_USE_FP8_W8A8_MOE=1
+```
+
+### GSM8K
+
+| 规模 | 并发 | 耗时 | EvalScope 分数 | 独立复核 |
+| ---: | --: | --: | --: | ---: |
+| 5 | 5 | 52s | 100% | 5/5 全部与数据集 gold 一致 |
+| 50 | 16 | 2 分 30 秒 | 98% | 49/50 = 98% |
+| 1319（全量） | 16 | 见下方报告 | 见下方报告 | 见下方报告 |
+
+`limit=5` 与 `limit=50` 的预测均用独立脚本对照 `openai/gsm8k` 测试集 gold
+答案重新提取 `\boxed{}` 并逐一比对，结果与 EvalScope 分数一致。这不是只
+看文本是否通顺，也不是依赖 scorer 的单一结论。
+
+50 条中的唯一错误是真实算术失误（idx=12，得 12、gold 13），不是结构性
+错误。partial（540 条）误答 7 条，同样为个位数算术偏差，无空答案、无
+乱码、无 `!` 重复。
+
+### 关键发现：此前「短 chat 错误」的测量口径有误
+
+`tp_bf16_aiter.sh` 设置了 `--reasoning-parser glm45`。GLM-5.3-Flash 是
+**推理模型**，服务会把思考过程放进 `reasoning_content`，而把最终答案放进
+`content`。此前用 `max_tokens=64` 发请求时，64 个 token 会被思考过程全部
+占用，`content` 返回空字符串——这被误读为「输出错误/空输出」。
+
+放宽 `max_tokens` 后同一批 prompt 的输出完全正确：
+
+```text
+Q: What is the capital of France?    -> content='The capital of France is **Paris**.'
+Q: 2+2=?                             -> content='**4**'
+Q: Water is composed of hydrogen...  -> content='Water is composed of hydrogen and **oxygen**. Its chemical formula is H₂O...'
+```
+
+教训：对推理模型做精度判断必须看 `content`，且 `max_tokens` 必须留足
+思考预算。评测 `max_tokens` 低于 512 会大面积截断，产生假的「低分」。
 
 ## 当前状态
 
