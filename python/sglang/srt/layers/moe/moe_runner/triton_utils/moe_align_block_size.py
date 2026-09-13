@@ -400,8 +400,13 @@ def hcu_moe_align_block_size(
         max_num_tokens_padded = topk_ids.numel() + num_experts * (block_size - 1)
         if pad_sorted_ids:
             max_num_tokens_padded = round_up(max_num_tokens_padded, block_size)
-        sorted_ids = torch.empty(
-            (max_num_tokens_padded,), dtype=torch.int32, device=topk_ids.device
+        # LightOp does not guarantee that unused padding slots are written.
+        # The fused GEMM masks this sentinel token id.
+        sorted_ids = torch.full(
+            (max_num_tokens_padded,),
+            fill_value=topk_ids.numel(),
+            dtype=torch.int32,
+            device=topk_ids.device,
         )
     max_num_m_blocks = triton.cdiv(max_num_tokens_padded, block_size)
     if expert_map is not None:
@@ -415,7 +420,7 @@ def hcu_moe_align_block_size(
     num_tokens_post_pad = torch.empty((1), dtype=torch.int32, device=topk_ids.device)
 
     if expert_mask is not None:
-        op.moe_align_block_size_out(
+        op.moe_align_block_size(
             topk_ids,
             num_experts,
             block_size,
@@ -425,11 +430,11 @@ def hcu_moe_align_block_size(
             expert_map=expert_map,
             expert_mask=expert_mask,
             num_local_tokens=None,
-            is_ep=False,
-            is_fuse_fill=True,
+            Is_EP=False,
+            Is_fuse_fill=True,
         )
     else:
-        op.moe_align_block_size_out(
+        op.moe_align_block_size(
             topk_ids,
             num_experts,
             block_size,
@@ -439,8 +444,8 @@ def hcu_moe_align_block_size(
             expert_map=None,
             expert_mask=None,
             num_local_tokens=None,
-            is_ep=False,
-            is_fuse_fill=True,
+            Is_EP=False,
+            Is_fuse_fill=True,
         )
         if expert_map is not None:
             expert_ids = expert_map[expert_ids]
