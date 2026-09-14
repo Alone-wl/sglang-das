@@ -10,6 +10,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage.mmap import alloc_mmap
 from sglang.srt.runtime_context import get_memory
+from sglang.srt.utils import is_hcu
 
 logger = logging.getLogger(__name__)
 
@@ -156,7 +157,7 @@ def _cuda_host_register(
         while offset < total:
             size = min(chunk_bytes, total - offset)
             ptr = base + offset
-            rc = int(cudart.cudaHostRegister(ptr, size, 0))
+            rc = int(cudart.cudaHostRegister(ptr, size, 2 if is_hcu() else 0))
             if rc != 0:
                 raise RuntimeError(
                     f"cudaHostRegister failed (rc={rc}, "
@@ -257,3 +258,43 @@ ALLOC_MEMORY_FUNCS = defaultdict(
         "musa": alloc_with_pin_memory,
     },
 )
+
+_HIP_RT = None
+
+
+def _hip_host_get_device_pointer(host_ptr: int) -> int:
+    import ctypes
+
+    global _HIP_RT
+    if _HIP_RT is None:
+        last_err = None
+        for lib in ("libamdhip64.so", "libamdhip64.so.6", "libamdhip64.so.5"):
+            try:
+                _HIP_RT = ctypes.CDLL(lib)
+                break
+            except OSError as e:  # noqa: PERF203
+                last_err = e
+        if _HIP_RT is None:
+            raise RuntimeError(
+                f"Failed to load the HIP runtime for hipHostGetDevicePointer: {last_err}"
+            )
+
+    dev_ptr = ctypes.c_void_p()
+    # hipError_t hipHostGetDevicePointer(void** devPtr, void* hstPtr, unsigned int flags)
+    err = _HIP_RT.hipHostGetDevicePointer(
+        ctypes.byref(dev_ptr), ctypes.c_void_p(host_ptr), ctypes.c_uint(0)
+    )
+    if err != 0:
+        raise RuntimeError(
+            f"hipHostGetDevicePointer failed (hipError={err}) while building the "
+            f"kernel hicache device-pointer table; the host buffer must be "
+            f"registered with hipHostRegisterMapped (see alloc_with_host_register)."
+        )
+    return int(dev_ptr.value)
+
+
+def kernel_accessible_host_ptr(tensor: torch.Tensor) -> int:
+    """Translate registered HCU host storage without overlapping registrations."""
+    if is_hcu() and not tensor.is_cuda:
+        return _hip_host_get_device_pointer(tensor.data_ptr())
+    return tensor.data_ptr()

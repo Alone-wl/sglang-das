@@ -231,6 +231,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         """Allocate draft KV cache pools (called by scheduler)."""
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
+        from sglang.srt.layers.attention.glm5_next import is_glm5_next_hcu
+
+        target_pool = self.target_worker.model_runner.token_to_kv_pool
+        if is_glm5_next_hcu(self.draft_runner.model_config.hf_config) and getattr(
+            target_pool, "layer_shard_enabled", False
+        ):
+            self.draft_runner.glm5_next_layer_split_scratch_source = getattr(
+                target_pool, "full_kv_pool", target_pool
+            )
         self.draft_worker.alloc_memory_pool(
             memory_pool_config=memory_pool_config,
             req_to_token_pool=req_to_token_pool,
@@ -358,6 +367,28 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.draft_runner.model.set_embed_and_head(embed, head)
             maybe_share_target_lm_head()
 
+        vp_size = get_spec().speculative_draft_lm_head_vp_size
+        if vp_size > 1:
+            from sglang.srt.speculative.draft_lm_head_vp import (
+                DraftLMHeadVocabParallelTop1,
+            )
+
+            logits_processor = getattr(
+                self.draft_runner.model, "logits_processor", None
+            )
+            if logits_processor is None:
+                raise RuntimeError(
+                    "Draft LM-head VP requires the draft model to expose "
+                    "logits_processor."
+                )
+            draft_lm_head_vp = DraftLMHeadVocabParallelTop1(
+                full_weight=head,
+                vocab_size=self.draft_runner.model_config.vocab_size,
+                vp_size=vp_size,
+                max_rows_per_rank=self.draft_runner.req_to_token_pool.size,
+            )
+            logits_processor.set_draft_lm_head_vp(draft_lm_head_vp)
+
     def init_attention_backend(self):
         # Create multi-step attn backends and cuda graph runners
 
@@ -454,11 +485,17 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             from sglang.srt.layers.attention.dsa_backend import (
                 DeepseekSparseAttnBackend,
             )
+            from sglang.srt.layers.attention.glm5_next.dsa_backend import (
+                NativeSparseAttnBackend,
+            )
 
             supports_hip_draft_extend_graph = (
                 isinstance(self.draft_attn_backend, AiterMultiStepDraftBackend)
                 or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
-                or isinstance(self.draft_extend_attn_backend, DeepseekSparseAttnBackend)
+                or isinstance(
+                    self.draft_extend_attn_backend,
+                    (DeepseekSparseAttnBackend, NativeSparseAttnBackend),
+                )
             )
 
         graph_supported_backend_types = [
@@ -709,7 +746,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if get_spec().speculative_use_rejection_sampling:
+                if logits_output.draft_top1_token_ids is not None:
+                    topk_p = logits_output.draft_top1_probs
+                    topk_index = logits_output.draft_top1_token_ids
+                    forward_batch.positions.add_(1)
+                    if draft_tokens_topk1 is not None:
+                        draft_tokens_topk1[:, i + 1 : i + 2].copy_(topk_index)
+                elif get_spec().speculative_use_rejection_sampling:
                     probs, topk_p, topk_index = sample_draft_proposal(
                         logits_output.next_token_logits,
                         forward_batch.sampling_info.temperatures,
@@ -738,11 +781,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
+                draft_vocab_size = (
+                    self.draft_runner.model_config.vocab_size
+                    if logits_output.draft_top1_token_ids is not None
+                    else logits_output.next_token_logits.shape[-1]
+                )
                 maybe_detect_oob(
                     topk_index,
                     0,
-                    logits_output.next_token_logits.shape[-1],
-                    f"draft_forward step {i}: topk_index OOB vs vocab_size={logits_output.next_token_logits.shape[-1]}",
+                    draft_vocab_size,
+                    f"draft_forward step {i}: topk_index OOB vs vocab_size={draft_vocab_size}",
                 )
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]

@@ -46,14 +46,6 @@ from sglang.srt.arg_groups.arg_utils import (
     resolvable_fields,
     with_fallback,
 )
-from sglang.srt.environ import envs
-from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.utils.common import (
-    get_quantization_config,
-    is_gfx95_supported,
-    is_hcu,
-    xpu_has_xmx_support,
-)
 
 # Re-exported for the callers that already import these names from here; the
 # declarations under ``model_overrides/`` import them from the base directly.
@@ -77,6 +69,14 @@ from sglang.srt.arg_groups.model_override_base import (  # noqa: F401
     resolved_view,
     resolving_view,
     use_mla_backend,
+)
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.utils.common import (
+    get_quantization_config,
+    is_gfx95_supported,
+    is_hcu,
+    xpu_has_xmx_support,
 )
 
 logger = logging.getLogger(__name__)
@@ -465,7 +465,6 @@ def collect_model_override_declarations(
 import sglang.srt.arg_groups.model_overrides  # noqa: F401
 
 
-
 @register_model_override_predicate(
     lambda arch: (
         "Step3p5ForCausalLM" in arch or "Step3p7ForConditionalGeneration" in arch
@@ -531,6 +530,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
         "Lfm2MoeForCausalLM",
         "ZayaForCausalLM",
         "Glm5NextForConditionalGeneration",
+        "Glm5NextForCausalLM",
     }
 )
 
@@ -553,6 +553,7 @@ _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
         "FalconH1ForCausalLM",
         "GraniteMoeHybridForCausalLM",
         "Glm5NextForConditionalGeneration",
+        "Glm5NextForCausalLM",
         "NemotronHForCausalLM",
         "NemotronHPuzzleForCausalLM",
         # KDA-based: same MambaPool ping-pong machinery as GDN; requires the
@@ -845,6 +846,7 @@ _DEEPSEEK_FAMILY_ARCHS = frozenset(
         "PixtralForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
         "Glm5NextForConditionalGeneration",
+        "Glm5NextForCausalLM",
         "HYV4ForCausalLM",
         "HYV4ForCausalLMNextN",
         "LongcatFlashForCausalLM",

@@ -24,6 +24,7 @@ from sglang.srt.utils.common import (
     get_bool_env_var,
     is_cuda,
     is_gfx1250_supported,
+    is_hcu,
     is_hip,
     is_musa,
     is_npu,
@@ -91,6 +92,16 @@ class _SamplingMaskCapture(NamedTuple):
     token_ids: Optional[torch.Tensor]
     selected_weight: Optional[torch.Tensor]
     batch_rows: torch.Tensor
+
+
+lightop_top_k_top_p_sampling_from_probs = None
+if is_hcu():
+    try:
+        from lightop.sampling import (
+            top_k_top_p_sampling_from_probs as lightop_top_k_top_p_sampling_from_probs,
+        )
+    except (ImportError, AttributeError):
+        pass
 
 
 class Sampler(nn.Module):
@@ -427,32 +438,46 @@ class Sampler(nn.Module):
                             batch_rows=capture_rows,
                         )
             elif backend == "pytorch":
-                # A slower fallback implementation with torch native operations.
-                sample_result = top_k_top_p_min_p_sampling_from_probs_torch(
-                    probs,
-                    sampling_info.top_ks,
-                    sampling_info.top_ps,
-                    sampling_info.min_ps,
-                    sampling_info.need_min_p_sampling,
-                    sampling_info.sampling_seed,
-                    positions,
-                    return_filtered_probs=return_sampling_mask,
-                )
-                if return_sampling_mask:
-                    (
-                        batch_next_token_ids,
-                        filtered_probs,
-                        token_ids,
-                        selected_weight,
-                    ) = sample_result
-                    sampling_mask_capture = _SamplingMaskCapture(
-                        weights=select_capture_rows(filtered_probs),
-                        token_ids=select_capture_rows(token_ids),
-                        selected_weight=select_capture_rows(selected_weight),
-                        batch_rows=capture_rows,
+                if (
+                    lightop_top_k_top_p_sampling_from_probs is not None
+                    and sampling_info.sampling_seed is None
+                    and not sampling_info.need_min_p_sampling
+                    and not return_sampling_mask
+                ):
+                    batch_next_token_ids = lightop_top_k_top_p_sampling_from_probs(
+                        probs.contiguous(),
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        filter_apply_order="top_k_first",
+                        deterministic=True,
                     )
                 else:
-                    batch_next_token_ids = sample_result
+                    # A slower fallback implementation with torch native operations.
+                    sample_result = top_k_top_p_min_p_sampling_from_probs_torch(
+                        probs,
+                        sampling_info.top_ks,
+                        sampling_info.top_ps,
+                        sampling_info.min_ps,
+                        sampling_info.need_min_p_sampling,
+                        sampling_info.sampling_seed,
+                        positions,
+                        return_filtered_probs=return_sampling_mask,
+                    )
+                    if return_sampling_mask:
+                        (
+                            batch_next_token_ids,
+                            filtered_probs,
+                            token_ids,
+                            selected_weight,
+                        ) = sample_result
+                        sampling_mask_capture = _SamplingMaskCapture(
+                            weights=select_capture_rows(filtered_probs),
+                            token_ids=select_capture_rows(token_ids),
+                            selected_weight=select_capture_rows(selected_weight),
+                            batch_rows=capture_rows,
+                        )
+                    else:
+                        batch_next_token_ids = sample_result
             else:
                 raise ValueError(f"Invalid sampling backend: {backend}")
         return batch_next_token_ids, sampling_mask_capture
@@ -712,6 +737,60 @@ def create_sampler(backend: Optional[str] = None) -> "Sampler":
     raise ValueError(
         f"Unknown sampling backend '{backend}'. Register it via register_sampler_backend()."
     )
+
+
+def sample_mtp_target_ids(
+    next_token_logits: torch.Tensor,
+    sampling_info,
+    draft_token_num: int,
+    positions: torch.Tensor,
+):
+    """Sample target ids for top-1 MTP verification on HCU."""
+    expanded_temperature = torch.repeat_interleave(
+        sampling_info.temperatures, draft_token_num, dim=0
+    )
+    target_probs = torch.softmax(next_token_logits / expanded_temperature, dim=-1)
+    expanded_top_ks = torch.repeat_interleave(
+        sampling_info.top_ks, draft_token_num, dim=0
+    )
+    expanded_top_ps = torch.repeat_interleave(
+        sampling_info.top_ps, draft_token_num, dim=0
+    )
+
+    # LightOp implements the common top-k-first/top-p path. Keep SGLang's
+    # existing compatibility path for min-p and request-specific RNG seeds.
+    if (
+        lightop_top_k_top_p_sampling_from_probs is None
+        or sampling_info.sampling_seed is not None
+        or sampling_info.need_min_p_sampling
+    ):
+        expanded_min_ps = torch.repeat_interleave(
+            sampling_info.min_ps, draft_token_num, dim=0
+        )
+        expanded_sampling_seed = (
+            None
+            if sampling_info.sampling_seed is None
+            else torch.repeat_interleave(
+                sampling_info.sampling_seed, draft_token_num, dim=0
+            )
+        )
+        return top_k_top_p_min_p_sampling_from_probs_torch(
+            target_probs,
+            expanded_top_ks,
+            expanded_top_ps,
+            expanded_min_ps,
+            sampling_info.need_min_p_sampling,
+            expanded_sampling_seed,
+            positions,
+        ).to(torch.long)
+
+    return lightop_top_k_top_p_sampling_from_probs(
+        target_probs.contiguous(),
+        expanded_top_ks,
+        expanded_top_ps,
+        filter_apply_order="top_k_first",
+        deterministic=True,
+    ).to(torch.long)
 
 
 def top_k_top_p_min_p_sampling_from_probs_torch(

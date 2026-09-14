@@ -371,6 +371,7 @@ class TpModelWorker(BaseTpWorker):
                     revision=get_model().revision,
                     tokenizer_backend=get_serving().tokenizer_backend,
                     model_name=get_model().model_path,
+                    glm_special_token_escape_seed=get_serving().glm_special_token_escape_seed,
                 )
                 self.tokenizer = get_tokenizer_from_processor(self.processor)
             else:
@@ -380,6 +381,7 @@ class TpModelWorker(BaseTpWorker):
                     trust_remote_code=get_model().trust_remote_code,
                     revision=get_model().revision,
                     tokenizer_backend=get_serving().tokenizer_backend,
+                    glm_special_token_escape_seed=get_serving().glm_special_token_escape_seed,
                 )
         self.device = self.model_runner.device
 

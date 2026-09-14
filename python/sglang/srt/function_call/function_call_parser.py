@@ -23,6 +23,10 @@ from sglang.srt.function_call.dots_detector import DotsToolDetector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
 from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.glm5_moe_detector import (
+    Glm5MoeDetector,
+    Glm5MoeStreamDetector,
+)
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
 from sglang.srt.function_call.hermes_detector import HermesDetector
@@ -76,6 +80,8 @@ class FunctionCallParser:
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
+        "glm5": Glm5MoeDetector,
+        "glm5stream": Glm5MoeStreamDetector,
         "gpt-oss": GptOssDetector,
         "k2_horizon": K2V3Detector,
         "kimi_k2": KimiK2Detector,
@@ -314,6 +320,10 @@ class FunctionCallParser:
                     tag = self.get_legacy_structural_tag(at_least_one=is_required)
                     return ("structural_tag", tag)
 
+            if is_required and hasattr(self.detector, "build_ebnf"):
+                ebnf = self.get_ebnf(tool_choice)
+                return ("ebnf", ebnf) if ebnf is not None else None
+
             if (
                 tool_choice == "required" or isinstance(tool_choice, ToolChoice)
             ) and not self.detector.parses_required_natively():
@@ -324,3 +334,41 @@ class FunctionCallParser:
         except Exception as e:
             logger.error(f"Error getting structure constraint: {e}")
             return None
+
+    def get_ebnf(
+        self, tool_choice: Union[ToolChoice, Literal["required"]]
+    ) -> Optional[str]:
+        """
+        Get the EBNF grammar for the specified tool choice.
+
+        Args:
+            tool_choice: The tool choice specification
+
+        Returns:
+            EBNF grammar string, or None if no valid tools found
+
+        Note:
+            If a specific function is requested but not found in available tools,
+            logs a warning and falls back to using all available tools for backward compatibility.
+        """
+        filtered_tools = []
+        if isinstance(tool_choice, ToolChoice):
+            fn_name = tool_choice.function.name
+            filtered_tools = [t for t in self.tools if t.function.name == fn_name]
+
+            # Check if the requested function exists in available tools
+            if not filtered_tools:
+                available_functions = [t.function.name for t in self.tools]
+                logger.warning(
+                    f"Function '{fn_name}' not found in available tools. "
+                    f"Available functions: {available_functions}. "
+                    f"Skipping tool choice."
+                )
+
+                # TODO: Return a 400 error instead of warning when adapter supports proper error handling
+                # For now, fall back to return None
+                return None
+        else:
+            filtered_tools = self.tools
+
+        return self.detector.build_ebnf(filtered_tools)

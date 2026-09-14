@@ -96,6 +96,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_prefill_cp",
     "cp_strategy",
     "enable_dsa_cache_layer_split",
+    "mla_kv_prefetch_ring_size",
     "enable_dsa_prefill_context_parallel",
     "dsa_prefill_cp_mode",
     "enable_prefill_context_parallel",
@@ -273,6 +274,7 @@ POSITIONAL_FIELD_ORDER = (
     "speculative_draft_load_format",
     "speculative_num_steps",
     "speculative_eagle_topk",
+    "speculative_draft_lm_head_vp_size",
     "speculative_num_draft_tokens",
     "speculative_dflash_block_size",
     "speculative_dspark_block_size",
@@ -507,5 +509,12 @@ POSITIONAL_FIELD_ORDER = (
     "weight_cache_timeout",
     "forward_hooks",
     "msprobe_dump_config",
+    "glm_adaptive_max_tokens",
+    "glm_check_chat_prompt_length",
+    "glm_check_total_num_tokens",
+    "glm_decoding_constraint_module",
+    "glm_disable_nothink",
+    "glm_ignore_decoding_constraint_exception",
+    "glm_special_token_escape_seed",
 )
 # fmt: on

@@ -51,6 +51,7 @@ from sglang.srt.utils import (
     get_cuda_version,
     is_blackwell,
     is_flashinfer_available,
+    is_hcu,
     is_hip,
     is_npu,
     load_json_config,
@@ -646,7 +647,12 @@ class _DeepEPDispatcherImplNormal(_DeepEPDispatcherImplBase):
                 expert_alignment=(
                     256
                     if (
-                        get_global_server_args().quantization == "slimquant_marlin"
+                        (
+                            get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
+                            if is_hcu()
+                            else get_global_server_args().quantization
+                            == "slimquant_marlin"
+                        )
                         or _use_fp8_w8a8_moe
                         or _use_marlin_w16a16_moe
                     )
