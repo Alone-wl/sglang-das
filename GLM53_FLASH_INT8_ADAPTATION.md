@@ -47,6 +47,7 @@
 - 已有提交记录包含 HCU 单算子、KPool 和 CUDA Graph 回放验证，以及 16 rank 图捕获成功记录。
 - 仓库中未找到 GLM-5.3-Flash INT8/FP8 W8A8 的固定启动配方、注册测试或完整精度报告。
 - 因此当前状态是“INT8 实现基本齐备，FP8 W8A8 适配待完成；局部运行验证通过，整模型精度与完整部署矩阵待补证”，不能标记为生产可用。
+- 目标 FP8 W8A8 checkpoint 的静态配置已确认：`compressed-tensors/float-quantized`，权重为 FP8 channel-wise，激活为 FP8 token-wise dynamic；容器内量化模块导入通过，整模型启动仍待验证。
 
 ## 5. 实现结构
 
@@ -180,6 +181,13 @@ INT8 权重适配不要求同时启用 FP8 KV。首次建立精度基线时建�
 - [ ] 对比启用/禁用 `SGLANG_INT8_DEEPGEMM_ASM` 的结果。
 - [ ] 验证 `swiglu_limit` 在 TP、EP、contiguous、masked 四种组合中均生效。
 - [ ] 增加覆盖 GLM-5.3-Flash INT8 MoE limit 语义的自动化测试。
+
+### P1：验证 FP8 W8A8
+
+- [ ] 用目标 checkpoint 完成最小 TP eager、BF16 KV cache 启动验证。
+- [ ] 确认 Dense 和 MoE 实际选择 `CompressedTensorsW8A8Fp8` 方案，并记录 HCU backend。
+- [ ] 分别验证 normal dispatch 和 masked dispatch，检查 `swiglu_limit` 语义。
+- [ ] 对比 FP8 W8A8 与 INT8 W8A8 的固定短请求和精度集结果。
 
 ### P2：逐项恢复优化
 
