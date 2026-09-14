@@ -187,6 +187,13 @@ else:
         flash_attn_with_kvcache,
     )
 
+if _is_hcu:
+    # HCU uses the portable wrapper for the short-prefill FA3/MHA path. The
+    # generic HIP block above only imports AITER symbols.
+    from sglang.srt.layers.attention.flashattention_interface import (
+        flash_attn_with_kvcache,
+    )
+
 
 def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tensor:
     # Always normalize to (N_total, 1) layout, to avoid deadlock at deep_gemm.fp8_paged_mqa_logits

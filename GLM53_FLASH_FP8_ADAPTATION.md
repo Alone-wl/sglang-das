@@ -199,7 +199,8 @@ Q: Water is composed of hydrogen...  -> content='Water is composed of hydrogen a
 | `1eaf649dc7` | SwiGLU clamp 后保持 FP8 per-token 量化 | 20-token chat 恢复；79/139/259/506/1287/7K/10K token 仍逐步退化或输出 `!` |
 | `44e500b0f3` | KDA Triton wrapper 继续传递 raw beta | HCU 端到端及 GSM8K 全量验证通过 |
 | `8f0473a36d` | 登记 M1 GSM8K 全量 96.66% | 文档提交 |
-| 本提交 | 恢复 HCU FP8 KV 的动态 scale 存储与 LightOp decode | `compileall`、`git diff --check` 通过；HCU 短请求待验证 |
+| `d60cd2d41b` | 恢复 HCU FP8 KV 的动态 scale 存储与 LightOp decode | 本地静态检查通过；首次 HCU warmup 暴露 FA3 wrapper 缺失 |
+| 本提交 | 补齐 HCU 短 prefill 的 FlashAttention wrapper 导入 | 本地静态检查；HCU 重启待验证 |
 
 ## 调试记录
 
@@ -488,6 +489,8 @@ checkpoint 的 `kv_cache_scheme=null` 只表示没有静态校准 scale，不能
 3. decode 复用 LightOp `decode_gather_and_up_convert_with_indices`，把选中的 packed FP8 KV 动态反量化为 BF16，再交给 HCU FlashMLA。
 4. BF16 KV 继续走已验证的 AITER fallback；generic HIP 的原始布局不变。
 
+首次部署 `d60cd2d41b` 后，权重加载完成，warmup 的短 prefill 进入 `_forward_fa3`，报 `NameError: flash_attn_with_kvcache is not defined`。原因是 DSA backend 的 generic HIP import block 只导入 AITER 符号；此前 HCU backend 被重映射到 AITER，所以该缺口没有暴露。`sglang-model` 在 DCU 上明确导入 `sglang.srt.layers.attention.flashattention_interface.flash_attn_with_kvcache`。本提交只补齐同一 wrapper 导入，不改算子或路由。
+
 ### 5. EvalScope：旧超时已解除，当前是确定性重复
 
 GSM8K smoke 配置为 20 条、batch size 1、`max_tokens=2048`。运行 49 分钟仍为 0/20，EvalScope 多次报告请求超时，prediction 目录为空。
@@ -540,7 +543,7 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 
 ## 未解决问题
 
-1. **P0：HCU FP8 KV 端到端待验证。** 本地已恢复 528-byte 动态 scale 写入和 LightOp decode，需用 `--kv-cache-dtype fp8_e4m3` 启动并跑短 chat。
+1. **P0：HCU FP8 KV 端到端待验证。** 首次启动已越过权重加载，在 warmup 暴露并修复 HCU FA3 wrapper 缺失；需重启并跑短 chat。
 2. **P2：HiCache Mamba backup VMFault。** 当前仅通过关闭 HiCache 规避。
 3. **P2：DeepSeek-V4 norm 修复未验证。** `de651cb5e6` 可能影响该模型，需独立回归。
 4. **P2：MATH-500 尚未执行。** GSM8K M1 已达成，MATH-500 仍需补测。
