@@ -19,14 +19,13 @@ from sglang.srt.function_call.deepseekv3_detector import DeepSeekV3Detector
 from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
 from sglang.srt.function_call.deepseekv31_detector import DeepSeekV31Detector
 from sglang.srt.function_call.deepseekv32_detector import DeepSeekV32Detector
-from sglang.srt.function_call.deepseekv41_detector import DeepSeekV41Detector
 from sglang.srt.function_call.dots_detector import DotsToolDetector
 from sglang.srt.function_call.gemma4_detector import Gemma4Detector
 from sglang.srt.function_call.gigachat3_detector import GigaChat3Detector
-from sglang.srt.function_call.glm4_moe_detector import (
-    Glm4MoeDetector,
-    GlmSpecialTokenConfig,
-    generate_glm_grammar,
+from sglang.srt.function_call.glm4_moe_detector import Glm4MoeDetector
+from sglang.srt.function_call.glm5_moe_detector import (
+    Glm5MoeDetector,
+    Glm5MoeStreamDetector,
 )
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.gpt_oss_detector import GptOssDetector
@@ -77,11 +76,12 @@ class FunctionCallParser:
         "deepseekv31": DeepSeekV31Detector,
         "deepseekv32": DeepSeekV32Detector,
         "deepseekv4": DeepSeekV4Detector,
-        "deepseekv41": DeepSeekV41Detector,
         "dots": DotsToolDetector,
         "glm": Glm4MoeDetector,
         "glm45": Glm4MoeDetector,
         "glm47": Glm47MoeDetector,
+        "glm5": Glm5MoeDetector,
+        "glm5stream": Glm5MoeStreamDetector,
         "gpt-oss": GptOssDetector,
         "k2_horizon": K2V3Detector,
         "kimi_k2": KimiK2Detector,
@@ -125,10 +125,6 @@ class FunctionCallParser:
         else:
             raise ValueError(f"Unsupported tool_call_parser: {tool_call_parser}")
 
-        if isinstance(detector, Glm47MoeDetector):
-            detector.use_full_assistant_constraint = not any(
-                tool.function.strict for tool in tools
-            )
         self.detector = detector
         self.tools = tools
         self.tool_strict_level = envs.SGLANG_TOOL_STRICT_LEVEL.get()
@@ -282,35 +278,8 @@ class FunctionCallParser:
             or self.tool_strict_level >= ToolStrictLevel.FUNCTION
         )
 
+        # Highest priority: model-native structural_tag when available.
         try:
-            if (
-                isinstance(self.detector, Glm47MoeDetector)
-                and self.detector.use_full_assistant_constraint
-            ):
-                functions = (
-                    [
-                        tool.function
-                        for tool in self.tools
-                        if not isinstance(tool_choice, ToolChoice)
-                        or tool.function.name == tool_choice.function.name
-                    ]
-                    if self.tools and tool_choice != "none"
-                    else None
-                )
-                return (
-                    "full_assistant_ebnf",
-                    generate_glm_grammar(
-                        enable_thinking=thinking_mode,
-                        functions=functions,
-                        special_tokens=GlmSpecialTokenConfig(),
-                        chat_template_version="glm47",
-                        accommodate_chat_template=True,
-                        allow_multiple_assistant_turns=False,
-                        required=is_required,
-                        parallel_tool_calls=parallel_tool_calls,
-                    ),
-                )
-            # Highest priority: model-native structural_tag when available.
             if tool_choice == "auto" and not should_constrain_auto:
                 structural_tag = self.detector.get_auto_tool_call_structural_tag(
                     tools=self.tools,
@@ -351,6 +320,10 @@ class FunctionCallParser:
                     tag = self.get_legacy_structural_tag(at_least_one=is_required)
                     return ("structural_tag", tag)
 
+            if is_required and hasattr(self.detector, "build_ebnf"):
+                ebnf = self.get_ebnf(tool_choice)
+                return ("ebnf", ebnf) if ebnf is not None else None
+
             if (
                 tool_choice == "required" or isinstance(tool_choice, ToolChoice)
             ) and not self.detector.parses_required_natively():
@@ -361,3 +334,41 @@ class FunctionCallParser:
         except Exception as e:
             logger.error(f"Error getting structure constraint: {e}")
             return None
+
+    def get_ebnf(
+        self, tool_choice: Union[ToolChoice, Literal["required"]]
+    ) -> Optional[str]:
+        """
+        Get the EBNF grammar for the specified tool choice.
+
+        Args:
+            tool_choice: The tool choice specification
+
+        Returns:
+            EBNF grammar string, or None if no valid tools found
+
+        Note:
+            If a specific function is requested but not found in available tools,
+            logs a warning and falls back to using all available tools for backward compatibility.
+        """
+        filtered_tools = []
+        if isinstance(tool_choice, ToolChoice):
+            fn_name = tool_choice.function.name
+            filtered_tools = [t for t in self.tools if t.function.name == fn_name]
+
+            # Check if the requested function exists in available tools
+            if not filtered_tools:
+                available_functions = [t.function.name for t in self.tools]
+                logger.warning(
+                    f"Function '{fn_name}' not found in available tools. "
+                    f"Available functions: {available_functions}. "
+                    f"Skipping tool choice."
+                )
+
+                # TODO: Return a 400 error instead of warning when adapter supports proper error handling
+                # For now, fall back to return None
+                return None
+        else:
+            filtered_tools = self.tools
+
+        return self.detector.build_ebnf(filtered_tools)
