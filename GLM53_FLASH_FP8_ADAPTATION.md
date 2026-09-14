@@ -118,12 +118,12 @@ Q: Water is composed of hydrogen...  -> content='Water is composed of hydrogen a
 ## 当前状态
 
 - 本地分支：`glm5.3-flash`；推送目标：`wl/glm5.3-flash`。
-- 当前本地基线：`1eaf649dc7`；本提交补齐 KDA Triton wrapper 的 raw beta 传递。
-- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`1eaf649dc7`。
+- 当前本地基线：`8f0473a36d`；正在修复 HCU FP8 KV cache。
+- 远端代码：`/home/work/code/sglang-das`；最后确认的远端 commit：`8f0473a36d`。
 - 模型：`/home/work/GLM-5.3-Flash-Channel-FP8-w8a8`。
 - 硬件：8 张 HCU，`gfx938`。
-- 主配置：TP=8、EP=8、DeepEP normal、DSA/NSA、FP8-E4M3 KV cache、Mamba、EAGLE。
-- 当前临时关闭 HiCache，使用 `/home/work/glm/ifb_nohicache.sh`。这是规避 Mamba backup VMFault 的临时措施，不是最终配置。
+- M1 基线配置：TP=8、EP=1、无 DeepEP/EAGLE/HiCache/CUDA graph，BF16 KV + AITER DSA。
+- 完整目标配置仍包含 EP、DeepEP、FP8 KV、EAGLE 和 HiCache；这些变量必须在 M1 基线上逐项恢复。
 - **M1（纯 TP 精度）已达成**：`tp_bf16_aiter.sh` 配方下 GSM8K 全量 1319 条 = **96.66%**（独立复核 96.6%），高于 85-90% 门槛。
 - M2（清理 `979baf5a81` 之后的适配代码）和 M3（开 CUDA graph + EAGLE 后精度与接受率）待办。
 
@@ -141,6 +141,7 @@ Q: Water is composed of hydrogen...  -> content='Water is composed of hydrogen a
 | 完成 | M1/P0 | 复用 TP FP8 fused MoE 并保留 SwiGLU limit | `SGLANG_USE_FP8_W8A8_MOE=1`；`swiglu_limit=10.0` 进入 clamp+quant 且保持 E4M3FN；GSM8K 96.66% |
 | 完成 | P1 | 定位并解除评测吞吐阻塞 | 查出真实瓶颈是每步固定开销（非算力饱和）；用并发 16 把聚合吞吐从 6.6 提到 100 tok/s（15x）；GSM8K 可用批处理完成 |
 | 完成 | M1/P0 | 完成 GSM8K 全量 | 1319 条 = 96.66%，独立复核一致；已记录失败样例分布（答错 35、未输出 boxed 10，均为个位数算术偏差） |
+| 进行中 | M1/P0 | 修复并验证 HCU FP8 KV cache | 启动参数改为 `--kv-cache-dtype fp8_e4m3`；短 chat 内容正确；确认使用 528-byte 动态分组 scale 布局 |
 | 待办 | M1/P1 | 完成 MATH-500 | 用并发配方执行并记录分数、截断率和失败样例 |
 | 待办 | M2/P0 | **整理 GLM5.3 适配代码（`979baf5a81` 之后全部 commit）** | review 并清除实验性/workaround 代码，在本文档单独成节说明每一项的去留理由与证据 |
 | 待办 | M3/P0 | **开启 CUDA graph + EAGLE（5/1/6）后精度仍正常且接受率非 0** | `--speculative-algorithm EAGLE --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6`；开 CUDA graph；精度达 85%+；接受率 > 0 |
@@ -196,7 +197,9 @@ Q: Water is composed of hydrogen...  -> content='Water is composed of hydrogen a
 | `3cfabe3094` | TP 旧 FP8 fused MoE 补齐 GLM SwiGLU limit | HCU warmup 进入该路径；首次实现误用了 INT8 clamp+quant，已在后续提交修正 |
 | `fe54e1f611` | FP8 fused MoE align 调用适配当前 LightOp | TP8 服务越过 warmup 并就绪；短 probe 仍乱码，随后定位到激活量化 dtype 错误 |
 | `1eaf649dc7` | SwiGLU clamp 后保持 FP8 per-token 量化 | 20-token chat 恢复；79/139/259/506/1287/7K/10K token 仍逐步退化或输出 `!` |
-| 本提交 | KDA Triton wrapper 继续传递 raw beta | 本地静态检查；HCU 端到端待验证 |
+| `44e500b0f3` | KDA Triton wrapper 继续传递 raw beta | HCU 端到端及 GSM8K 全量验证通过 |
+| `8f0473a36d` | 登记 M1 GSM8K 全量 96.66% | 文档提交 |
+| 本提交 | 恢复 HCU FP8 KV 的动态 scale 存储与 LightOp decode | `compileall`、`git diff --check` 通过；HCU 短请求待验证 |
 
 ## 调试记录
 
@@ -472,6 +475,19 @@ fuse_silu_mul_fp8_quant   -> torch.float8_e4m3fn, max=448
 
 官方基线提交 `c66a285c94` 明确补齐了 wrapper 的形参和向下传递。本次照搬这两行契约修复，不修改 KDA 算子。此前 KDA 单算子通过只能证明传入正确 beta 后数值正常，不能覆盖这个服务调用链缺口。
 
+### 4.12 FP8 KV 不能使用无 scale 的 512-byte 原始布局
+
+checkpoint 的 `kv_cache_scheme=null` 只表示没有静态校准 scale，不能据此断言 FP8 KV 必须禁用。DCU 参考实现采用运行时动态量化：512 个 latent 按 128 元素分成 4 组，每组保存一个 FP32 scale，因此无 RoPE 的物理行宽是 `512 + 4 * 4 = 528` bytes。
+
+当前代码的 HCU 路径被通用 HIP workaround 错误覆盖：配置器分配 512-byte 原始行，写入时直接 BF16→FP8 cast，DSA backend 又把 `flashmla_auto/flashmla_kv` 强制改成 AITER。这样确实等价于 scale=1.0，可能产生饱和误差。
+
+本提交按 `sglang-model` 恢复既有算子链，不新增量化算子：
+
+1. HCU FP8 DSA 分配 528-byte scaled row，写入复用 `quantize_k_cache_separate`。
+2. no-RoPE prefill 使用 HCU FlashMLA sparse BF16 compute；持久化仍为 FP8 scaled row。
+3. decode 复用 LightOp `decode_gather_and_up_convert_with_indices`，把选中的 packed FP8 KV 动态反量化为 BF16，再交给 HCU FlashMLA。
+4. BF16 KV 继续走已验证的 AITER fallback；generic HIP 的原始布局不变。
+
 ### 5. EvalScope：旧超时已解除，当前是确定性重复
 
 GSM8K smoke 配置为 20 条、batch size 1、`max_tokens=2048`。运行 49 分钟仍为 0/20，EvalScope 多次报告请求超时，prediction 目录为空。
@@ -504,7 +520,7 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 以下项尚无独立证据证明有错，但在建立精度基线前不能删除：
 
 - channel-FP8 权重经 `pack_int8_weight_enk_to_w6_low_latency` 后是否保持幅值；应对单个 expert 比较 packed dequant 与原始按通道 BF16 权重。
-- checkpoint 的 `kv_cache_scheme` 为 null，但启动参数强制使用 FP8-E4M3 KV；需确认模型期望的 KV 量化约定。
+- FP8 KV 的 528-byte 动态分组 scale 路径已按 DCU 参考恢复，待端到端短请求确认精度。
 - DSA indexer `weights_proj(x.float())` 与 channel-FP8 权重组合的 HCU 数值行为。
 - `Glm5NextForConditionalGeneration` 权重映射、`fused_qkvbfg_a_proj` slice 顺序，以及 MTP `eh_proj/enorm/hnorm` 的 BF16 加载结果。
 
@@ -524,20 +540,17 @@ EvalScope 1.11.1 已安装在 `/home/work/evalscope_uv/.venv`，uv 版本 0.12.1
 
 ## 未解决问题
 
-1. **P0：KDA raw beta wrapper 修复待端到端验证。** FP8 MoE 修复后 20 token 正常，但 79 token 起状态累计仍异常；官方缺失调用契约已补齐。
-2. **P0：纯 TP 精度错误。** 旧配方 GSM8K 5 条均输出 256 个 `!`；当前配方尚未完成 wrapper 修复后的长 chat 和评测验证。
-3. **P2：HiCache Mamba backup VMFault。** 当前仅通过关闭 HiCache 规避。
-4. **P2：长生成仍有残余质量问题。** 20 条文本 sanity 仅 15/20，缺少失败样例分类和可信基线。
-5. **P2：DeepSeek-V4 norm 修复未验证。** `de651cb5e6` 可能影响该模型，需独立回归。
-6. **P2：MATH-500 尚未执行。** 先完成 TP GSM8K 精度门槛。
+1. **P0：HCU FP8 KV 端到端待验证。** 本地已恢复 528-byte 动态 scale 写入和 LightOp decode，需用 `--kv-cache-dtype fp8_e4m3` 启动并跑短 chat。
+2. **P2：HiCache Mamba backup VMFault。** 当前仅通过关闭 HiCache 规避。
+3. **P2：DeepSeek-V4 norm 修复未验证。** `de651cb5e6` 可能影响该模型，需独立回归。
+4. **P2：MATH-500 尚未执行。** GSM8K M1 已达成，MATH-500 仍需补测。
 
 ## 下一位开发者的执行顺序
 
-1. 部署 KDA wrapper 修复，以 `SGLANG_USE_FP8_W8A8_MOE=1` 启动 BF16 KV + AITER DSA 服务，复跑 20/79/139-token chat。
-2. 分级 chat 正确后跑 8K 冷/热，再运行 GSM8K 5/20 条和 MATH-500；记录分数、stop rate、截断率和失败样例。
-3. 若仍错误，继续核对官方 KDA wrapper 和服务实际张量契约；MoE GEMM 配置 A/B 已证伪，不按输出猜测硬改配置。
-4. TileLang DSA 的 gfx938 编译问题独立登记；首个 TP 精度 milestone 暂用 AITER DSA。
-5. 每次提交同步更新 Todo、调试记录、验证和未解决问题。
+1. 推送本提交并在容器拉取；把 M1 脚本的 KV 参数单独改为 `fp8_e4m3`，其余变量保持不变。
+2. 服务就绪后用足够的生成预算检查 Paris、2+2 和水的组成；分别查看 `reasoning_content` 与 `content`。
+3. 短请求正确后补 GSM8K 抽样，再决定是否把 FP8 KV 纳入目标配置。
+4. 每次提交同步更新 Todo、调试记录、验证和未解决问题。
 
 ## 操作注意事项
 

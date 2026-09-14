@@ -96,6 +96,7 @@ from sglang.srt.utils.common import (
     get_available_gpu_memory,
     get_device_memory_capacity,
     is_float4_e2m1fn_x2,
+    is_hcu,
     is_hip,
     is_npu,
 )
@@ -114,6 +115,7 @@ def _should_elide_dsa_index_k(*, is_draft_worker: bool) -> bool:
 
 
 _is_hip = is_hip()
+_is_hcu = is_hcu()
 
 
 def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
@@ -2484,11 +2486,10 @@ def calculate_mla_kv_cache_dim(
     if uses_trtllm_kv_layout:
         return kv_cache_dim
 
-    # On HIP, CUDA-only FlashMLA choices are remapped to AITER by the DSA
-    # backend. Include them here so the KV pool is allocated in the raw MLA
-    # layout before that remap happens; otherwise AITER receives the scaled
-    # 528/656-byte rows.
-    if _is_hip and (
+    # AITER and TileLang on generic HIP consume the raw MLA layout. HCU has a
+    # native FlashMLA + LightOp path which consumes the scaled 528/656-byte
+    # layout, so it must not take this early return.
+    if _is_hip and not _is_hcu and (
         get_exec().kernel.dsa_prefill_backend
         in (
             "tilelang",
