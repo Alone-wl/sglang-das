@@ -7,9 +7,9 @@ set -eo pipefail
 # ``exist_ok=True`` and otherwise masks the source fix below.
 export PYTHONPATH="${SGLANG_SOURCE_ROOT:-/home/work/code/sglang-das}/python${PYTHONPATH:+:${PYTHONPATH}}"
 export MODEL_PATH="${MODEL_PATH:-/home/work/GLM-5.3-Flash-Channel-FP8-w8a8}"
-export PREFILL_HOST="${PREFILL_HOST:-10.6.14.14}"
+export PREFILL_HOST="${PREFILL_HOST:-10.16.1.16}"
 export PREFILL_PORT="${PREFILL_PORT:-8080}"
-export DECODE_HOST="${DECODE_HOST:-10.6.14.15}"
+export DECODE_HOST="${DECODE_HOST:-10.16.1.26}"
 export DECODE_PORT="${DECODE_PORT:-8080}"
 export ROUTER_PORT="${ROUTER_PORT:-30005}"
 
