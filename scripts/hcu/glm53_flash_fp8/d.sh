@@ -15,7 +15,8 @@ exec python3 -m sglang.launch_server \
   --attention-backend nsa --nsa-prefill-backend flashmla_auto --nsa-decode-backend flashmla_kv \
   --linear-attn-backend triton --kv-cache-dtype fp8_e4m3 \
   --disaggregation-transfer-backend mooncake --disaggregation-mode decode \
-  --reasoning-parser glm5 --tool-call-parser glm5stream \
+  --speculative-algorithm EAGLE --speculative-num-steps 5 --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 6 --reasoning-parser glm5 --tool-call-parser glm5stream \
   --enable-cache-report --enable-metrics --tokenizer-worker-num=8 \
   --json-model-override-args '{"index_share_for_mtp_iteration": true}' --numa-node 0 3 2 1 4 7 6 5 \
   --deepep-config "$(dirname "$0")/ep_config.json"
