@@ -12,7 +12,7 @@ exec python3 -m sglang.launch_server \
   --nsa-prefill-cp-mode round-robin-split --moe-a2a-backend deepep --deepep-mode normal \
   --attention-backend nsa --nsa-prefill-backend flashmla_auto --nsa-decode-backend flashmla_kv \
   --kv-cache-dtype fp8_e4m3 --numa-node 0 3 2 1 4 7 6 5 \
-  --enable-hierarchical-cache --hicache-size 220 --hicache-write-policy write_through \
+  --enable-hierarchical-cache --hicache-size 120 --hicache-write-policy write_through \
   --hicache-io-backend kernel --hicache-mem-layout layer_first --speculative-algorithm EAGLE \
   --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
   --enable-cache-report --enable-metrics --tokenizer-worker-num=8 \
