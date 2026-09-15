@@ -4,7 +4,7 @@ ulimit -s 67108864
 exec python3 -m sglang.launch_server \
   --model-path "$MODEL_PATH" --trust-remote-code --host 0.0.0.0 --port "$PREFILL_PORT" \
   --random-seed 42 --context-length 1048576 --chunked-prefill-size 32768 --max-prefill-tokens 32768 \
-  --warmups prefill_input_shapes --disable-shared-experts-fusion --disable-piecewise-cuda-graph \
+  --disable-shared-experts-fusion --disable-piecewise-cuda-graph \
   --disable-chunked-prefix-cache --disaggregation-mode prefill --disaggregation-transfer-backend mooncake \
   --mem-fraction-static 0.8 --max-running-requests 16 --max-mamba-cache-size 96 \
   --mamba-scheduler-strategy extra_buffer --page-size 64 --disable-cuda-graph --enable-single-batch-overlap \
