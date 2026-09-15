@@ -13,8 +13,7 @@ exec python3 -m sglang.launch_server \
   --attention-backend nsa --nsa-prefill-backend flashmla_auto --nsa-decode-backend flashmla_kv \
   --kv-cache-dtype fp8_e4m3 --numa-node 0 3 2 1 4 7 6 5 \
   --enable-hierarchical-cache --hicache-size 64 --hicache-write-policy write_through \
-  --hicache-io-backend kernel --hicache-mem-layout layer_first --speculative-algorithm EAGLE \
-  --speculative-num-steps 5 --speculative-eagle-topk 1 --speculative-num-draft-tokens 6 \
+  --hicache-io-backend kernel --hicache-mem-layout layer_first \
   --enable-cache-report --enable-metrics --tokenizer-worker-num=8 \
   --deepep-config "$(dirname "$0")/ep_config.json" \
   --json-model-override-args '{"index_share_for_mtp_iteration": true}'
