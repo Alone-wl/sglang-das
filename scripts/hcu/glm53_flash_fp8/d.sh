@@ -13,7 +13,7 @@ exec python3 -m sglang.launch_server \
   --mamba-scheduler-strategy no_buffer --tp-size 8 --dp-size 8 --ep-size 8 --moe-dense-tp-size 1 \
   --enable-dp-attention --enable-dp-lm-head --moe-a2a-backend deepep --deepep-mode low_latency \
   --attention-backend nsa --nsa-prefill-backend flashmla_auto --nsa-decode-backend flashmla_kv \
-  --linear-attn-backend triton --kv-cache-dtype fp8_e4m3 --quantization w8a8_fp8 \
+  --linear-attn-backend triton --kv-cache-dtype fp8_e4m3 \
   --disaggregation-transfer-backend mooncake --disaggregation-mode decode \
   --speculative-algorithm EAGLE --speculative-num-steps 5 --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 6 --reasoning-parser glm5 --tool-call-parser glm5stream \

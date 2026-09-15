@@ -2,7 +2,10 @@
 # Shared environment for the HCU GLM-5.3-Flash FP8 recipes.
 set -eo pipefail
 
-export PYTHONPATH="${PYTHONPATH:-/home/work/code/sglang-das/python}"
+# Prefer the checkout pulled by the deployment over the image's preinstalled
+# sglang package.  The latter contains the same registration without
+# ``exist_ok=True`` and otherwise masks the source fix below.
+export PYTHONPATH="${SGLANG_SOURCE_ROOT:-/home/work/code/sglang-das}/python${PYTHONPATH:+:${PYTHONPATH}}"
 export MODEL_PATH="${MODEL_PATH:-/home/work/GLM-5.3-Flash-Channel-FP8-w8a8}"
 export PREFILL_HOST="${PREFILL_HOST:-10.6.14.14}"
 export PREFILL_PORT="${PREFILL_PORT:-8080}"
@@ -63,7 +66,7 @@ export ROCSHMEM_GDA_NUM_QPS_DEFAULT_CTX=288
 export ROCSHMEM_MAX_NUM_CONTEXTS=60
 export ROCSHMEM_HEAP_SIZE=3173741824
 export SGLANG_USE_DEEPGEMM_MOE=1
-export SGLANG_INT8_DEEPGEMM_ASM=1
+export SGLANG_USE_FP8_W8A8_MOE=1
 export SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION=1
 export W8A8_SUPPORT_METHODS=3
 export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1

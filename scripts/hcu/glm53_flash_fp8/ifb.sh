@@ -7,9 +7,9 @@ exec python3 -m sglang.launch_server \
   --warmups prefill_input_shapes --disable-shared-experts-fusion --disable-piecewise-cuda-graph \
   --disable-chunked-prefix-cache --mem-fraction-static 0.8 --max-running-requests 16 \
   --max-mamba-cache-size 96 --mamba-scheduler-strategy extra_buffer --tp-size 8 --ep-size 8 \
-  --moe-a2a-backend deepep --deepep-mode normal --attention-backend nsa \
+  --moe-a2a-backend deepep --moe-runner-backend deep_gemm --deepep-mode auto --attention-backend nsa \
   --nsa-prefill-backend flashmla_auto --nsa-decode-backend flashmla_kv --kv-cache-dtype fp8_e4m3 \
-  --quantization w8a8_fp8 --numa-node 0 3 2 1 4 7 6 5 --enable-hierarchical-cache --hicache-size 120 \
+  --numa-node 0 3 2 1 4 7 6 5 --enable-hierarchical-cache --hicache-size 120 \
   --hicache-write-policy write_through --hicache-io-backend kernel --hicache-mem-layout layer_first \
   --speculative-algorithm EAGLE --speculative-num-steps 5 --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 6 --enable-cache-report --enable-metrics --deepep-config "$(dirname "$0")/ep_config.json" \

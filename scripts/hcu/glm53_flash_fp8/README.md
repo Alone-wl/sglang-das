@@ -4,7 +4,10 @@ These recipes target the `/home/work/GLM-5.3-Flash-Channel-FP8-w8a8` checkpoint
 used by the `dev-wl-glm2` container. Copy this directory to `/home/work/glm`
 after updating `/home/work/code/sglang-das` from the commit containing it.
 
-* `ifb.sh` starts a single-node baseline server on eight cards.
+* `ifb.sh` starts a single-node baseline server on eight cards. It uses
+  DeepEP `auto` mode so extend/prefill batches take the normal contiguous
+  path while decode batches take the low-latency masked path, matching the
+  split used by `p.sh` and `d.sh`.
 * `p.sh` starts the eight-card prefill role.
 * `d.sh` starts the eight-card decode role (`TP8/DP8/EP8`); this is deliberately
   the temporary one-node decode layout requested for bring-up.
