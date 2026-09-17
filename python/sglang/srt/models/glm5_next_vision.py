@@ -22,11 +22,7 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.rotary_embedding import get_rope
-from sglang.srt.models.glm4v import (
-    Glm4vRMSNorm,
-    Glm4vVisionEmbeddings,
-    Glm4vVisionPatchEmbed,
-)
+from sglang.srt.models.glm4v import Glm4vRMSNorm, Glm4vVisionPatchEmbed
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_npu
 
@@ -267,10 +263,6 @@ class Glm5NextVisionModel(nn.Module):
             is_neox_style=True,
         )
 
-        # GLM5 vision checkpoints store one q_norm/k_norm vector per head.
-        # Older configs omit the flag even though those weights are present.
-        qk_norm_by_head_size = getattr(vision_config, "qk_norm_by_head_size", True)
-
         self.blocks = nn.ModuleList(
             [
                 Glm4vVisionBlock(
@@ -283,10 +275,9 @@ class Glm5NextVisionModel(nn.Module):
                     rms_norm_eps=vision_config.rms_norm_eps,
                     attn_qkv_bias=vision_config.attention_bias,
                     use_data_parallel=use_data_parallel,
-                    proj_bias=getattr(vision_config, "proj_bias", False),
-                    qk_normalization=getattr(vision_config, "qk_normalization", False),
-                    qk_normalization_by_head_size=qk_norm_by_head_size,
-                    mlp_linear_bias=getattr(vision_config, "mlp_linear_bias", False),
+                    proj_bias=True,
+                    qk_normalization_by_head_size=True,
+                    mlp_linear_bias=True,
                     swiglu_limit=swiglu_limit,
                 )
                 for layer_idx in range(depth)
@@ -314,15 +305,6 @@ class Glm5NextVisionModel(nn.Module):
             swiglu_limit=swiglu_limit,
         )
 
-        self.adapt_position = getattr(vision_config, "adapt_position", True)
-        if self.adapt_position:
-            self.embeddings = Glm4vVisionEmbeddings(vision_config)
-
-        self.use_post_conv_ln = getattr(vision_config, "post_conv_ln", True)
-        if self.use_post_conv_ln:
-            self.post_conv_layernorm = Glm4vRMSNorm(
-                vision_config.hidden_size, eps=vision_config.rms_norm_eps
-            )
         self.downsample = nn.Conv2d(
             in_channels=vision_config.hidden_size,
             out_channels=vision_config.out_hidden_size,
@@ -383,11 +365,9 @@ class Glm5NextVisionModel(nn.Module):
         # patchify
         x = x.to(device=self.device, dtype=self.dtype)
         x = self.patch_embed(x)
-        if self.use_post_conv_ln:
-            x = self.post_conv_layernorm(x)
 
         # compute position embedding
-        rotary_pos_emb_cos, rotary_pos_emb_sin, image_type_ids = self.rot_pos_emb(
+        rotary_pos_emb_cos, rotary_pos_emb_sin, _ = self.rot_pos_emb(
             grid_thw
         )
         # compute cu_seqlens
@@ -397,12 +377,6 @@ class Glm5NextVisionModel(nn.Module):
         cu_seqlens = torch.cat([cu_seqlens.new_zeros(1), cu_seqlens])
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = int(seq_lens.max().item())
-
-        seqlens = seq_lens.tolist()
-        if self.adapt_position:
-            x = self.embeddings(
-                x, seqlens, grid_thw, image_type_ids[:, 0], image_type_ids[:, 1]
-            )
 
         rotary_pos_emb_cos = torch.cat([rotary_pos_emb_cos, rotary_pos_emb_cos], dim=-1)
         rotary_pos_emb_sin = torch.cat([rotary_pos_emb_sin, rotary_pos_emb_sin], dim=-1)
