@@ -16,10 +16,10 @@ namespace hcu_delta_rule {
 
 constexpr int kK = 128;
 constexpr int kV = 128;
-constexpr int kThreads = 256;
+constexpr int kThreads = 128;
 constexpr int kLogicalWarp = 32;
 constexpr int kWarps = kThreads / kLogicalWarp;
-constexpr int kValuesPerWarp = 4;
+constexpr int kValuesPerWarp = 8;
 constexpr int kValuesPerBlock = kWarps * kValuesPerWarp;
 
 template <typename T>
