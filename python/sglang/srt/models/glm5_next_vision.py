@@ -267,6 +267,10 @@ class Glm5NextVisionModel(nn.Module):
             is_neox_style=True,
         )
 
+        # GLM5 vision checkpoints store one q_norm/k_norm vector per head.
+        # Older configs omit the flag even though those weights are present.
+        qk_norm_by_head_size = getattr(vision_config, "qk_norm_by_head_size", True)
+
         self.blocks = nn.ModuleList(
             [
                 Glm4vVisionBlock(
@@ -281,9 +285,7 @@ class Glm5NextVisionModel(nn.Module):
                     use_data_parallel=use_data_parallel,
                     proj_bias=getattr(vision_config, "proj_bias", False),
                     qk_normalization=getattr(vision_config, "qk_normalization", False),
-                    qk_normalization_by_head_size=getattr(
-                        vision_config, "qk_norm_by_head_size", False
-                    ),
+                    qk_normalization_by_head_size=qk_norm_by_head_size,
                     mlp_linear_bias=getattr(vision_config, "mlp_linear_bias", False),
                     swiglu_limit=swiglu_limit,
                 )
