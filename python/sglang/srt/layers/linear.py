@@ -57,6 +57,9 @@ _disable_hip_linear_quant = _is_hip and get_bool_env_var(
 )
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_LEGACY_FUSED_RMS_QUANT")
 _use_fused_silu_mul_quant = get_bool_env_var("SGLANG_USE_FUSED_SILU_MUL_QUANT")
+_use_fused_silu_mul_fp8_quant = (
+    envs.SGLANG_USE_FUSED_SILU_MUL_FP8_QUANT.get() or _use_fused_silu_mul_quant
+)
 _use_fused_bailing_silu_mul_fp8_quant = get_bool_env_var(
     "SGLANG_USE_FUSED_BAILING_SILU_MUL_FP8_QUANT"
 )
@@ -86,12 +89,24 @@ if _use_fused_silu_mul_quant:
     except ImportError:
         pass
 
-if _use_fused_bailing_silu_mul_fp8_quant or _use_fused_dpskv4_silu_mul_fp8_quant:
+_lightop_fuse_silu_mul_fp8_quant = None
+if (
+    _use_fused_silu_mul_fp8_quant
+    or _use_fused_bailing_silu_mul_fp8_quant
+    or _use_fused_dpskv4_silu_mul_fp8_quant
+):
     try:
-        from lightop.activation import fuse_silu_mul_fp8_quant
+        from lightop.activation import (
+            fuse_silu_mul_fp8_quant as _lightop_fuse_silu_mul_fp8_quant,
+        )
     except ImportError:
-        # Current HCU wheels export this operator from the package root.
-        from lightop import fuse_silu_mul_fp8_quant
+        try:
+            # Current HCU wheels export this operator from the package root.
+            from lightop import (
+                fuse_silu_mul_fp8_quant as _lightop_fuse_silu_mul_fp8_quant,
+            )
+        except ImportError:
+            pass
 
 if _use_fused_bailing_silu_mul_fp8_quant or _use_fused_dpskv4_silu_mul_fp8_quant:
     import deepgemm
@@ -1786,6 +1801,17 @@ class RowParallelLinear(LinearBase):
             )
         )
 
+    def supports_fused_silu_mul_fp8_quant_input(self) -> bool:
+        return bool(
+            _use_fused_silu_mul_fp8_quant
+            and _lightop_fuse_silu_mul_fp8_quant is not None
+            and getattr(
+                getattr(self, "scheme", None),
+                "supports_fp8_prequantized_input",
+                False,
+            )
+        )
+
     def forward(
         self,
         input_,
@@ -1854,19 +1880,38 @@ class RowParallelLinear(LinearBase):
                 if sm is not None:
                     sm.tag(output_parallel)
         elif use_fused_silu_mul_fp8_quant:
-            output_shape = [*input_.shape[:-1], self.weight.shape[1]]
-            input_x, x_scale = fuse_silu_mul_fp8_quant(input_parallel, fp8type=0)
+            if not self.supports_fused_silu_mul_fp8_quant_input():
+                raise RuntimeError("LightOp FP8 SwiGLU quantization is unavailable")
+            if input_parallel.dim() != 2 or not input_parallel.is_contiguous():
+                raise ValueError(
+                    "Fused FP8 SwiGLU quantization requires a contiguous 2D input"
+                )
+
+            num_tokens, gate_up_width = input_parallel.shape
+            if gate_up_width % 2 != 0:
+                raise ValueError("SwiGLU gate/up width must be even")
+            input_x = torch.empty(
+                (num_tokens, gate_up_width // 2),
+                device=input_parallel.device,
+                dtype=torch.float8_e4m3fn,
+            )
+            x_scale = torch.empty(
+                (num_tokens, 1), device=input_parallel.device, dtype=torch.float32
+            )
+            _lightop_fuse_silu_mul_fp8_quant(
+                input_parallel,
+                fp8type=0,
+                output=input_x,
+                scales=x_scale,
+                limit=swiglu_limit,
+            )
 
             with symm_ctx as sm:
-                output = torch.empty(
-                    output_shape, device=input_.device, dtype=input_.dtype
+                output_parallel = self.quant_method.apply(
+                    self,
+                    (input_x, x_scale, input_parallel.dtype),
+                    bias=bias_,
                 )
-                deepgemm.fp8_gemm(
-                    (input_x, x_scale),
-                    (self.weight, self.weight_scale),
-                    output,
-                )
-                output_parallel = output.view(*output_shape)
                 if sm is not None:
                     sm.tag(output_parallel)
         else:
