@@ -262,6 +262,18 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
             # orig_dtype (when present) sets the GEMM output dtype.
             qx, x_scale = x[0], x[1]
             out_dtype = x[2] if len(x) > 2 else None
+            if _is_hcu:
+                # HCU's fused SwiGLU producer emits one dynamic scale per
+                # token. Preserve the pair so apply_fp8_linear selects its
+                # DeepGEMM prequantized-input path instead of the generic
+                # scalar-scale path (which only accepts scale.numel() == 1).
+                return apply_fp8_linear(
+                    input=(qx, x_scale),
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    bias=bias,
+                    pre_quant_output_dtype=out_dtype,
+                )
             return apply_fp8_linear(
                 input=qx,
                 weight=layer.weight,
