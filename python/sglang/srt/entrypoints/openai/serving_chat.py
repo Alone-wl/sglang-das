@@ -486,8 +486,6 @@ class OpenAIServingChat(OpenAIServingBase):
             "glm45": "glm45",
             "glm45stream": "glm45",
             "glm47": "glm47",
-            "glm5": "glm47",
-            "glm5stream": "glm47",
         }
         self._glm_chat_template_version = _parser_to_version.get(self.tool_call_parser)
 
@@ -2563,7 +2561,6 @@ class OpenAIServingChat(OpenAIServingBase):
             detector_owns_format = (
                 parser.detector.supports_structural_tag()
                 or parser.detector.parses_required_natively()
-                or hasattr(parser.detector, "build_ebnf")
             )
             should_try_parser = not is_required or detector_owns_format
             if should_try_parser and parser.has_tool_call(text):
@@ -3017,7 +3014,6 @@ class OpenAIServingChat(OpenAIServingBase):
                     use_native_parser = (
                         probe.detector.supports_structural_tag()
                         or probe.detector.parses_required_natively()
-                        or hasattr(probe.detector, "build_ebnf")
                     )
                 if use_native_parser:
                     parser_dict[index] = probe
