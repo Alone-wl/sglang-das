@@ -298,3 +298,18 @@ def kernel_accessible_host_ptr(tensor: torch.Tensor) -> int:
     if is_hcu() and not tensor.is_cuda:
         return _hip_host_get_device_pointer(tensor.data_ptr())
     return tensor.data_ptr()
+
+
+def make_kernel_ptr_table(
+    tensors: list[torch.Tensor],
+    target_device: torch.device | str,
+    *,
+    host_memory_registered: bool,
+) -> torch.Tensor:
+    device = torch.device(target_device)
+    pointers = (
+        [kernel_accessible_host_ptr(tensor) for tensor in tensors]
+        if host_memory_registered and device.type == "cuda"
+        else [tensor.data_ptr() for tensor in tensors]
+    )
+    return torch.tensor(pointers, dtype=torch.uint64, device=device)

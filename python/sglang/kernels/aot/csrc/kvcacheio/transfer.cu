@@ -2232,8 +2232,8 @@ void transfer_mla_656_page_lf_lf_h2d_launcher_hcu(
     const at::Tensor& src_indices,
     const at::Tensor& dst_indices,
     int64_t num_pages) {
-  const void* src_ptr = get_rocm_kernel_accessible_ptr(src);
-  void* dst_ptr = get_rocm_kernel_accessible_ptr(dst);
+  const void* src_ptr = resolve_device_accessible_ptr(src);
+  void* dst_ptr = resolve_device_accessible_ptr(dst);
   cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
   transfer_mla_656_page_lf_lf_h2d_kernel_hcu<ThreadsPerBlock>
       <<<dim3(num_pages, 1, 1), ThreadsPerBlock, 0, torch_current_stream>>>(
@@ -2271,8 +2271,8 @@ void transfer_item_lf_lf_h2d_launcher_hcu(
     const at::Tensor& src_indices,
     const at::Tensor& dst_indices,
     int64_t item_size) {
-  const void* src_ptr = get_rocm_kernel_accessible_ptr(src);
-  void* dst_ptr = get_rocm_kernel_accessible_ptr(dst);
+  const void* src_ptr = resolve_device_accessible_ptr(src);
+  void* dst_ptr = resolve_device_accessible_ptr(dst);
   cudaStream_t torch_current_stream = at::cuda::getCurrentCUDAStream();
   transfer_item_lf_lf_h2d_kernel_hcu<ThreadsPerBlock>
       <<<dim3(src_indices.numel(), 1, 1), ThreadsPerBlock, 0, torch_current_stream>>>(
