@@ -686,10 +686,11 @@ class NativeSparseAttnBackend(
         page_size = self.real_page_size
         if page_size == 1:
             return page_table
-        # Keep the old gather-then-divide memory pattern, but cache the column
-        # index as int64 so PyTorch does not insert an int32->int64 _to_copy.
-        col_indices = self.get_real_page_col_indices(page_table.shape[1])
-        return torch.index_select(page_table, 1, col_indices) // page_size
+        max_seqlen_k = page_table.shape[1]
+        strided_indices = torch.arange(
+            0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
+        )
+        return page_table[:, strided_indices] // page_size
 
     # ---- Kpool metadata: delegated to dsa.kpool.planner ------------
     def _init_pooled_paged_mqa_metadata(

@@ -496,8 +496,11 @@ def enable_moe_dense_fully_dp():
 
 def _generic_prefill_cp_shards_tokens() -> bool:
     """Whether the strategy prefill CP path shards prefill tokens across CP ranks."""
+    # Local import: module-level CP helper imports here are circular (#27014).
+    from sglang.srt.layers.cp.utils import enable_cp_v2
+
     parallel = get_parallel()
-    return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp
+    return parallel.attn_cp_size > 1 and parallel.enable_prefill_cp and enable_cp_v2()
 
 
 def enable_dwdp():

@@ -647,9 +647,12 @@ def _kpool_plan_to_gpu(
         packed_page = full_real_page_table[pool_batch_idx_t, pool_page_group].to(
             torch.int64
         )
-        pool_write_locs = packed_page * slots_per_page + torch.remainder(
-            pool_pool_id_t, slots_per_page
+        pool_slot = (
+            torch.bitwise_and(pool_pool_id_t, slots_per_page - 1)
+            if is_hcu()
+            else torch.remainder(pool_pool_id_t, slots_per_page)
         )
+        pool_write_locs = packed_page * slots_per_page + pool_slot
     else:
         pool_write_locs = torch.empty((0,), dtype=torch.int64, device=device)
 

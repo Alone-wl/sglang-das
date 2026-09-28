@@ -43,6 +43,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 from sglang.srt.arg_groups import model_override_base
 from sglang.srt.arg_groups.arg_utils import (
     field_names,
+    is_record,
     resolvable_fields,
     with_fallback,
 )
@@ -74,6 +75,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.utils.common import (
     get_quantization_config,
+    is_fi_a2a_supported,
     is_gfx95_supported,
     is_hcu,
     xpu_has_xmx_support,
@@ -181,6 +183,43 @@ def declare_resolution(server_args: Any, source: str, **fields: Any) -> None:
         stash = []
         server_args._resolved_overrides = stash
     stash.append((source, dict(fields)))
+
+
+class _ForeignDefaults:
+    """The stand-in handed to a resolver this tree does not own."""
+
+    __slots__ = ("_cfg", "_written")
+
+    def __init__(self, server_args: Any):
+        object.__setattr__(self, "_cfg", resolving_view(server_args))
+        object.__setattr__(self, "_written", {})
+
+    def __getattr__(self, name: str) -> Any:
+        written = object.__getattribute__(self, "_written")
+        if name in written:
+            return written[name]
+        return getattr(object.__getattribute__(self, "_cfg"), name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__getattribute__(self, "_written")[name] = value
+
+
+def record_foreign_defaults(
+    server_args: Any, source: str, resolve: Callable[[Any], Any]
+) -> Any:
+    """Run a resolver owned by a platform or speculative plugin."""
+    if not is_record(server_args):
+        return resolve(server_args)
+    recorder = _ForeignDefaults(server_args)
+    result = resolve(recorder)
+    written = {
+        name: value
+        for name, value in object.__getattribute__(recorder, "_written").items()
+        if name in field_names(type(server_args))
+    }
+    if written:
+        declare_resolution(server_args, source, **written)
+    return result
 
 
 def declare_late_resolution(server_args: Any, source: str, **fields: Any) -> None:
@@ -1505,6 +1544,32 @@ def _data_parallelism_defaults(view: Any) -> dict:
     ):
         return {"enable_dp_attention": False, "enable_dp_lm_head": False}
     return {}
+
+
+@register_post_process
+def _dcp_comm_backend_default(view: Any) -> dict:
+    if view.dcp_comm_backend is not None:
+        return {}
+    if view.dcp_size <= 1:
+        return {"dcp_comm_backend": "ag_rs"}
+    platform = get_platform()
+    if is_fi_a2a_supported(
+        dcp_size=view.dcp_size,
+        tp_size=view.tp_size,
+        pp_size=view.pp_size,
+        nnodes=view.nnodes,
+    ):
+        backend = "fi_a2a"
+    elif platform.is_cuda or platform.is_hip:
+        backend = "a2a"
+    else:
+        backend = "ag_rs"
+    logger.info(
+        "DCP (dcp_size=%d) selects communication backend %r.",
+        view.dcp_size,
+        backend,
+    )
+    return {"dcp_comm_backend": backend}
 
 
 @register_post_process

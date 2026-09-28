@@ -62,6 +62,7 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
+from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -78,6 +79,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
+from sglang.srt.layers.cp.utils import enable_cp_v2
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -114,6 +116,10 @@ from sglang.srt.layers.moe.utils import (
     is_sbo_enabled,
     is_shared_experts_fusion_disabled,
     is_tbo_enabled,
+)
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    mla_use_prefill_cp,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
@@ -581,6 +587,14 @@ class MoEGate(nn.Module):
             if _is_cuda or _is_hip:
                 return torch.mm(hidden_states, self.weight.t(), out_dtype=torch.float32)
             return F.linear(hidden_states.float(), self.weight.float(), None)
+
+        if (
+            not enable_cp_v2()
+            and not self.is_deepseek_v4
+            and forward_batch is not None
+            and (dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch))
+        ):
+            return F.linear(hidden_states, self.weight, None)
 
         if hidden_states.shape[0] <= self.tiny_router_gemm_max_tokens:
             logits = tiny_gemm_bf16(
@@ -2621,6 +2635,20 @@ class DeepseekV2AttentionMLA(
         else:
             q = self.q_b_proj(q_lora)[0]
         return q.view(-1, self.num_local_heads, self.qk_head_dim)
+
+    def rebuild_cp_kv_cache(self, latent_cache, forward_batch, k_nope, k_pe):
+        # Retained for the platform MLA paths.
+        latent_cache[..., : self.kv_lora_rank] = k_nope.squeeze(1)
+        latent_cache[..., self.kv_lora_rank :] = k_pe.squeeze(1)
+        latent_cache_output = cp_all_gather_rerange_output(
+            latent_cache.contiguous(),
+            get_parallel().attn_cp_size,
+            forward_batch,
+            torch.cuda.current_stream(),
+        )
+        k_nope = latent_cache_output[..., : self.kv_lora_rank].unsqueeze(1)
+        k_pe = latent_cache_output[..., self.kv_lora_rank :].unsqueeze(1)
+        return k_nope, k_pe
 
     @staticmethod
     def _get_q_b_proj_quant_config(quant_config):
