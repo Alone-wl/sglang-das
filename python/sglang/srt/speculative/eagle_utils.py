@@ -23,6 +23,7 @@ from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
+    is_hcu,
     is_hip,
     is_musa,
     is_npu,
@@ -46,10 +47,15 @@ _is_npu = is_npu()
 _is_musa = is_musa()
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
+_is_hcu = is_hcu()
 
 logger = logging.getLogger(__name__)
 
-if _is_cuda or _is_hip or _is_musa:
+if _is_cuda or (_is_hip and not _is_hcu):
+    from sglang.kernels.ops.speculative.tree import (
+        build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
+    )
+elif _is_hip or _is_musa:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
@@ -386,7 +392,10 @@ def verify_tree_greedy_func(
     topk: int = -1,
 ):
     if _is_cuda or _is_hip or _is_musa:
-        from sgl_kernel import verify_tree_greedy
+        if _is_cuda or (_is_hip and not _is_hcu):
+            from sglang.kernels.ops.speculative.tree import verify_tree_greedy
+        else:
+            from sgl_kernel import verify_tree_greedy
 
         verify_tree_greedy(
             predicts=predicts,  # mutable
@@ -685,6 +694,24 @@ def _verify_coins(
     return coins, coins_for_final_sampling
 
 
+def _verify_uses_greedy(
+    *,
+    is_all_greedy: bool,
+    is_cpu: bool,
+    is_hip: bool,
+    is_xpu: bool,
+    use_rejection_sampling: bool,
+) -> bool:
+    """Whether EAGLE verify must commit argmax instead of taking the sampling path.
+
+    HIP has no CUDA/MUSA sampling-verify kernels, so it used to be listed here
+    unconditionally. Rejection sampling routes it through the pure-Triton chain
+    sampler instead, so only a HIP run without that still has to go greedy. Every
+    other platform reduces to the original predicate.
+    """
+    return is_all_greedy or is_cpu or is_xpu or (is_hip and not use_rejection_sampling)
+
+
 def _can_use_sparse_uno_tree_target_sampling(
     max_top_k: Optional[int],
     sampling_info: SamplingBatchInfo,
@@ -781,10 +808,14 @@ def eagle_sample(
 
     # HCU top-1 MTP samples the target distribution before greedy tree matching,
     # retaining source temperature/top-k/top-p/min-p and per-request RNG semantics.
-    from sglang.srt.utils import is_hcu
-
+    use_rejection_sampling = get_spec().speculative_use_rejection_sampling
     sampled_target_ids = None
-    if not sampling_info.is_all_greedy and is_hcu() and verify_input.tree_topk == 1:
+    if (
+        not sampling_info.is_all_greedy
+        and _is_hcu
+        and verify_input.tree_topk == 1
+        and not use_rejection_sampling
+    ):
         from sglang.srt.layers.sampler import sample_mtp_target_ids
 
         sampled_target_ids = sample_mtp_target_ids(
@@ -794,7 +825,13 @@ def eagle_sample(
             verify_input.positions,
         )
     target_predict = None
-    if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+    if _is_npu or _verify_uses_greedy(
+        is_all_greedy=sampling_info.is_all_greedy,
+        is_cpu=_is_cpu,
+        is_hip=_is_hip,
+        is_xpu=_is_xpu,
+        use_rejection_sampling=use_rejection_sampling,
+    ):
         target_predict = (
             torch.argmax(next_token_logits, dim=-1)
             if sampled_target_ids is None
@@ -873,8 +910,6 @@ def eagle_sample(
         from sglang.kernels.ops.speculative.reject_sampling import (
             chain_speculative_sampling_triton,
         )
-
-        use_rejection_sampling = get_spec().speculative_use_rejection_sampling
 
         sampling_fn = (
             chain_speculative_sampling_triton

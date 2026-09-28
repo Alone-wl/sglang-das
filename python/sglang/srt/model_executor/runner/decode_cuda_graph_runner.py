@@ -26,6 +26,7 @@ Backend selection comes from cuda_graph_config.decode:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import inspect
 import logging
 import os
@@ -1506,6 +1507,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             if shared_read_ends is SharedReadEnds.POST_REPLAY:
                 self._publish_read_done(in_graph=False)
 
+            output = self._process_output_after_replay(output, forward_batch)
+
         if isinstance(output, LogitsProcessorOutput):
             if self.is_dllm:
                 next_token_logits = None
@@ -1522,7 +1525,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     else None
                 )
 
-            return LogitsProcessorOutput(
+            # Preserve extension fields produced by the eager output processor.
+            return dataclasses.replace(
+                output,
                 next_token_logits=next_token_logits,
                 full_logits=full_logits,
                 hidden_states=(
@@ -1534,7 +1539,19 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            # Slice in token rows, not request rows: under speculative verify
+            # each request carries captured_req_width tokens (identical for
+            # plain decode, where captured_req_width == 1).
+            return PPProxyTensors(
+                {
+                    k: v[: self.bs * self.captured_req_width]
+                    for k, v in output.tensors.items()
+                }
+            )
+
+    def _process_output_after_replay(self, output, forward_batch: ForwardBatch):
+        """Optional eager tail executed after graph replay and inside its timer."""
+        return output
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None

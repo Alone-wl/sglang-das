@@ -43,6 +43,15 @@ def _should_auto_enable_hip_rejection_sampling(
     stage-a ``test_basic_sanity_eagle3`` (draft 32000 vs target 128256). Skip
     EAGLE3 and any EAGLE run that already has a token map.
     """
+    if is_hip:
+        # HCU reports itself through PyTorch's HIP runtime but uses its own
+        # top-1 MTP target sampler; the generic ROCm rejection path requires
+        # draft probabilities that the HCU draft backend does not produce.
+        from sglang.srt.utils.common import is_hcu
+
+        if is_hcu():
+            return False
+
     return (
         is_hip
         and not use_rejection_sampling
