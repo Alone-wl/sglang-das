@@ -740,8 +740,13 @@ class DeepEPMoE(FusedMoE):
 
         self.deepep_mode = get_deepep_mode()
 
+        if quant_config is not None and quant_config.get_name() == "slimquant_w4a8":
+            self.dispatcher.set_quant_config({"int8_dispatch": True})
         if quant_config is None and hasattr(self.dispatcher, "set_quant_config"):
             self.dispatcher.set_quant_config({"bf16_dispatch": True})
+            if _is_hcu:
+                # DeepEP's grouped BF16 path consumes ordinary, unshuffled weights.
+                self._skip_aiter_moe_shuffle = True
         if (
             self.deepep_mode.enable_low_latency()
             and not _is_npu
@@ -872,7 +877,14 @@ class DeepEPMoE(FusedMoE):
 
         if DispatchOutputChecker.format_is_deepep_normal(dispatch_output):
             # assert deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM and self.use_fp8_w8a8
-            if (
+            if _is_hcu and self.quant_config is None:
+                output = self.forward_groupgemm_bf16_contiguous(dispatch_output)
+            elif (
+                self.quant_config is not None
+                and self.quant_config.get_name() == "slimquant_w4a8"
+            ):
+                output = self.quant_method.apply_deepep_normal(self, dispatch_output)
+            elif (
                 _is_hcu
                 and _use_deepgemm_moe
                 and (
@@ -922,6 +934,8 @@ class DeepEPMoE(FusedMoE):
         elif DispatchOutputChecker.format_is_deepep_ll(dispatch_output):
             if self.quant_config is None:
                 output = self.forward_unquantized_deepep_ll(dispatch_output)
+            elif self.quant_config.get_name() == "slimquant_w4a8":
+                output = self.quant_method.apply_deepep_low_latency(self, dispatch_output)
             elif (
                 get_moe_runner_backend().is_flashinfer_cutedsl()
                 and self.quant_config is not None
@@ -1334,6 +1348,7 @@ class DeepEPMoE(FusedMoE):
             topk_weights,
             num_recv_tokens_per_expert,
         ) = dispatch_output
+        assert hidden_states_scale is None and hidden_states.dtype == torch.bfloat16
         assert self.moe_runner_config.activation == "silu"
         if num_recv_tokens_per_expert is None:
             return hidden_states.bfloat16()
