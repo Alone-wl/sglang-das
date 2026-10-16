@@ -26,7 +26,12 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.distributed import get_tensor_model_parallel_world_size
 from sglang.srt.layers.linear import LinearBase, set_weight_attrs
-from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
+from sglang.srt.layers.moe import (
+    MoeRunner,
+    MoeRunnerBackend,
+    MoeRunnerConfig,
+    get_moe_a2a_backend,
+)
 from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
     moe_align_block_size,
 )
@@ -43,6 +48,7 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.compressed_tensors import quant_ops
 from sglang.srt.utils import W8a8GetCacheJSON, get_bool_env_var
+from sglang.srt.utils.common import is_hcu
 
 _use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 _use_fused_silu_mul_quant = get_bool_env_var("SGLANG_USE_FUSED_SILU_MUL_QUANT")
@@ -649,6 +655,11 @@ class SlimQuantW4A8Int8MoEMethod:
     def __init__(self, quant_config):
         self.quant_config = quant_config
         self.tritonsingleton = W8a8GetCacheJSON()
+        self.use_deepgemm = (
+            is_hcu()
+            and get_bool_env_var("SGLANG_USE_DEEPGEMM_MOE")
+            and get_moe_a2a_backend().is_deepep()
+        )
 
     def create_weights(
         self,
@@ -663,6 +674,8 @@ class SlimQuantW4A8Int8MoEMethod:
             FusedMoeWeightScaleSupported,
         )
 
+        if self.use_deepgemm and params_dtype != torch.bfloat16:
+            raise ValueError("DeepGEMM HIPC W4A8 requires bfloat16 output")
         tp_size = get_tensor_model_parallel_world_size()
         intermediate_size = intermediate_size_per_partition
 
@@ -710,6 +723,13 @@ class SlimQuantW4A8Int8MoEMethod:
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(self, "use_deepgemm", False):
+            from sglang.srt.layers.quantization.hcu_deepgemm_w4a8_utils import (
+                prepare_slimquant_w4a8_deepgemm_weights,
+            )
+
+            prepare_slimquant_w4a8_deepgemm_weights(layer)
+            return
         E = layer.w13_weight.shape[0]
         N1 = layer.w13_weight.shape[1]
         N2 = layer.w2_weight.shape[1]
@@ -745,7 +765,10 @@ class SlimQuantW4A8Int8MoEMethod:
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         self.moe_runner_config = moe_runner_config
-        self.runner = MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        self.runner = (
+            None if self.use_deepgemm
+            else MoeRunner(MoeRunnerBackend.TRITON, moe_runner_config)
+        )
 
     def _apply_triton(
         self,
@@ -795,6 +818,21 @@ class SlimQuantW4A8Int8MoEMethod:
     def apply_deepep_low_latency(self, layer, dispatch_output):
         if self.moe_runner_config.apply_router_weight_on_input:
             raise NotImplementedError("W4A8 DeepEP requires output-side router weights")
+        if self.use_deepgemm:
+            from sglang.srt.layers.quantization.hcu_deepgemm_w4a8_utils import (
+                apply_slimquant_w4a8_deepgemm_masked,
+            )
+
+            if self.moe_runner_config.activation != "silu":
+                raise ValueError("DeepGEMM W4A8 requires silu activation")
+            return apply_slimquant_w4a8_deepgemm_masked(
+                layer,
+                dispatch_output.hidden_states,
+                dispatch_output.hidden_states_scale,
+                dispatch_output.masked_m,
+                dispatch_output.expected_m,
+                self.moe_runner_config,
+            )
         return fused_experts_impl_w4a8_low_latency(
             dispatch_output.hidden_states,
             dispatch_output.hidden_states_scale,
@@ -810,6 +848,10 @@ class SlimQuantW4A8Int8MoEMethod:
 
     def apply_deepep_normal(self, layer: torch.nn.Module, dispatch_output):
         """Consume DeepEP's local expert IDs and already-quantized INT8 tokens."""
+        if self.use_deepgemm:
+            if self.moe_runner_config.apply_router_weight_on_input:
+                raise NotImplementedError("W4A8 DeepEP requires output-side router weights")
+            return layer.forward_deepgemm_w4a8_contiguous(dispatch_output)
         x = dispatch_output.hidden_states
         x_scale = dispatch_output.hidden_states_scale
         if x.dtype != torch.int8 or x_scale is None:
