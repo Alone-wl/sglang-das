@@ -1107,8 +1107,8 @@ def _fused_moe_kernel_sequence(
                 if filter_expert:
                     swiglu_limit_for_triton = swiglu_limit
                 else:
-                    assert _is_cuda or _is_xpu, (
-                        "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
+                    assert _is_cuda or _is_xpu or _is_hip, (
+                        "fused silu_and_mul_clamp requires CUDA/HIP/XPU"
                     )
                     swiglu_limit_for_silu_and_mul_clamp = swiglu_limit
             else:
@@ -1121,13 +1121,23 @@ def _fused_moe_kernel_sequence(
 
             if not filter_expert:
                 if swiglu_limit_for_silu_and_mul_clamp is not None:
-                    from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
+                    _clamped = intermediate_cache1.view(-1, N)
+                    try:
+                        from sglang.kernels.ops.attention.dsv4 import silu_and_mul_clamp
 
-                    silu_and_mul_clamp(
-                        intermediate_cache1.view(-1, N),
-                        intermediate_cache2,
-                        swiglu_limit_for_silu_and_mul_clamp,
-                    )
+                        silu_and_mul_clamp(
+                            _clamped,
+                            intermediate_cache2,
+                            swiglu_limit_for_silu_and_mul_clamp,
+                        )
+                    except Exception:
+                        # 兜底：显式 clamp 后再普通 silu_and_mul（语义等价：
+                        # gate 截到 <=limit，up 截到 [-limit, limit]）。
+                        _limit = float(swiglu_limit_for_silu_and_mul_clamp)
+                        _gate, _up = _clamped.chunk(2, dim=-1)
+                        _gate.clamp_(max=_limit)
+                        _up.clamp_(min=-_limit, max=_limit)
+                        silu_and_mul(_clamped, intermediate_cache2)
                 else:
                     silu_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
             else:
