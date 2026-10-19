@@ -67,6 +67,9 @@ class MockTokenizerManager:
         self.generate_request = Mock()
         self.create_abort_task = Mock()
 
+    async def run_tokenizer_offload(self, fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
     def config_value(self, name: str):
         """The value in effect for one config field."""
         if name in self._config_overrides:
