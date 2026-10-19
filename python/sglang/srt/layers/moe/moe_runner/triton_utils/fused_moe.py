@@ -1117,17 +1117,6 @@ def _fused_moe_kernel_sequence(
                 intermediate_cache1[:, :half].clamp_(max=swiglu_limit)
                 intermediate_cache1[:, half:].clamp_(
                     min=-swiglu_limit, max=swiglu_limit
-                # HCU(gfx936)/HIP 补丁：单机 TP8 时所有专家都在本地
-                # (num_local_experts == num_experts) ⇒ filter_expert=False，
-                # 于是走到 fused silu_and_mul_clamp。原断言只允许 CUDA/XPU，
-                # 会让每次单机启动在 CUDA graph 捕获阶段直接 abort：
-                #   AssertionError: fused silu_and_mul_clamp kernel is CUDA/XPU
-                #   only; HIP must disable SWIGLU_CLAMP_FUSION
-                # 但该 kernel 实际是 load_jit 的 CUDA/HIP 模块，本 build 可用
-                # —— dense MLP 路径 (deepseek_v2.py 的 silu_and_mul_clamp)
-                # 用同一个 swiglu_limit=10.0 早已在跑。故放开 HIP。
-                assert _is_cuda or _is_xpu or _is_hip, (
-                    "fused silu_and_mul_clamp kernel is CUDA/XPU only; HIP must disable SWIGLU_CLAMP_FUSION"
                 )
 
             if not filter_expert:
