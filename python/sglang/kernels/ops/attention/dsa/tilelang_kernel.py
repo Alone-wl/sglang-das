@@ -166,12 +166,14 @@ def act_quant(
     s = x.new_empty(*x.size()[:-1], N // block_size, dtype=torch.float32)
     if _is_hcu:
         from lightop import op
+
         use_ue8m0 = scale_fmt is not None
         op.per_token_group_quant_fp8(y, x, s, block_size, 1e-5, use_ue8m0)
     else:
         kernel = act_quant_kernel(N, round_scale=scale_fmt is not None)
         kernel(x.view(-1, N), y.view(-1, N), s.view(-1, N // block_size))
     return y, s
+
 
 @tilelang.jit(out_idx=[4], pass_configs=pass_configs)
 def fp8_index_kernel(h: int, d: int, clear_accum=True):
@@ -1375,12 +1377,15 @@ def tilelang_sparse_fwd(
     topk = indices.shape[-1]
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
-    if _is_hip:
-        is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if _is_hip or is_fp8_kv:
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
-            if _is_gfx95_supported:
+            if not _is_hip:
+                block_I, threads, block_per_cu = 32, 128, 1
+                cu = torch.cuda.get_device_properties(q.device).multi_processor_count
+            elif _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304

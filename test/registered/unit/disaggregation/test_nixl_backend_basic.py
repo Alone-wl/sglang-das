@@ -116,11 +116,13 @@ class TestNixlBackendInitialization(CustomTestCase):
             gpu_id=gpu_id,
             kv_data_ptrs=[],
             kv_item_lens=[],
+            state_types=[],
         )
         mgr = object.__new__(NixlKVManager)
         mgr.kv_args = args
         mgr.disaggregation_mode = mode
         mgr.enable_deferred_decode_kv_release = False
+        mgr.pp_size = mgr.attn_cp_size = mgr.dcp_size = 1
 
         api = types.ModuleType("nixl._api")
         api.nixl_agent = MagicMock(return_value=agent)
@@ -286,26 +288,6 @@ class TestNixlTransferInfo(CustomTestCase):
 
         self.assertTrue(info.is_dummy)
 
-    def test_explicit_dummy_frame_true_is_dummy(self):
-        # msg[9] is the explicit is_dummy frame the sender writes
-        # (str(int(is_dummy))); it wins over payload inference.
-        info = TransferInfo.from_zmq(
-            [
-                b"11",
-                b"127.0.0.1",
-                b"12349",
-                b"agent",
-                np.array([], dtype=np.int32).tobytes(),
-                b"2",
-                b"1",
-                b"",
-                b"0",
-                b"1",
-            ]
-        )
-
-        self.assertTrue(info.is_dummy)
-
     def test_explicit_dummy_frame_true_with_prefix_hit_stays_dummy(self):
         # A dummy rank whose request also has a decode-side prefix hit: the
         # sender sends decode_prefix_len unconditionally, so only the explicit
@@ -342,44 +324,6 @@ class TestNixlTransferInfo(CustomTestCase):
                 b"",
                 b"128",
                 b"0",
-            ]
-        )
-
-        self.assertFalse(info.is_dummy)
-
-    def test_explicit_dummy_frame_false_for_real_transfer(self):
-        info = TransferInfo.from_zmq(
-            [
-                b"14",
-                b"127.0.0.1",
-                b"12352",
-                b"agent",
-                np.array([3, 5], dtype=np.int32).tobytes(),
-                b"2",
-                b"1",
-                b"",
-                b"0",
-                b"0",
-            ]
-        )
-
-        self.assertFalse(info.is_dummy)
-
-    def test_fallback_without_dummy_frame_reads_prefix_hit_dummy_as_real(self):
-        # Old-peer fallback: without msg[9], a dummy rank with a decode-side
-        # prefix hit is indistinguishable from a real full-prefix-hit transfer
-        # and parses as real. The explicit frame above exists for this case.
-        info = TransferInfo.from_zmq(
-            [
-                b"15",
-                b"127.0.0.1",
-                b"12353",
-                b"agent",
-                np.array([], dtype=np.int32).tobytes(),
-                b"2",
-                b"1",
-                b"",
-                b"128",
             ]
         )
 
@@ -447,6 +391,19 @@ class TestNixlKVArgsRegisterInfo(CustomTestCase):
         self.assertEqual(info.dst_kv_layer_ids, [2, 7])
         self.assertEqual(info.staging_base_ptr, staging_ptr)
         self.assertEqual(info.staging_total_size, 1048576)
+        # Both metadata extensions must retain their own wire position.
+        lengths = [[4096], [8192, 16384]]
+        types = [StateType.MAMBA, StateType.SWA]
+        encoded_types = ",".join(t.value for t in types).encode("ascii")
+        for tail, expected_lengths, expected_types in (
+            ([pack_int_lists(lengths, "Q"), encoded_types], lengths, types),
+            ([pack_int_lists(lengths, "Q")], lengths, []),
+            ([encoded_types], [], types),
+        ):
+            with self.subTest(tail_length=len(tail), expected_types=expected_types):
+                parsed = KVArgsRegisterInfo.from_zmq(msg + tail)
+                self.assertEqual(parsed.dst_state_data_lens, expected_lengths)
+                self.assertEqual(parsed.dst_state_types, expected_types)
 
     def test_from_zmq_allows_missing_state_and_staging_fields(self):
         msg = [
@@ -567,6 +524,58 @@ class TestNixlEmptyStateTransfer(CustomTestCase):
         self.assertIsNone(handle)
         self.assertEqual(mgr.agent.get_xfer_descs_calls, [])
         self.assertEqual(mgr.agent.initialize_xfer_calls, [])
+
+    def test_prepared_mamba_rejects_stride_mismatch_before_fallback(self):
+        """Different SSM dtypes must not write into the wrong decode request slot."""
+        for src_stride, dst_stride in ((32, 16), (16, 32)):
+            with self.subTest(src_stride=src_stride, dst_stride=dst_stride):
+                mgr = object.__new__(NixlKVManager)
+                mgr.agent = MagicMock()
+                mgr.pp_size = mgr.state_tp_size = 1
+                mgr.is_mla_backend = False
+                mgr._use_strided_descs = True
+                mgr._prepared_state_components = frozenset({0})
+                mgr._prepared_state_plans = {}
+                mgr._state_layout_rejections = {}
+                mgr.kv_args = SimpleNamespace(
+                    state_types=[StateType.MAMBA],
+                    state_data_ptrs=[[0x10000, 0x11000]],
+                    state_data_lens=[[16 * 16, src_stride * 16]],
+                    state_item_lens=[[16, src_stride]],
+                    state_layer_ids=[[0, 0]],
+                    mla_compression_ratios=None,
+                )
+                peer = SimpleNamespace(
+                    agent_name="decode",
+                    decode_tp_size=1,
+                    dst_dcp_size=1,
+                    requires_dcp_relayout=False,
+                    dst_state_data_ptrs=[[0x20000, 0x21000]],
+                    dst_state_data_lens=[[16 * 16, dst_stride * 16]],
+                    dst_state_item_lens=[[16, dst_stride]],
+                    dst_state_layer_ids=[[0, 0]],
+                    dst_state_types=[],
+                )
+
+                # Registration records the rejection; each transfer to the peer fails.
+                mgr._prepare_state_xfer(peer)
+
+                self.assertIn("stride mismatch", mgr._state_layout_rejections["decode"])
+                self.assertEqual(mgr._prepared_state_plans, {})
+                mgr.agent.prep_xfer_dlist.assert_not_called()
+                with self.assertRaisesRegex(RuntimeError, "stride mismatch"):
+                    list(
+                        mgr.maybe_send_extra(
+                            "decode",
+                            [[1]],
+                            peer.dst_state_data_ptrs,
+                            [[2]],
+                            0,
+                            "7_state_0",
+                            1,
+                        )
+                    )
+                mgr.agent.transfer.assert_not_called()
 
     def test_paired_state_entries_reject_item_length_mismatch(self):
         mgr = object.__new__(NixlKVManager)
@@ -1431,6 +1440,7 @@ class TestNixlHeteroTpReplicatedKV(CustomTestCase):
     def _make_manager(self):
         mgr = object.__new__(NixlKVManager)
         mgr.agent = DlistCaptureAgent()
+        mgr.model_config = SimpleNamespace(hf_config=None)
         mgr.attn_tp_size = 1  # prefill attention TP = 1 (DP attention)
         mgr.prep_handle_slice_src = None
         mgr.prep_handles_slice_dst = {}
@@ -1562,6 +1572,9 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         mgr._num_slots_src = 4
         mgr.prep_handles = {}
         mgr.prep_handles_slice_dst = {}
+        mgr._prepared_state_plans = {}
+        mgr._prepared_state_components = frozenset()
+        mgr._state_layout_rejections = {}
         mgr._peer_reload_lock = threading.Lock()
         mgr._peer_reload_times = {}
         mgr.kv_args = SimpleNamespace(

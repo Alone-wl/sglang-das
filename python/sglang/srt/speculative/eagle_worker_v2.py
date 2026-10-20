@@ -57,12 +57,17 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode, ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import (
+    CaptureHiddenMode,
+    ForwardBatch,
+    ForwardMode,
+)
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_loader.weight_utils import get_pp_stage_load_group
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
@@ -208,6 +213,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         self.draft_owns_attention = (
             get_parallel().attn_dp_enabled and self.speculative_algorithm.is_eagle3()
         )
+        # Only the last target PP stage loads the draft. Capture its TP group
+        # before draft_pp_context hides the target's pipeline topology.
+        load_group = get_pp_stage_load_group()
         with (
             draft_tp_context(self.draft_owns_attention),
             draft_pp_context(),
@@ -223,6 +231,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 # The draft runs at absolute target positions.
                 context_length=target_worker.model_runner.model_config.context_len,
                 random_seed=target_worker.random_seed,
+                load_group=load_group,
             )
 
         # Alias for better readability
@@ -610,6 +619,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 NativeSparseAttnBackend,
             )
 
+            from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+                QwenSparseAttnBackend,
+            )
+
             supports_hip_draft_extend_graph = (
                 isinstance(self.draft_attn_backend, AiterMultiStepDraftBackend)
                 or isinstance(self.draft_extend_attn_backend, DeepseekV4HipRadixBackend)
@@ -617,6 +630,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     self.draft_extend_attn_backend,
                     (DeepseekSparseAttnBackend, NativeSparseAttnBackend),
                 )
+                or isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
             )
 
         graph_supported_backend_types = [
@@ -828,13 +842,13 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             self.topk == 1
             and topk_index.shape[0] <= self._topk1_parents_prealloc.shape[0]
         )
-        # Materialize the chain directly only when the CUDA kernel can write
+        # Materialize the chain directly only when the Triton kernel can write
         # every subsequent column. Other topk=1 paths retain the token list and
         # assemble it with one final cat instead of launching a copy per step.
         draft_tokens_topk1 = None
         if (
             topk1_chain_fits
-            and _is_cuda
+            and (_is_cuda or _is_hip)
             and self.hot_token_id is None
             and not needs_draft_probs
         ):
@@ -899,7 +913,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 maybe_detect_inf(
                     logits_output.next_token_logits, f"draft_forward step {i}"
                 )
-                if not needs_draft_probs and logits_output.draft_top1_token_ids is not None:
+                if (
+                    not needs_draft_probs
+                    and logits_output.draft_top1_token_ids is not None
+                ):
                     topk_p = logits_output.draft_top1_probs
                     topk_index = logits_output.draft_top1_token_ids
                     forward_batch.positions.add_(1)

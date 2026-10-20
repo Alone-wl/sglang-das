@@ -16,7 +16,16 @@ from __future__ import annotations
 
 import logging
 from contextlib import nullcontext
-from typing import List, Literal, NamedTuple, Optional, Sequence, Tuple, Union
+from typing import (
+    FrozenSet,
+    List,
+    Literal,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import torch
 
@@ -54,8 +63,10 @@ from sglang.srt.layers.attention.hip_flash_mla import resolve_hip_flashmla_backe
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.memory_pool import KVCache
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import get_exec, get_platform, get_spec
 from sglang.srt.utils import ceil_div, is_gfx95_supported, is_hcu, is_hip
+from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +148,31 @@ def get_compress_state_write_pad(compress_ratio: int, ring_size: int) -> int:
     return ring_size - window_size + 2 if ring_size > window_size else 0
 
 
+def is_dspark_spec() -> bool:
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec_algorithm = get_spec().speculative_algorithm
+    return (
+        spec_algorithm is not None
+        and SpeculativeAlgorithm.from_string(spec_algorithm).is_dspark()
+    )
+
+
+def uses_draft_swa_ring() -> bool:
+    """Whether the DSpark draft keeps its SWA KV in a per-request ring, so no SWA
+    state is tree-owned under encoder replay. The HIP backend still addresses the
+    draft SWA through the target's paged full-to-SWA mapping."""
+    return get_exec().features.enable_encoder_swa_bounded_replay and not _is_hip
+
+
+def get_draft_swa_ring_size(
+    sliding_window: int, max_draft_tokens: int, page_size: int
+) -> int:
+    # A draft block and a verify commit write past the committed window; whole
+    # pages match the target request window's rows, so PD sends both as one list.
+    return ceil_div(sliding_window + max_draft_tokens, page_size) * page_size
+
+
 def get_swa_ring_size(sliding_window: int, is_speculative: bool = False) -> int:
     # A verify batch writes its draft tokens ahead of the committed position.
     spec_extra = (get_spec().speculative_num_draft_tokens - 1) if is_speculative else 0
@@ -193,6 +229,8 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     AITER attention."""
     mode = envs.SGLANG_DSV4_KV_LAYOUT.get().lower()
     option = envs.SGLANG_DSV4_COMPRESSED_KV_LAYOUT.get().lower()
+    if get_exec().kernel.dsv4_attn_backend == "flashmla_mega":
+        mode = "v41"
     if get_exec().kernel.dsv4_attn_backend == "trtllm":
         assert mode in ("auto", "v4") and option in ("auto", "fp8"), (
             "trtllm uses uniform FP8 pools, not the packed V4.1 KV layouts"
@@ -657,6 +695,11 @@ class DeepSeekV4IndexerPool(KVCache):
                 use_fp4_indexer=self.use_fp4_indexer,
             )
 
+        # aiter's row-group page-8 layout inside each page (pack_kv_cache): page size and shapes
+        # are unchanged but the bytes are not, so PD peers must use the same layout and a
+        # persisted cache written under the other one must be cleared before switching
+        self.index_k_page8 = False
+
         self._create_buffer()
 
     def get_bytes_per_token(self) -> int:
@@ -839,6 +882,7 @@ class DeepSeekV4IndexerPool(KVCache):
                 loc,
                 page_size=self.page_size,
                 rne=self.index_k_rne,
+                page8=self.index_k_page8,
             )
         from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
             store_fp4_index_k_cache,
@@ -1231,13 +1275,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         self.request_window = None
+        self.full_to_swa_index_mapping = None
+        # Per req slot, the first position whose draft SWA rows this request
+        # wrote: the ring restarts at the cached prefix, and a PD decode receives
+        # the prefill's mark as request-row state.
+        self.swa_valid_from: Optional[torch.Tensor] = None
         encoder_replay = get_exec().features.enable_encoder_swa_bounded_replay
-        # DSpark's draft shares the target's full-to-SWA mapping, so the target
-        # keeps its paged SWA allocator even under encoder replay.
-        self.needs_paged_swa_allocator = (
-            not encoder_replay
-            or is_draft_worker
-            or get_spec().speculative_algorithm is not None
+        # Under encoder replay the target keeps SWA in a per-request window. A
+        # draft without its own ring still reads the target's full-to-SWA mapping,
+        # so the target then keeps its paged SWA allocator.
+        self.needs_paged_swa_allocator = not encoder_replay or (
+            not uses_draft_swa_ring() and get_spec().speculative_algorithm is not None
         )
         if encoder_replay and not is_draft_worker:
             from sglang.srt.mem_cache.dsv41_request_window import RequestWindow
@@ -1259,6 +1307,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             from sglang.srt.runtime_context import get_schedule
 
             chunk = get_schedule().chunked_prefill_size or 0
+            # A prefill graph pads its layouts to the captured bucket, which can
+            # exceed this rank's chunk (DP attention divides the chunk budget).
+            graph_config = get_exec().graph.cuda_graph_config
+            prefill_graph = graph_config.prefill if graph_config is not None else None
+            graph_rows = (
+                get_cuda_graph_max_batch_size(max(prefill_graph.bs))
+                if prefill_graph is not None
+                and prefill_graph.backend == Backend.BREAKABLE
+                and prefill_graph.bs
+                else 0
+            )
             self.request_window = RequestWindow(
                 make_window_pool,
                 num_slots=self.num_req_slots,
@@ -1268,8 +1327,27 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 workspace_rows=(self.num_req_slots + 1) * self.sliding_window
                 + max(
                     chunk,
+                    graph_rows,
                     (self.num_req_slots + 1) * (1 + (online_mtp_max_draft_tokens or 0)),
                 ),
+            )
+        elif uses_draft_swa_ring():
+            # The DSpark draft writes SWA rows only from target hidden states, never
+            # while attending, so it addresses its ring directly with no workspace.
+            self.unified_kv_pool = None
+            self.swa_req_ring_size = get_draft_swa_ring_size(
+                self.sliding_window, online_mtp_max_draft_tokens or 0, swa_page_size
+            )
+            self.swa_kv_pool = self._make_kv_pool(
+                size=self.num_req_slots * self.swa_req_ring_size,
+                page_size=swa_kv_page_size,
+                dtype=dtype,
+                layer_num=stage_layer_num,
+                device=device,
+                enable_memory_saver=enable_memory_saver,
+                global_page_size=swa_page_size,
+                kv_layout=self.kv_layout,
+                cls=kv_pool_cls,
             )
         elif self._unified_kv:
             assert self.kv_layout is KVLayout.V4, (
@@ -1317,10 +1395,33 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 cls=kv_pool_cls,
             )
 
+        if (
+            is_draft_worker
+            and not _is_hip
+            and self.swa_kv_pool is not None
+            and is_dspark_spec()
+        ):
+            # Kept for the ring and for paged SWA alike, so both PD roles
+            # register it; it stays 0 unless the ring restarts or PD writes it.
+            with (
+                torch.cuda.use_mem_pool(self.custom_mem_pool)
+                if self.custom_mem_pool
+                else nullcontext()
+            ):
+                self.swa_valid_from = torch.zeros(
+                    self.num_req_slots, dtype=torch.int64, device=device
+                )
+
+        if self.request_window is not None:
+            swa_storage = "request_window"
+        elif self.swa_req_ring_size is not None:
+            swa_storage = "ring"
+        else:
+            swa_storage = "paged"
         logger.info(
             "DSV4 SWA storage: worker=%s, storage=%s, paged_allocator=%s",
             "draft" if is_draft_worker else "target",
-            "request_window" if self.request_window is not None else "paged",
+            swa_storage,
             self.needs_paged_swa_allocator,
         )
         self.full_size = full_size
@@ -1346,9 +1447,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.present_ratios: Tuple[int, ...] = tuple(
             ratio for ratio in sorted(self.kv_pools) if ratio in model_ratios
         )
-        self.use_int8_index_k_cache = (
-            self.c4_indexer_kv_pool.use_int8_index_k_cache
-        )
+        self.use_int8_index_k_cache = self.c4_indexer_kv_pool.use_int8_index_k_cache
 
         self._init_compressed_layer_mapping()
 
@@ -1391,6 +1490,18 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             if ratio == 128
         ]
         return c4_layer_ids + c4_layer_ids + c128_layer_ids
+
+    def set_swa_valid_from(self, slots: torch.Tensor, valid_from: torch.Tensor) -> None:
+        """The draft SWA rows of ``slots`` below ``valid_from`` are not this
+        request's: the slot's previous owner wrote them, or no one did."""
+        self.swa_valid_from[slots] = valid_from
+
+    def get_swa_valid_from_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """The draft SWA valid-from, which PD sends as request-row state."""
+        if self.swa_valid_from is None:
+            return [], [], []
+        mark = self.swa_valid_from
+        return [mark.data_ptr()], [mark.nbytes], [mark[0].nbytes]
 
     def get_contiguous_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         data_ptrs: List[int] = []
@@ -1547,11 +1658,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         data_lens: List[int] = []
         item_lens: List[int] = []
 
-        if self.swa_kv_pool is not None:
-            physical_pages_per_logical_page = (
-                self.swa_page_size // self.swa_kv_pool.page_size
-            )
-            for buf in self.swa_kv_pool.kv_buffer:
+        # Under encoder replay the target's SWA lives in the request window, whose
+        # pages pair with decode's paged SWA pages (RequestWindow.page_indices).
+        swa_pool = (
+            self.request_window.state
+            if self.request_window is not None
+            else self.swa_kv_pool
+        )
+        if swa_pool is not None:
+            physical_pages_per_logical_page = self.swa_page_size // swa_pool.page_size
+            for buf in swa_pool.kv_buffer:
                 assert buf.ndim == 2, f"expected 2D buffer, got {buf.ndim}D"
                 data_ptrs.append(buf.data_ptr())
                 data_lens.append(buf.nbytes)
@@ -1657,6 +1773,19 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     kv_layout=self.compressed_kv_layout(ratio),
                 )
 
+        index_k_page8 = _is_hip and envs.SGLANG_HIP_DSV41_INDEX_K_PAGE8.get()
+        if index_k_page8:
+            from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+                aiter_has_fp4_rowgroup,
+            )
+
+            if not aiter_has_fp4_rowgroup():
+                logger.warning(
+                    "SGLANG_HIP_DSV41_INDEX_K_PAGE8 is set but the installed AITER has "
+                    "no row-group FP4 MQA logits kernel (#6145); keeping the page-64 "
+                    "index-K pool."
+                )
+                index_k_page8 = False
         self.index_pools: dict[int, DeepSeekV4IndexerPool] = {
             ratio: self._make_indexer_pool(
                 config.indexer_size,
@@ -1683,6 +1812,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device,
                 enable_memory_saver,
                 force_fp4=True,
+                # only the candidate consumers (ratio 1) score a subset of blocks
+                index_k_page8=ratio == 1 and index_k_page8,
             )
 
         # HiCache and hardware backends still read these per-ratio attributes.
@@ -1729,6 +1860,16 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         assert is_valid_kv_layout_pair(self.kv_layout, layout)
         return layout
 
+    def pd_kv_layout(self) -> str:
+        """The main and compressed KV layouts, which PD peers must share."""
+        if self.uniform_fp8:
+            return KVLayout.UNIFORM_FP8.value
+        compressed = [
+            f"c{ratio}:{self.compressed_kv_layout(ratio).value}"
+            for ratio in sorted(set(self.compression_ratios) - {0})
+        ]
+        return ",".join([self.kv_layout.value, *compressed])
+
     def _make_indexer_pool(
         self,
         size: int,
@@ -1740,6 +1881,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         enable_memory_saver: bool,
         force_fp4: bool = False,
         global_page_size: Optional[int] = None,
+        index_k_page8: bool = False,
     ) -> DeepSeekV4IndexerPool:
         """Build the c4 lightning-indexer K pool (packed CUDA layout).
         Overridden by :class:`DSV4NPUTokenToKVPool` to swap in the
@@ -1760,6 +1902,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             )
             # The dsv41 low-ratio indexer rounds to nearest even (reference rounding).
             pool.index_k_rne = True
+            pool.index_k_page8 = index_k_page8
             return pool
         return DeepSeekV4IndexerPool(
             size,
@@ -2121,6 +2264,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         compress_ratio, _, _ = self.layer_mapping[layer_id]
         return self._indexer_pool(compress_ratio).uses_aiter_fp4_layout
 
+    def low_ratio_index_k_page8(self, layer_id: int) -> bool:
+        """Whether the layer's split index-K pool lays each page out as row-group 8-slot pages."""
+        compress_ratio, _, _ = self.layer_mapping[layer_id]
+        return self._indexer_pool(compress_ratio).index_k_page8
+
+    def low_ratio_index_k_page8_ratios(self) -> FrozenSet[int]:
+        """The compression ratios whose index-K pool is in the page-8 layout."""
+        return frozenset(
+            ratio for ratio, pool in self.index_pools.items() if pool.index_k_page8
+        )
+
     def get_index_k_fp4_payload_buffer(self, layer_id: int) -> torch.Tensor:
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
@@ -2139,9 +2293,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
-        return self.c4_indexer_kv_pool.get_index_k_int8_packed_buffer(
-            compress_layer_id
-        )
+        return self.c4_indexer_kv_pool.get_index_k_int8_packed_buffer(compress_layer_id)
 
     def get_index_k_scale_buffer(
         self,
@@ -2181,9 +2333,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
     ) -> None:
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         assert compress_ratio == 4, f"only c4 has indexer, got {compress_ratio = }"
-        self.c4_indexer_kv_pool.set_index_int8(
-            compress_layer_id, loc, cache_k
-        )
+        self.c4_indexer_kv_pool.set_index_int8(compress_layer_id, loc, cache_k)
 
     def get_key_buffer(self, layer_id: int) -> torch.Tensor:
         raise NotImplementedError()

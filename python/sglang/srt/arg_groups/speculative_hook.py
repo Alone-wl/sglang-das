@@ -167,6 +167,19 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
+    # Check the final algorithm: NEXTN aliases EAGLE, while Gemma4 drafts promote
+    # EAGLE/NEXTN to FROZEN_KV_MTP.
+    if (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_radix_cache
+        and cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE", "EAGLE3")
+    ):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with speculative decoding "
+            f"(--speculative-algorithm {cfg.speculative_algorithm})"
+        )
+
     if cfg.speculative_use_block_verification:
         if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
             raise ValueError(
@@ -243,12 +256,6 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 "handle_speculative_decoding.custom_validate",
                 algo.validate_server_args,
             )
-
-    if cfg.speculative_skip_dp_mlp_sync:
-        assert cfg.speculative_algorithm == "EAGLE", (
-            "--speculative-skip-dp-mlp-sync is only supported with "
-            f"speculative_algorithm == EAGLE, got {cfg.speculative_algorithm}."
-        )
 
     if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
         if (
@@ -694,10 +701,10 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     from sglang.srt.utils.common import is_hcu
 
     _is_hcu_device = is_hcu()
-    if not cfg.device.startswith(("cuda", "npu")):
+    if not cfg.device.startswith(("cuda", "npu", "xpu")):
         if not _is_hcu_device:
             raise ValueError(
-                "DSpark speculative decoding only supports CUDA, NPU and HCU devices."
+                "DSpark speculative decoding only supports CUDA, NPU, XPU and HCU devices."
             )
 
     pd_prefill_cp = _is_supported_dspark_pd_prefill_cp(server_args)
@@ -714,9 +721,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.attn_dp_size > 1 and not pd_prefill_cp:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        supports_target_moe = cfg.moe_a2a_backend in (
-            "none", "megamoe", "mori"
-        ) or (
+        supports_target_moe = cfg.moe_a2a_backend in ("none", "megamoe", "mori") or (
             cfg.moe_a2a_backend == "deepep"
             # HCU serves DeepEP with its own runners (marlin/aiter/...).
             and (_is_hcu_device or cfg.moe_runner_backend == "deep_gemm")
@@ -752,8 +757,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             else cfg.moe_runner_backend
         )
         supports_draft_moe = draft_a2a in ("none", "megamoe", "mori") or (
-            draft_a2a == "deepep"
-            and (_is_hcu_device or draft_runner == "deep_gemm")
+            draft_a2a == "deepep" and (_is_hcu_device or draft_runner == "deep_gemm")
         )
         if not supports_draft_moe:
             raise ValueError(
@@ -1003,6 +1007,9 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         all_causal = getattr(draft_text_config, "is_causal", False) is True
         if not (all_sliding or all_causal):
             fallback_backend = get_fallback_backend()
+            # Preserve the CUDA FA4 path without overriding out-of-tree defaults.
+            if not current_platform.is_out_of_tree() and get_platform().is_sm100:
+                fallback_backend = "fa4"
             logger.warning(
                 "DFLASH only enables 'trtllm_mha' when all layers use sliding "
                 "attention or the draft is explicitly causal; got "

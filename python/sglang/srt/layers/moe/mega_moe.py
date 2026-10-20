@@ -40,6 +40,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.models.deepseek_common.utils import _device_sm
 from sglang.srt.runtime_context import get_disagg, get_exec
 from sglang.srt.utils import is_hcu, is_hip, is_sm100_supported
+from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 
 if TYPE_CHECKING:
     from deep_gemm import SymmBuffer
@@ -281,8 +282,12 @@ def _use_amd_flydsl_mega_moe() -> bool:
 def _mega_moe_mma_type(experts) -> str:
     if _is_hcu:
         # HCU W4A8 experts predate upstream per-layer NVFP4/W4A4 flags.
-        return "nvfp4xnvfp4" if getattr(experts, "_mega_moe_nvfp4", False) else (
-            "mxf4xmxf4" if getattr(experts, "_mega_moe_w4a4", False) else "fp8xfp4"
+        return (
+            "nvfp4xnvfp4"
+            if getattr(experts, "_mega_moe_nvfp4", False)
+            else (
+                "mxf4xmxf4" if getattr(experts, "_mega_moe_w4a4", False) else "fp8xfp4"
+            )
         )
     if experts._mega_moe_nvfp4:
         return "nvfp4xnvfp4"
@@ -328,14 +333,19 @@ def _configure_mega_moe_deep_gemm_num_sms(deep_gemm):
 
 
 def check_mega_moe_shapes(hidden: int, intermediate: int, mma_type: str) -> None:
-    # DeepGEMM keeps one scale row per token and needs 16-byte TMA alignment
-    # on it (layout/mega_moe.cuh), so both dims must be multiples of 16 * group.
+    # SGLang's pre-dispatch requires 16-byte input SF rows (hidden % 512).
+    # The pinned DeepGEMM FP8/FP4 path copies intermediate scales separately
+    # from token TMA loads, so intermediate % 128 suffices, including V4.1
+    # Flash's 2304-wide intermediate dimension.
+    # Keep the existing restrictions on the other MMA paths.
     scale_group = 16 if mma_type == "nvfp4xnvfp4" else 32
-    align = 16 * scale_group
-    if hidden % align != 0 or intermediate % align != 0:
+    align = 128 if mma_type == "fp8xfp4" else 16 * scale_group
+    hidden_align = 16 * scale_group
+    if hidden % hidden_align != 0 or intermediate % align != 0:
         raise ValueError(
-            f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size and "
-            f"moe_intermediate_size to be multiples of {align}; got "
+            f"DeepGEMM MegaMoE ({mma_type}) needs hidden_size to be a multiple "
+            f"of {hidden_align} and moe_intermediate_size to be a multiple of "
+            f"{align}; got "
             f"hidden_size={hidden}, moe_intermediate_size={intermediate}. "
             "Use another --moe-a2a-backend for this model."
         )
@@ -471,7 +481,8 @@ def should_fuse_mega_moe_shared_experts(moe: DeepseekV2MoE) -> bool:
         and is_sm100_supported()
         and _mega_moe_mma_type(moe.experts) == "fp8xfp4"
         and moe.shared_experts_is_fp8
-        and moe.shared_experts_weight_block_size == [128, 128]
+        and moe.shared_experts_weight_block_size is not None
+        and moe.shared_experts_weight_block_size[1] % 32 == 0
     )
 
 
@@ -522,7 +533,8 @@ def forward_mega_moe(
         overlap_stream.wait_stream(current_stream)
         if eager_w4a8_overlap:
             for tensor in (
-                hidden_states, input_ids_global,
+                hidden_states,
+                input_ids_global,
                 getattr(forward_batch, "num_token_non_padded", None),
             ):
                 if isinstance(tensor, torch.Tensor) and tensor.is_cuda:
@@ -573,19 +585,31 @@ def _run_mega_routed(
     if num_tokens > 0:
         router_logits = moe.gate(hidden_states, forward_batch=forward_batch)
         topk_kwargs = {"input_ids": input_ids_global} if moe.is_hash else {}
-        topk_output = moe.topk(
-            hidden_states,
-            router_logits,
-            num_token_non_padded=(
-                forward_batch.moe_num_token_non_padded()
-                if forward_batch is not None
-                else None
-            ),
-            expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                layer_id=moe.layer_id,
-            ),
-            **topk_kwargs,
+        num_token_non_padded = (
+            forward_batch.moe_num_token_non_padded()
+            if forward_batch is not None
+            else None
         )
+        dispatch_info = ExpertLocationDispatchInfo.init_new(layer_id=moe.layer_id)
+        if (
+            not moe.is_hash
+            and getattr(moe.gate, "e_score_correction_bias_vl", None) is not None
+        ):
+            topk_output = vision_topk(
+                moe,
+                router_logits,
+                input_ids_global,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+            )
+        else:
+            topk_output = moe.topk(
+                hidden_states,
+                router_logits,
+                num_token_non_padded=num_token_non_padded,
+                expert_location_dispatch_info=dispatch_info,
+                **topk_kwargs,
+            )
         topk_ids = topk_output.topk_ids
         topk_weights = topk_output.topk_weights
     else:
@@ -692,9 +716,7 @@ def run_mega_routed_experts(
         runtime=runtime,
         cuda_graph_max_tokens_per_rank=cuda_graph_max_tokens_per_rank,
         quant_mode=(
-            "w4a8"
-            if getattr(experts, "_mega_moe_hcu_w4a8_weights", False)
-            else "fp8"
+            "w4a8" if getattr(experts, "_mega_moe_hcu_w4a8_weights", False) else "fp8"
         ),
     )
 
@@ -939,9 +961,7 @@ def _run_standalone_hcu_w8a8_mega_moe(
         experts.mega_l2_weights,
         buf,
         cumulative_local_expert_recv_stats=(
-            None
-            if is_graph_capture
-            else getattr(experts, "mega_moe_recv_stats", None)
+            None if is_graph_capture else getattr(experts, "mega_moe_recv_stats", None)
         ),
         activation_clamp=activation_clamp,
         fast_math=True,
@@ -983,31 +1003,49 @@ def build_hcu_w4a8_mega_moe_experts_weights(experts) -> None:
     if getattr(experts, "_mega_moe_weights_built", False):
         return
     if not _is_hcu or get_hcu_mega_moe_runtime() != "megamoe":
-        raise ValueError("W4A8 MegaMoE requires HCU and SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe")
+        raise ValueError(
+            "W4A8 MegaMoE requires HCU and SGLANG_HCU_MEGA_MOE_RUNTIME=megamoe"
+        )
     if get_exec().moe.enable_eplb:
-        raise ValueError("W4A8 MegaMoE supports offline EPLB via --init-expert-location; online EPLB is unsupported")
+        raise ValueError(
+            "W4A8 MegaMoE supports offline EPLB via --init-expert-location; online EPLB is unsupported"
+        )
     if not get_exec().graph.disable_cuda_graph:
         raise ValueError("W4A8 MegaMoE prefill currently requires --disable-cuda-graph")
     # The loader has already placed logical experts into the static physical
     # slots. Repack each slot independently without changing expert order.
     for name in ("w13_weight", "w2_weight"):
         weight = getattr(experts, name)
-        setattr(experts, name, torch.nn.Parameter(
-            pack_w4a8_moe_hipc_weight(weight.data), requires_grad=False,
-        ))
+        setattr(
+            experts,
+            name,
+            torch.nn.Parameter(
+                pack_w4a8_moe_hipc_weight(weight.data),
+                requires_grad=False,
+            ),
+        )
     for name in ("w13_weight_scale", "w2_weight_scale"):
         scale = getattr(experts, name)
-        setattr(experts, name, torch.nn.Parameter(scale.data * 16.0, requires_grad=False))
+        setattr(
+            experts, name, torch.nn.Parameter(scale.data * 16.0, requires_grad=False)
+        )
     experts.mega_l1_weights = (experts.w13_weight, experts.w13_weight_scale)
     experts.mega_l2_weights = (experts.w2_weight, experts.w2_weight_scale)
     metadata = get_global_expert_location_metadata()
     if metadata is not None:
         logical_experts = metadata.num_logical_experts
         if logical_experts % 8:
-            raise ValueError("W4A8 MegaMoE canonical reduction requires logical experts divisible by EP8")
+            raise ValueError(
+                "W4A8 MegaMoE canonical reduction requires logical experts divisible by EP8"
+            )
         groups = (
-            metadata.physical_to_logical_map[experts.layer_id] // (logical_experts // 8)
-        ).to(torch.int32).contiguous()
+            (
+                metadata.physical_to_logical_map[experts.layer_id]
+                // (logical_experts // 8)
+            )
+            .to(torch.int32)
+            .contiguous()
+        )
         physical_groups = torch.arange(
             groups.numel(), device=groups.device, dtype=torch.int32
         ) // (groups.numel() // 8)
@@ -1127,6 +1165,16 @@ def build_mega_moe_experts_weights(experts) -> None:
 
         experts.mega_l1_weights = (experts.w13_weight.data, w13_sf_utccp)
         experts.mega_l2_weights = (experts.w2_weight.data, w2_sf_utccp)
+        # EPLB moves each expert's slice of every parameter, so the UTCCP copies
+        # move with the scales they are transposed from.
+        experts.register_parameter(
+            "mega_w13_weight_scale_utccp",
+            torch.nn.Parameter(w13_sf_utccp, requires_grad=False),
+        )
+        experts.register_parameter(
+            "mega_w2_weight_scale_utccp",
+            torch.nn.Parameter(w2_sf_utccp, requires_grad=False),
+        )
     else:
         l1_pair, l2_pair = transform_weights_for_mega_moe((w13, w13_sf), (w2, w2_sf))
 
@@ -1254,6 +1302,8 @@ def build_hcu_w8a8_mega_moe_experts_weights(experts) -> None:
     experts._mega_moe_hcu_runtime = runtime
     experts._mega_moe_hcu_w8a8_weights = True
     experts._mega_moe_weights_built = True
+
+
 def build_mega_moe_shared_weights(
     shared_experts,
 ) -> tuple[tuple[torch.Tensor, torch.Tensor], tuple[torch.Tensor, torch.Tensor]]:
@@ -1278,10 +1328,21 @@ def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:
     if sf.dtype == torch.int32:
         # Requantized for the DeepGEMM linear runner.
         sf = inverse_transform_scale_ue8m0(sf, mn=n)[:, : k // 128]
+        block_m, block_k = 128, 128
+    else:
+        block_m, block_k = linear.quant_method.quant_config.weight_block_size
+    sf = sf.repeat_interleave(block_k // 32, dim=-1)
+    if block_m == 128:
+        return transform_sf_into_required_layout(
+            sf, mn=n, k=k, recipe=(128, 32), disable_ue8m0_cast=False
+        )
+    if block_m != 1:
+        sf = sf.repeat_interleave(block_m, dim=0)
     return transform_sf_into_required_layout(
-        sf.repeat_interleave(4, dim=-1),
+        sf.unsqueeze(0).contiguous(),
         mn=n,
         k=k,
-        recipe=(128, 32),
+        recipe=(1, 32),
+        num_groups=1,
         disable_ue8m0_cast=False,
-    )
+    ).squeeze(0)
