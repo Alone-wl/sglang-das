@@ -33,6 +33,12 @@ from sglang.srt.disaggregation.encoder.receiver import (
     EmbeddingData,
     video_meta_attrs_for,
 )
+from sglang.srt.disaggregation.encoder.transfer_queue import (
+    EncoderAbortRegistry,
+    EncoderTransferQueue,
+    TransferQueueTimeout,
+    TransferRequestReleased,
+)
 from sglang.srt.distributed.parallel_state import (
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
@@ -362,6 +368,10 @@ class ReqState:
     active_sends: int = 0
     release_requested: bool = False
     preserve_metadata_on_release: bool = False
+    created_at: float = field(default_factory=time.monotonic)
+    staged_at: Optional[float] = None
+    release_started_at: Optional[float] = None
+    release_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     embedding_ready: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     lifecycle_condition: asyncio.Condition = field(
         default_factory=asyncio.Condition, repr=False
@@ -645,6 +655,9 @@ class MMEncoder:
         self.mm_cache_lock = asyncio.Lock()
 
         self.send_timeout = envs.SGLANG_ENCODER_SEND_TIMEOUT.get()
+        self.lifecycle_log_interval = envs.SGLANG_ENCODER_LIFECYCLE_LOG_INTERVAL.get()
+        self.lifecycle_trace = envs.SGLANG_ENCODER_LIFECYCLE_TRACE.get()
+        self._lifecycle_probe_task = None
 
         if schedule_path is not None:
             self.schedule_socket = get_zmq_socket(
@@ -693,6 +706,12 @@ class MMEncoder:
                 # default asyncio pool with preprocessing and ZMQ work.
                 transfer_workers = int(
                     os.environ.get("SGLANG_ENCODER_TRANSFER_WORKERS", "10")
+                )
+                self.transfer_queue = EncoderTransferQueue(
+                    transfer_workers, trace=self.lifecycle_trace
+                )
+                self.ack_queue = EncoderTransferQueue(
+                    10, phase="ack", trace=self.lifecycle_trace
                 )
                 self.transfer_executor = concurrent.futures.ThreadPoolExecutor(
                     max_workers=transfer_workers, thread_name_prefix="mc-transfer"
@@ -788,6 +807,89 @@ class MMEncoder:
     def supports_modality(self, modality: Modality) -> bool:
         return self.preprocessor.supports_modality(modality)
 
+    def _trace_lifecycle(self, event: str, state: ReqState) -> None:
+        if getattr(self, "lifecycle_trace", False):
+            logger.info(
+                "Encoder request lifecycle event=%s req_id=%s age_s=%.3f "
+                "active_encodes=%d active_sends=%d release_requested=%s "
+                "embedding_bytes=%d",
+                event,
+                state.req_id,
+                time.monotonic() - state.created_at,
+                state.active_encodes,
+                state.active_sends,
+                state.release_requested,
+                (
+                    state.embedding_data.embedding.nbytes
+                    if state.embedding_data is not None
+                    and state.embedding_data.embedding is not None
+                    else 0
+                ),
+            )
+
+    def lifecycle_snapshot(self) -> dict:
+        """Logical staged bytes, distinct from total live CUDA allocations."""
+        now = time.monotonic()
+        states = list(self.req_states.values())
+        gpu_bytes = cpu_bytes = 0
+        for state in states:
+            data = state.embedding_data
+            if data is not None and data.embedding is not None:
+                if data.embedding.is_cuda:
+                    gpu_bytes += data.embedding.nbytes
+                else:
+                    cpu_bytes += data.embedding.nbytes
+        queue = getattr(self, "transfer_queue", None)
+        ack_queue = getattr(self, "ack_queue", None)
+        return {
+            "requests": len(states),
+            "staged_gpu_bytes": gpu_bytes,
+            "staged_cpu_bytes": cpu_bytes,
+            "active_encodes": sum(s.active_encodes for s in states),
+            "active_sends": sum(s.active_sends for s in states),
+            "release_waiting": sum(s.release_requested for s in states),
+            "oldest_request_s": max((now - s.created_at for s in states), default=0),
+            "oldest_staged_s": max(
+                (now - s.staged_at for s in states if s.staged_at is not None),
+                default=0,
+            ),
+            "oldest_release_wait_s": max(
+                (
+                    now - s.release_started_at
+                    for s in states
+                    if s.release_started_at is not None
+                ),
+                default=0,
+            ),
+            "stale_release_tasks": len(meta_registry._stale_release_tasks),
+            "transfer": queue.snapshot() if queue is not None else {},
+            "ack": ack_queue.snapshot() if ack_queue is not None else {},
+        }
+
+    def _ensure_lifecycle_probe(self) -> None:
+        if (
+            self.rank != 0
+            or getattr(self, "lifecycle_log_interval", 0) <= 0
+            or self._lifecycle_probe_task is not None
+        ):
+            return
+        self._lifecycle_probe_task = self._create_background_task(
+            self._lifecycle_probe_loop()
+        )
+
+    async def _lifecycle_probe_loop(self) -> None:
+        while True:
+            snapshot = self.lifecycle_snapshot()
+            if torch.cuda.is_initialized():
+                snapshot["cuda_allocated_bytes"] = torch.cuda.memory_allocated(
+                    self.gpu_id
+                )
+                snapshot["cuda_reserved_bytes"] = torch.cuda.memory_reserved(
+                    self.gpu_id
+                )
+            logger.info("Encoder lifecycle snapshot=%s", snapshot)
+            await asyncio.sleep(max(0.1, self.lifecycle_log_interval))
+
     def has_pending_embeddings(self) -> bool:
         return bool(getattr(self, "req_states", None))
 
@@ -813,8 +915,42 @@ class MMEncoder:
         state.active_encodes += 1
         if req_id in self.abandoned_req_ids:
             state.release_requested = True
+            state.release_event.set()
             self.abandoned_req_ids.discard(req_id)
+        aborted = getattr(self, "_user_aborts", None)
+        if aborted is not None and req_id in aborted:
+            state.release_requested = True
+            state.release_event.set()
+            state.embedding_ready.set()
+        self._trace_lifecycle("encode_acquire", state)
         return state
+
+    async def request_abort(self, req_id: str) -> None:
+        """Accept retirement without waiting for encoding or native sends to drain.
+
+        An accepted abort is not confirmation that RDMA has stopped. Keep a
+        bounded tombstone for late encodes and duplicate abort notifications.
+        """
+        if not hasattr(self, "_user_aborts"):
+            self._user_aborts = EncoderAbortRegistry(
+                max(
+                    envs.SGLANG_ENCODER_HTTP_TIMEOUT.get(),
+                    envs.SGLANG_ENCODER_SEND_TIMEOUT.get(),
+                )
+            )
+        if not self._user_aborts.remember(req_id):
+            return
+        try:
+            state = self.req_states.get(req_id)
+            if state is not None:
+                async with state.lifecycle_condition:
+                    state.release_requested = True
+                    state.release_event.set()
+                    state.embedding_ready.set()
+            self._create_background_task(self.release_request(req_id))
+        except BaseException:
+            self._user_aborts.forget(req_id)
+            raise
 
     async def abandon_request(self, req_id: str) -> None:
         """Release now, or remember the release until encode state exists."""
@@ -834,7 +970,6 @@ class MMEncoder:
             state.active_encodes -= 1
             assert state.active_encodes >= 0
             should_release = state.release_requested and state.active_encodes == 0
-            state.lifecycle_condition.notify_all()
         if should_release:
             await self.release_request(state.req_id)
 
@@ -857,18 +992,24 @@ class MMEncoder:
     def _stage_embedding(self, mm_data: EmbeddingData) -> None:
         state = self._embedding_state_for_stage(mm_data)
         state.embedding_data = mm_data
+        state.staged_at = time.monotonic()
         state.embedding_ready.set()
+        self._trace_lifecycle("staged", state)
 
     def _stage_embedding_batch(self, embeddings: List[EmbeddingData]) -> None:
         """Validate the whole fused batch before publishing any result."""
         states = [self._embedding_state_for_stage(mm_data) for mm_data in embeddings]
         for state, mm_data in zip(states, embeddings):
             state.embedding_data = mm_data
+            state.staged_at = time.monotonic()
         for state in states:
             state.embedding_ready.set()
+            self._trace_lifecycle("staged", state)
 
     async def _wait_for_embedding(self, state: ReqState) -> EmbeddingData:
         await state.embedding_ready.wait()
+        if state.release_requested:
+            raise InternalError(f"Encoder request was released: {state.req_id}")
         if state.embedding_data is None:
             raise InternalError(f"No embedding available for request: {state.req_id}")
         return state.embedding_data
@@ -883,12 +1024,14 @@ class MMEncoder:
             ):
                 raise InternalError(f"Encoder request was released: {state.req_id}")
             state.active_sends += 1
+        self._trace_lifecycle("send_enter", state)
         try:
             await self.delivery.send(state, destination)
         finally:
             async with state.lifecycle_condition:
                 state.active_sends -= 1
                 state.lifecycle_condition.notify_all()
+            self._trace_lifecycle("send_exit", state)
 
     async def release_request(
         self, req_id: str, *, preserve_metadata: bool = False
@@ -901,8 +1044,15 @@ class MMEncoder:
             return
         async with state.lifecycle_condition:
             state.release_requested = True
+            state.release_event.set()
+            # A /send may precede forward completion. Retirement must also
+            # wake those waiters, otherwise they keep active_sends nonzero.
+            state.embedding_ready.set()
+            if state.release_started_at is None:
+                state.release_started_at = time.monotonic()
             state.preserve_metadata_on_release |= preserve_metadata
             encode_is_active = state.active_encodes > 0
+        self._trace_lifecycle("release_requested", state)
 
         # ``send_with_url`` may be waiting for a destination that will never
         # arrive after its HTTP caller disappears. Wake it so the worker slot
@@ -918,6 +1068,7 @@ class MMEncoder:
             self.req_states.pop(req_id, None)
         await self.delivery.release(state)
         state.embedding_data = None
+        self._trace_lifecycle("released", state)
         if not state.preserve_metadata_on_release:
             await meta_registry.discard(req_id)
 
@@ -2055,16 +2206,15 @@ class MMEncoder:
             if glm_transfer:
                 if not hasattr(self, "_glm_source_buffers"):
                     self._glm_source_buffers = GlmSourceBuffers(self.engine)
-                mr_already_registered = self._glm_source_buffers.pool is not None
-                xfer_ret = await _await_transfer_completion(
-                    asyncio.get_running_loop().run_in_executor(
-                        self.transfer_executor,
-                        self._glm_source_buffers.transfer,
-                        embedding,
-                        session_id,
-                        buffer_address,
-                    ),
-                    f"GLM Mooncake transfer for req_id={req_id}",
+                # GLM manages source registrations per concurrent send rather
+                # than registering the staged embedding on the event loop.
+                mr_already_registered = False
+                xfer_ret = await self._run_transfer_work(
+                    req_id,
+                    self._glm_source_buffers.transfer,
+                    embedding,
+                    session_id,
+                    buffer_address,
                 )
             else:
                 # Fall back to a per-send registration only if the shared one failed.
@@ -2079,6 +2229,7 @@ class MMEncoder:
                         embedding.data_ptr(),
                         buffer_address,
                         embedding.nbytes,
+                        req_id=req_id,
                     )
                 except BaseException as error:
                     transfer_error = error
@@ -2211,10 +2362,20 @@ class MMEncoder:
             finally:
                 sock.close(linger=5000)
 
-        await _await_transfer_completion(
-            asyncio.get_running_loop().run_in_executor(self.executor, send_with_socket),
-            f"ZMQ transfer for req_id={mm_data.req_id}",
-        )
+        if get_disagg().encoder_transfer_backend == "mooncake":
+            # RDMA completed, but an unreachable ACK endpoint can consume
+            # SNDTIMEO per send. Do not hide an unbounded ACK backlog in the
+            # executor while its coroutines retain the GPU embeddings.
+            await self._run_transfer_work(
+                mm_data.req_id, send_with_socket, phase="ack"
+            )
+        else:
+            await _await_transfer_completion(
+                asyncio.get_running_loop().run_in_executor(
+                    self.executor, send_with_socket
+                ),
+                f"ZMQ transfer for req_id={mm_data.req_id}",
+            )
         if (
             encoder_metrics_collector is not None
             and get_disagg().encoder_transfer_backend != "mooncake"
@@ -2230,19 +2391,76 @@ class MMEncoder:
         source_address: int,
         destination_address: int,
         size: int,
+        *,
+        req_id: str = "unknown",
     ) -> int:
         """Keep the send active until its blocking transfer stops using the MR."""
-        return await _await_transfer_completion(
-            asyncio.get_running_loop().run_in_executor(
-                self.transfer_executor,
-                self.engine.transfer_sync,
-                session_id,
-                source_address,
-                destination_address,
-                size,
-            ),
-            f"Mooncake transfer to session={session_id}",
+        return await self._run_transfer_work(
+            req_id,
+            self.engine.transfer_sync,
+            session_id,
+            source_address,
+            destination_address,
+            size,
         )
+
+    async def _run_transfer_work(self, req_id: str, fn, *args, phase="rdma"):
+        queue_attr = "ack_queue" if phase == "ack" else "transfer_queue"
+        executor = self.executor if phase == "ack" else self.transfer_executor
+        queue = getattr(self, queue_attr, None)
+        if queue is None:
+            queue = EncoderTransferQueue(
+                (
+                    10
+                    if phase == "ack"
+                    else int(os.environ.get("SGLANG_ENCODER_TRANSFER_WORKERS", "10"))
+                ),
+                phase=phase,
+                trace=getattr(self, "lifecycle_trace", False),
+            )
+            setattr(self, queue_attr, queue)
+        state = getattr(self, "req_states", {}).get(req_id)
+        retired = state.release_event if state is not None else asyncio.Event()
+        timeout = getattr(self, "send_timeout", envs.SGLANG_ENCODER_SEND_TIMEOUT.get())
+        try:
+            async with queue.slot(req_id, retired, timeout) as ticket:
+                loop = asyncio.get_running_loop()
+
+                def run():
+                    loop.call_soon_threadsafe(
+                        queue.mark_started, ticket, time.monotonic()
+                    )
+                    try:
+                        return fn(*args)
+                    finally:
+                        loop.call_soon_threadsafe(
+                            queue.mark_finished, ticket, time.monotonic()
+                        )
+
+                # Once submitted, cancellation must drain the worker. Only the
+                # asynchronous admission wait above is safe to discard.
+                return await _await_transfer_completion(
+                    loop.run_in_executor(executor, run),
+                    f"Mooncake {phase} for req_id={req_id}",
+                )
+        except TransferRequestReleased:
+            raise InternalError(
+                f"Encoder request retired before {phase}: {req_id}"
+            ) from None
+        except TransferQueueTimeout:
+            raise MMError(
+                f"Encoder {phase} queue timed out after {timeout}s: {req_id}",
+                code=HTTPStatus.GATEWAY_TIMEOUT,
+            ) from None
+        except Exception as error:
+            logger.warning(
+                "Encoder send work failed phase=%s req_id=%s error_type=%s error=%s",
+                phase,
+                req_id,
+                type(error).__name__,
+                error,
+            )
+            raise
 
     def _register_shared_mr(self, mm_data: EmbeddingData, embedding: torch.Tensor):
         """Register one MR shared by every rank's /send; _send re-registers on failure."""
@@ -2416,6 +2634,7 @@ class MMEncoder:
         bypass caches and stage on CPU so completion confirms a model forward.
         """
         self._ensure_event_loop_probe()
+        self._ensure_lifecycle_probe()
         states = [self._acquire_encode_ref(req["req_id"]) for req in requests]
         is_health_check = all(
             is_health_check_request(req["req_id"]) for req in requests

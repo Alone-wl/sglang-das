@@ -388,6 +388,31 @@ async def handle_encode_request(request: dict):
         )
 
 
+@app.post("/abort")
+async def handle_abort_request(request: dict):
+    """Accept exact part IDs for retirement, without claiming RDMA has stopped."""
+    req_ids = request.get("req_ids")
+    if (
+        not isinstance(req_ids, list)
+        or not req_ids
+        or any(not isinstance(req_id, str) or not req_id for req_id in req_ids)
+    ):
+        return ORJSONResponse(
+            status_code=HTTPStatus.BAD_REQUEST,
+            content={"status": "error", "message": "req_ids must be nonempty strings"},
+        )
+    req_ids = list(dict.fromkeys(req_ids))
+    if dp_dispatcher is not None:
+        await dp_dispatcher.abort_requests(req_ids)
+    else:
+        for req_id in req_ids:
+            await encoder.request_abort(req_id)
+    return ORJSONResponse(
+        status_code=HTTPStatus.ACCEPTED,
+        content={"status": "accepted", "req_ids": req_ids},
+    )
+
+
 @app.post("/send")
 async def handle_send_request(request: dict):
     """Mooncake-only: drive the RDMA push of a staged embedding. The zmq
@@ -424,7 +449,11 @@ async def handle_send_request(request: dict):
     except Exception as error:
         logger.error("Mooncake send failed for req_id=%s: %s", req_id, error)
         return ORJSONResponse(
-            status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            status_code=(
+                int(error.code)
+                if isinstance(error, MMError)
+                else HTTPStatus.INTERNAL_SERVER_ERROR
+            ),
             content={
                 "status": "error",
                 "message": str(error),

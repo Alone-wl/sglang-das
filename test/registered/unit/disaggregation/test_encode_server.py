@@ -55,6 +55,22 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+def make_encoder_for_test():
+    """Constructor runtime defaults for tests which bypass model loading."""
+    encoder = MMEncoder.__new__(MMEncoder)
+    encoder.rank = 0
+    encoder.model_type = "test"
+    encoder.gpu_executor = None
+    encoder.transfer_executor = None
+    encoder.executor = None
+    encoder.send_timeout = 180.0
+    encoder._event_loop_probe_task = None
+    encoder._lifecycle_probe_task = None
+    encoder.lifecycle_log_interval = 0
+    encoder.lifecycle_trace = False
+    return encoder
+
+
 class TestEncoderDPErrorHandling(CustomTestCase):
     @staticmethod
     async def _run_registration_error(error):
@@ -281,7 +297,7 @@ class TestEncoderPreprocessorKimiGrid(CustomTestCase):
 
     @staticmethod
     def _make_encoder():
-        return MMEncoder.__new__(MMEncoder)
+        return make_encoder_for_test()
 
     def test_kimi_vl_prefers_and_normalizes_hw_grid(self):
         mm_inputs = {
@@ -403,7 +419,7 @@ class TestEncoderDelivery(CustomTestCase):
                 finish_transfer.wait()
                 return 0
 
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.req_states = {}
             encoder._element_size = 2
             encoder.transfer_backend = "mooncake"
@@ -474,7 +490,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_failed_mooncake_transfer_releases_per_send_registration(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder._element_size = 2
             encoder.transfer_backend = "mooncake"
             encoder.engine = SimpleNamespace(
@@ -525,7 +541,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     @staticmethod
     def _make_prefix_cache_encoder_and_context(get_feature_fn):
-        encoder = MMEncoder.__new__(MMEncoder)
+        encoder = make_encoder_for_test()
         encoder.mm_cache = MultiModalStaticCache(1024 * 1024)
         encoder.mm_cache_lock = asyncio.Lock()
         item = SimpleNamespace(hash=123, set_pad_value=lambda: None)
@@ -538,6 +554,7 @@ class TestEncoderDelivery(CustomTestCase):
             preprocess_result=SimpleNamespace(token_counts=[2], mm_inputs={}),
             get_feature_fn=get_feature_fn,
             is_health_check=False,
+            use_global_cache=False,
             items_per_req=[1],
             aux_data={},
         )
@@ -617,7 +634,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_background_task_failure_is_observed(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.background_tasks = set()
 
             async def fail():
@@ -763,7 +780,7 @@ class TestEncoderDelivery(CustomTestCase):
             Modality.IMAGE,
             embedding=embedding,
         )
-        encoder = MMEncoder.__new__(MMEncoder)
+        encoder = make_encoder_for_test()
         encoder._element_size = embedding.element_size()
         encoder.engine = engine
         return encoder, embedding, mm_data
@@ -890,7 +907,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_preprocess_metadata_precedes_embedding(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.rank = 0
             encoder.req_states = {}
             encoder.abandoned_req_ids = set()
@@ -991,7 +1008,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_remote_preprocess_failure_stops_all_tp_ranks_before_forward(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder._prepare_encode_context = AsyncMock(
                 return_value=self._encode_context()
             )
@@ -1034,7 +1051,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_tp_preprocess_layout_mismatch_fails_before_forward(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder._prepare_encode_context = AsyncMock(
                 return_value=self._encode_context()
             )
@@ -1074,7 +1091,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_remote_metadata_failure_stops_tp_peer_before_forward(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder._prepare_encode_context = AsyncMock(
                 return_value=self._encode_context()
             )
@@ -1118,7 +1135,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_unexpected_preprocess_failure_is_internal(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.preprocessor = SimpleNamespace(
                 process_batch_mm_items=AsyncMock(side_effect=RuntimeError("boom"))
             )
@@ -1442,7 +1459,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_global_cache_lookup_failure_falls_back_to_all_misses(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.rank = 0
             encoder.mm_global_cache = SimpleNamespace(
                 batch_is_exist=AsyncMock(side_effect=RuntimeError("store down"))
@@ -1464,7 +1481,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_global_cache_prefetch_failure_immediately_falls_back(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.rank = 0
             encoder.mm_global_cache = SimpleNamespace(
                 prefetch=unittest.mock.Mock(side_effect=RuntimeError("store down"))
@@ -1488,7 +1505,7 @@ class TestEncoderDelivery(CustomTestCase):
         asyncio.run(run())
 
     def test_global_cache_staging_failure_skips_insert(self):
-        encoder = MMEncoder.__new__(MMEncoder)
+        encoder = make_encoder_for_test()
         encoder.mm_global_cache = SimpleNamespace(
             store_to_pool_async=unittest.mock.Mock(
                 side_effect=RuntimeError("pool full")
@@ -1506,7 +1523,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_global_cache_insert_failure_is_contained(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.background_tasks = set()
             encoder.mm_global_cache = SimpleNamespace(
                 wait_store_to_pool=unittest.mock.Mock(
@@ -1535,7 +1552,7 @@ class TestEncoderDelivery(CustomTestCase):
             def __getitem__(self, key):
                 return self
 
-        encoder = MMEncoder.__new__(MMEncoder)
+        encoder = make_encoder_for_test()
         encoder.rank = 0
         events = []
         state = ReqState("req", active_encodes=1)
@@ -1548,8 +1565,10 @@ class TestEncoderDelivery(CustomTestCase):
             preprocess_result=SimpleNamespace(
                 token_counts=[2],
                 grid_thw=[[1, 2, 3]],
+                mm_inputs={},
             ),
             aux_data={},
+            item_hashes=None,
             use_global_cache=True,
         )
         stream = SimpleNamespace(synchronize=lambda: events.append("sync"))
@@ -1565,7 +1584,7 @@ class TestEncoderDelivery(CustomTestCase):
         self.assertEqual(events, ["sync", "ready"])
 
     def test_shared_mr_registration_failure_keeps_send_fallback_enabled(self):
-        encoder = MMEncoder.__new__(MMEncoder)
+        encoder = make_encoder_for_test()
         encoder.engine = unittest.mock.Mock()
         encoder.engine.register.side_effect = RuntimeError("register failed")
         embedding = torch.ones((2, 4))
@@ -1578,7 +1597,7 @@ class TestEncoderDelivery(CustomTestCase):
         self.assertIsNone(mm_data._mr_ptr)
 
     def test_fused_staging_rolls_back_mrs_before_any_result_is_published(self):
-        encoder = MMEncoder.__new__(MMEncoder)
+        encoder = make_encoder_for_test()
         encoder.rank = 0
         encoder.engine = Mock()
         first_state = ReqState("req-0", active_encodes=1)
@@ -1602,8 +1621,10 @@ class TestEncoderDelivery(CustomTestCase):
             preprocess_result=SimpleNamespace(
                 token_counts=[1, 1],
                 grid_thw=[[1, 1, 1], [1, 1, 1]],
+                mm_inputs={},
             ),
             aux_data={},
+            item_hashes=None,
             use_global_cache=False,
         )
         requests = [
@@ -1630,7 +1651,7 @@ class TestEncoderDelivery(CustomTestCase):
         self.assertFalse(second_state.embedding_ready.is_set())
 
     def test_stage_embedding_does_not_resurrect_missing_state(self):
-        encoder = MMEncoder.__new__(MMEncoder)
+        encoder = make_encoder_for_test()
         encoder.req_states = {}
 
         with self.assertRaisesRegex(
@@ -1650,7 +1671,7 @@ class TestEncoderDelivery(CustomTestCase):
         self.assertNotIn("req", encoder.req_states)
 
     def test_stage_embedding_requires_active_encode(self):
-        encoder = MMEncoder.__new__(MMEncoder)
+        encoder = make_encoder_for_test()
         state = ReqState("req")
         encoder.req_states = {"req": state}
 
@@ -1674,7 +1695,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_release_during_encode_is_deferred_without_resurrecting_state(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.rank = 0
             encoder.req_states = {}
             encoder.abandoned_req_ids = set()
@@ -1720,7 +1741,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_abandon_before_encode_is_applied_when_state_is_created(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.rank = 0
             encoder.req_states = {}
             encoder.abandoned_req_ids = set()
@@ -1755,7 +1776,7 @@ class TestEncoderDelivery(CustomTestCase):
             req_id = "test-error-metadata-waiter"
             await meta_registry.discard(req_id)
 
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.req_states = {}
             encoder.delivery = SimpleNamespace(release=AsyncMock())
             state = ReqState(
@@ -1778,7 +1799,7 @@ class TestEncoderDelivery(CustomTestCase):
                 await meta_registry.publish(req_id, 0, 0, 0, error="encode failed")
                 await encoder.release_request(req_id, preserve_metadata=True)
                 meta = await asyncio.wait_for(waiter, timeout=1)
-                self.assertEqual(meta, {"error": "encode failed"})
+                self.assertEqual(meta, {"error": "encode failed", "error_code": None})
                 self.assertNotIn(req_id, encoder.req_states)
             finally:
                 if not waiter.done():
@@ -1791,7 +1812,7 @@ class TestEncoderDelivery(CustomTestCase):
         async def run():
             events = []
             finish_encode = asyncio.Event()
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.transfer_backend = "zmq_to_tokenizer"
 
             async def encode(**kwargs):
@@ -1844,7 +1865,7 @@ class TestEncoderDelivery(CustomTestCase):
         async def run():
             encode_started = asyncio.Event()
             finish_encode = asyncio.Event()
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.transfer_backend = "zmq_to_tokenizer"
             encoder.encode_dispatch_lock = asyncio.Lock()
 
@@ -1895,7 +1916,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_pipeline_releases_request_when_error_publish_fails(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.transfer_backend = "mooncake"
             encoder.encode = AsyncMock(side_effect=RuntimeError("encode failed"))
             encoder.release_request = AsyncMock()
@@ -1923,7 +1944,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_pipeline_releases_error_result_when_error_send_fails(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.transfer_backend = "zmq_to_scheduler"
             encoder.encode = AsyncMock(return_value=(0, 0, 0, "bad image", 400))
             encoder.release_request = AsyncMock()
@@ -1953,7 +1974,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_send_waits_for_embedding_published_by_encode(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.rank = 0
             encoder.req_states = {}
             encoder.abandoned_req_ids = set()
@@ -2007,7 +2028,7 @@ class TestEncoderDelivery(CustomTestCase):
 
     def test_release_waits_for_send_then_clears_embedding(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.req_states = {}
 
             send_started = asyncio.Event()
@@ -2061,7 +2082,7 @@ class TestEncoderDelivery(CustomTestCase):
             req_id = "test-release-wakes-destination-waiter"
             await meta_registry.discard(req_id)
 
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.req_states = {req_id: ReqState(req_id)}
             encoder.send_timeout = 60
             encoder.delivery = ZmqDelivery(encoder, cleanup_receive_state=True)
@@ -2084,7 +2105,7 @@ class TestEncoderDelivery(CustomTestCase):
         async def run(register_first):
             req_id = "registration-before-encode"
             await meta_registry.discard(req_id)
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.rank = 0
             encoder.req_states = {}
             encoder.abandoned_req_ids = set()
@@ -2099,9 +2120,10 @@ class TestEncoderDelivery(CustomTestCase):
                 modality=Modality.IMAGE,
                 items_per_req=[1],
                 preprocess_result=SimpleNamespace(
-                    token_counts=[1], grid_thw=[[1, 1, 1]]
+                    token_counts=[1], grid_thw=[[1, 1, 1]], mm_inputs={}
                 ),
                 aux_data={},
+                item_hashes=None,
                 use_global_cache=False,
             )
             request = {
@@ -2158,7 +2180,7 @@ class TestEncoderDelivery(CustomTestCase):
     def test_destination_registration_timeout_does_not_create_state(self):
         async def run():
             req_id = "registration-without-encode"
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.req_states = {}
             with (
                 patch.object(
@@ -2186,7 +2208,7 @@ class TestEncoderDelivery(CustomTestCase):
     def test_destination_registration_cancellation_does_not_create_state(self):
         async def run():
             req_id = "cancelled-registration"
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.req_states = {}
             with patch.object(
                 encoder_server, "encode_state_condition", asyncio.Condition()
@@ -2210,7 +2232,7 @@ class TestEncoderDelivery(CustomTestCase):
             req_id = "registration-lifecycle"
             await meta_registry.discard(req_id)
 
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             state = ReqState(req_id)
             state.active_encodes = 1
             encoder.req_states = {req_id: state}
@@ -2357,7 +2379,7 @@ class TestEncoderDPAbandonedRequest(CustomTestCase):
 
     def test_worker_preserves_release_before_encode_task_exists(self):
         async def run():
-            encoder = MMEncoder.__new__(MMEncoder)
+            encoder = make_encoder_for_test()
             encoder.rank = 0
             encoder.req_states = {}
             encoder.abandoned_req_ids = set()

@@ -35,6 +35,7 @@ from sglang.srt.disaggregation.encoder.server import (
     await_task_completion_on_cancel,
     launch_encoder,
 )
+from sglang.srt.disaggregation.encoder.transfer_queue import EncoderAbortRegistry
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import (
     ProfileReq,
@@ -80,6 +81,7 @@ class PendingRequest:
 _BATCHABLE_MODALITIES = {Modality.IMAGE, Modality.AUDIO}
 _KIMI_K3_DEFAULT_ENCODER_MAX_BATCH_SIZE = 2
 _DP_RELEASE_AFTER_ENCODE = "release_after_encode"
+_DP_USER_ABORT = "user_abort"
 
 
 def validate_encode_request(request: dict) -> Optional[str]:
@@ -455,6 +457,12 @@ class DPDispatcher:
         # The event loop only keeps weak references to tasks, so the long-lived
         # loops and fire-and-forget notifications need a strong reference.
         self.background_tasks: Set[asyncio.Task] = set()
+        self._user_aborts = EncoderAbortRegistry(
+            max(
+                envs.SGLANG_ENCODER_HTTP_TIMEOUT.get(),
+                envs.SGLANG_ENCODER_SEND_TIMEOUT.get(),
+            )
+        )
 
         # Prometheus gauge: pending requests per DP rank. Lives in the main
         # process (the dispatcher), unlike the per-worker EncoderMetricsCollector.
@@ -530,6 +538,28 @@ class DPDispatcher:
         task = asyncio.create_task(notify_worker())
         self.background_tasks.add(task)
         task.add_done_callback(self.background_tasks.discard)
+
+    async def abort_requests(self, req_ids: List[str]) -> None:
+        """Retire through the worker's independent cleanup channel."""
+        for req_id in req_ids:
+            if not self._user_aborts.remember(req_id):
+                continue
+            rank = self.req_id_to_rank.get(req_id)
+            if rank is not None and rank not in self._dead_ranks:
+                try:
+                    await asyncio.wait_for(
+                        async_sock_send(
+                            self.release_sockets[rank],
+                            wrap_as_pickle(
+                                {"_dp_type": _DP_USER_ABORT, "req_id": req_id}
+                            ),
+                        ),
+                        timeout=5.0,
+                    )
+                except BaseException:
+                    # A failed notification must remain retryable by the caller.
+                    self._user_aborts.forget(req_id)
+                    raise
 
     @staticmethod
     def _send_req_key(req_id: str, request: dict) -> str:
@@ -629,6 +659,13 @@ class DPDispatcher:
             # They share one PUSH socket, so releasing the condition after send
             # preserves the required order.
             async with self._mapping_condition:
+                if req_id in self._user_aborts:
+                    self._drop_pending_and_mapping(rank, req_id)
+                    return {
+                        "req_id": req_id,
+                        "_error": "Encoder request aborted by user",
+                        "_error_code": int(HTTPStatus.BAD_REQUEST),
+                    }
                 self.req_id_to_rank[req_id] = rank
                 try:
                     await async_sock_send(
@@ -1641,6 +1678,9 @@ async def run_dp_worker(
                 logger.error(f"DP worker {dp_rank} received malformed release request")
                 continue
             req_id = request["req_id"]
+            if request.get("_dp_type") == _DP_USER_ABORT:
+                await enc.request_abort(req_id)
+                continue
             task = asyncio.create_task(
                 _retire_abandoned_encode(enc, encode_tasks.get(req_id), req_id)
             )
