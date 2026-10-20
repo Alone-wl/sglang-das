@@ -359,8 +359,8 @@ class Envs:
     # value instead of asking the OS for a random port.  Useful to keep all
     # SGLang ports in a predictable range behind a firewall.
     SGLANG_PORT = EnvInt(None)
+    # Legacy GLM receiver GPU-pool size fallback. Encoder sources are direct.
     SGLANG_MC_RDMA_POOL_MAX_MB = EnvInt(0)
-    SGLANG_MC_RDMA_POOL_ACQUIRE_TIMEOUT_SECS = EnvFloat(60)
     SGLANG_ENCODER_VIDEO_SHARD_MIN_MB = EnvInt(128)
     SGLANG_ENCODER_VIDEO_SHARD_MIN_FRAMES_PER_ENCODER = EnvInt(80)
     SGLANG_ENCODER_MAX_PENDING_VIT = EnvInt(32)
@@ -1405,6 +1405,9 @@ class Envs:
     SGLANG_ENCODER_MM_RECEIVER_MODE = EnvStr("http")
     SGLANG_ENCODER_RECV_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_SEND_TIMEOUT = EnvFloat(180.0)
+    # Disabled at zero; logs logical staged bytes and transfer queue ages.
+    SGLANG_ENCODER_LIFECYCLE_LOG_INTERVAL = EnvFloat(0.0)
+    SGLANG_ENCODER_LIFECYCLE_TRACE = EnvBool(False)
     SGLANG_ENCODER_HTTP_TIMEOUT = EnvFloat(1800.0)
     SGLANG_ENCODER_REQ_TIMEOUT = EnvFloat(180.0)
     SGLANG_ENCODER_DISPATCH_MIN_ITEMS = EnvInt(2)
