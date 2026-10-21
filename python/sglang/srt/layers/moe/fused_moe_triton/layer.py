@@ -155,6 +155,13 @@ def _maybe_copy_weight_view_before_h2d(
 def _get_deepep_comm_group(a2a_backend):
     group = get_parallel().tp_group.device_group
 
+    if envs.SGLANG_DEEPEP_USE_MOE_EP_GROUP.get():
+        group = get_parallel().moe_ep_group.device_group
+        logging.getLogger(__name__).info(
+            "DeepEP communicator: using the standalone MoE-EP process group "
+            "(SGLANG_DEEPEP_USE_MOE_EP_GROUP=1)."
+        )
+
     if a2a_backend.is_mori():
         group = get_parallel().tp_group
 
@@ -192,6 +199,7 @@ def _should_use_ascend_tp_dispatcher(moe_runner_config: MoeRunnerConfig) -> bool
             return True
     return False
 
+
 def create_moe_dispatcher(
     moe_runner_config: MoeRunnerConfig,
     quant_method: FusedMoEMethodBase,
@@ -220,16 +228,26 @@ def create_moe_dispatcher(
         or a2a_backend.is_nixl()
         or a2a_backend.is_pplx()
     ):
+        num_dispatch_experts = (
+            moe_runner_config.num_dispatch_experts
+            if moe_runner_config.num_dispatch_experts is not None
+            else moe_runner_config.num_experts
+        )
+        num_dispatch_local_experts = (
+            moe_runner_config.num_dispatch_local_experts
+            if moe_runner_config.num_dispatch_local_experts is not None
+            else moe_runner_config.num_local_experts
+        )
         return MaybeTboDeepEPDispatcher(
             group=_get_deepep_comm_group(a2a_backend),
             router_topk=moe_runner_config.top_k,
             permute_fusion=True,
-            num_experts=moe_runner_config.num_experts,
-            num_local_experts=moe_runner_config.num_local_experts,
+            num_experts=num_dispatch_experts,
+            num_local_experts=num_dispatch_local_experts,
             hidden_size=moe_runner_config.hidden_size,
             params_dtype=moe_runner_config.params_dtype,
             deepep_mode=get_deepep_mode(),
-            async_finish=True,
+            async_finish=envs.SGLANG_DEEPEP_ASYNC_FINISH.get(),
             return_recv_hook=not is_hcu(),
         )
     elif a2a_backend.is_deepep_v2():
@@ -434,6 +452,9 @@ class FusedMoE(torch.nn.Module):
         gate_up_interleaved: bool = True,
         enable_qwen35_fp8_deferred_finalize: bool = False,
         quant_method: Optional[FusedMoEMethodBase] = None,
+        num_dispatch_experts: Optional[int] = None,
+        num_dispatch_local_experts: Optional[int] = None,
+        local_shared_experts_without_dispatch: bool = False,
     ):
         super().__init__()
         if params_dtype is None:
@@ -540,6 +561,9 @@ class FusedMoE(torch.nn.Module):
             num_experts=self.num_experts,
             num_local_experts=self.num_local_experts,
             hidden_size=self.hidden_size,
+            num_dispatch_experts=num_dispatch_experts,
+            num_dispatch_local_experts=num_dispatch_local_experts,
+            local_shared_experts_without_dispatch=local_shared_experts_without_dispatch,
             intermediate_size_per_partition=self.intermediate_size_per_partition,
             layer_id=self.layer_id,
             top_k=self.top_k,
@@ -740,7 +764,7 @@ class FusedMoE(torch.nn.Module):
         # 2. GPU with flashinfer_trtllm padding (when intermediate_size is padded to 128)
         # 3. GPU with Aiter padding
         aiter_padded = (
-            _use_aiter
+            (_use_aiter or get_moe_runner_backend().is_aiter())
             and hasattr(self, "w2_weight")
             and getattr(self.w2_weight, "weight_padded", False)
         )
@@ -1261,6 +1285,16 @@ class FusedMoE(torch.nn.Module):
         shard_id: str,
         expert_id: int,
     ) -> None:
+        if getattr(param, "compressed_tensors_packed_int4", False):
+            if param.dtype == torch.int8 and loaded_weight.dtype == torch.int32:
+                # compressed-tensors stores offset-8 nibbles, even K in low bits.
+                # SlimQuant expects signed nibbles, even K in high bits.
+                packed = loaded_weight.contiguous().view(torch.uint8) ^ 0x88
+                loaded_weight = ((packed << 4) | (packed >> 4)).view(torch.int8)
+            elif weight_name.endswith("weight_scale"):
+                # The SlimQuant native kernels apply the factor 16 internally.
+                loaded_weight = loaded_weight.float() / 16.0
+
         # Special case for GGUF weights
         if self._load_gguf_weight(param, loaded_weight, shard_id, expert_id):
             return
@@ -1661,7 +1695,9 @@ class FusedMoE(torch.nn.Module):
     ):
         origin_hidden_states_dim = hidden_states.shape[-1]
         assert self.quant_method is not None
-        if _use_lightop_moe_sum_mul_add:
+        if _use_lightop_moe_sum_mul_add and hasattr(
+            self.quant_method, "apply_with_shared_output"
+        ):
             final_hidden_states = self.quant_method.apply_with_shared_output(
                 layer=self,
                 x=hidden_states,

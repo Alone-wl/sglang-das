@@ -183,6 +183,13 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "correction_bias) -> ()");
   m.impl("topk_sigmoid", torch::kCUDA, &topk_sigmoid);
 
+#ifdef SGLANG_HCU_AOT_FP8_QUANT
+  // HCU builds include the e4m3fn AOT implementation. Other ROCm builds keep
+  // using the existing runtime fallback instead of exporting a mismatched op.
+  m.def("sgl_per_token_quant_fp8(Tensor input, Tensor! output_q, Tensor! output_s) -> ()");
+  m.impl("sgl_per_token_quant_fp8", torch::kCUDA, &sgl_per_token_quant_fp8);
+#endif
+
   /*
    * From csrc/speculative
    */
@@ -326,6 +333,12 @@ TORCH_LIBRARY_EXPAND(sgl_kernel, m) {
       "                 Tensor!? key, int head_size,"
       "                 Tensor cos_sin_cache, bool is_neox) -> ()");
   m.impl("rotary_embedding", torch::kCUDA, &rotary_embedding);
+
+  m.def(
+      "minimax_h3_rotary_embedding(Tensor positions, Tensor! query,"
+      "                            Tensor!? key, int head_size,"
+      "                            Tensor cos_sin_cache, bool is_neox) -> ()");
+  m.impl("minimax_h3_rotary_embedding", torch::kCUDA, &minimax_h3_rotary_embedding);
 
   /*
    * From csrc/memory

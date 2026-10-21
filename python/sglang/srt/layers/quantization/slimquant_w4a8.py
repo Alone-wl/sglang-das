@@ -42,7 +42,6 @@ from sglang.srt.layers.quantization.base_config import (
 from sglang.srt.layers.quantization.compressed_tensors import quant_ops
 from sglang.srt.utils import W8a8GetCacheJSON, get_bool_env_var
 
-_use_fused_rms_quant = get_bool_env_var("SGLANG_USE_FUSED_RMS_QUANT")
 _use_fused_silu_mul_quant = get_bool_env_var("SGLANG_USE_FUSED_SILU_MUL_QUANT")
 
 
@@ -119,6 +118,14 @@ def fused_experts_impl_w4a8_triton(
         config1, config2 = w4a8_triton.get_w8a8moe_json(
             token_count, w1.shape[0], n1, n2, n1 // 2
         )
+        # fused_moe_kernel_int4_w4a8 has no K remainder mask; clamp tiles so
+        # BLOCK_SIZE_K|K and BLOCK_SIZE_N|N (e.g. K=80 with default BK=64).
+        from sglang.srt.layers.quantization.slimquant_w4a8_marlin import (
+            _adjust_w4a8_triton_block_config,
+        )
+
+        config1 = _adjust_w4a8_triton_block_config(config1, n=n1, k=n2)
+        config2 = _adjust_w4a8_triton_block_config(config2, n=n2, k=n1 // 2)
         sorted_ids, expert_ids, padded_count = w4a8_triton.moe_align_block_size(
             current_ids, config1["BLOCK_SIZE_M"], global_num_experts, expert_map
         )
@@ -175,6 +182,8 @@ def fused_experts_impl_w4a8_triton(
 
 
 class SlimQuantW4A8Int8Config(QuantizationConfig):
+    supports_kimi_k3_quantized_latent_projections = True
+
     """Config class for W8A8 Int8 Quantization.
 
     - Weight: static, per-channel, symmetric
@@ -226,7 +235,9 @@ class SlimQuantW4A8Int8Config(QuantizationConfig):
 
 
 class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
+    supports_prequantized_input = True
 
+    # Explicit INT8 input + FP32 per-token scale; caller owns fusion routing.
     def __init__(self, quantization_config: SlimQuantW4A8Int8Config):
         self.quantization_config = quantization_config
         self.tritonsingleton = W8a8GetCacheJSON()
@@ -306,9 +317,16 @@ class SlimQuantW4A8Int8LinearMethod(LinearMethodBase):
         input_quant_args: Optional[list[torch.Tensor]] = None,
         silu_quant_args: Optional[list[torch.Tensor]] = None,
     ):
-        if _use_fused_rms_quant and input_quant_args is not None:
-            assert len(input_quant_args) == 2
+
+        # Explicit q/scale must not depend on an unrelated global RMS switch.
+        if input_quant_args is not None:
             x_q, x_scale = input_quant_args
+            if (x_q.dtype, x_scale.dtype) != (torch.int8, torch.float32):
+                raise ValueError("Expected INT8 input and FP32 per-token scale")
+            if x.ndim != 2 or x_q.shape != x.shape or x_scale.shape != (x.shape[0], 1):
+                raise ValueError("Invalid prequantized INT8 input/scale shape")
+            if x_q.device != x.device or x_scale.device != x.device:
+                raise ValueError("Prequantized input/scale must share the input device")
         elif _use_fused_silu_mul_quant and silu_quant_args is not None:
             x_q, x_scale = silu_quant_args
         else:

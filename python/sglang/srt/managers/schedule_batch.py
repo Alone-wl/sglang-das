@@ -1205,6 +1205,21 @@ class Req(ReqDllmMixin):
         # set to_finish instead of directly setting finished_reason.
         # Note: We should never set finished_reason in the middle, the req will get filtered and never respond
         self.to_finish: Optional[BaseFinishReason] = None
+
+        # External KV abort cleanup state. Each action is independently
+        # retryable so a request can move between scheduler queues without
+        # losing progress when an asynchronous cleanup step fails.
+        self.external_kv_abort_requested = False
+        self.external_kv_pending_chunk_cleared = False
+        self.external_kv_linker_released = False
+        self.external_kv_sender_abort_requested = False
+        self.external_kv_metadata_released = False
+        self.external_kv_cache_released = False
+        self.external_kv_finish_state_applied = False
+        self.external_kv_response_sent = False
+        self.external_kv_abort_response_via_chunked = False
+        self.external_kv_cleanup_done = False
+        self.external_kv_cleanup_steps = {}
         self.stream = stream
         self.eos_token_ids = eos_token_ids
         self.vocab_size = vocab_size
@@ -1260,6 +1275,8 @@ class Req(ReqDllmMixin):
         # admission; less than host_hit_length when the load-back was declined
         # or the staged splice dropped (that shortfall is re-prefilled).
         self.host_loaded_length = 0
+        # Absolute external-cache hit boundary shared by PP0; None outside PP.
+        self.external_cache_hit_length: Optional[int] = None
         # Buffer-mode host memory is transport staging, not an L2 cache tier.
         self.host_hit_is_storage = False
         self.storage_prefetch_retry_attempts = 0
@@ -1748,6 +1765,18 @@ class Req(ReqDllmMixin):
         # avoiding an O(context) copy per prefill-batch build.
         token_ids_to_match = self.full_untruncated_fill_ids
         key_limit: Optional[int] = self._compute_max_prefix_len(input_len)
+
+        # PP0 owns the canonical external-cache boundary. Apply it only while
+        # admitting the request; cache insertion performs its own rematch and
+        # must be allowed to see KV computed after that original boundary.
+        if (
+            tree_cache is not None
+            and self.external_cache_hit_length is not None
+            and getattr(tree_cache, "linker", None) is not None
+            and getattr(tree_cache, "pp_size", 1) > 1
+        ):
+            capped = min(input_len, self.external_cache_hit_length)
+            key_limit = capped if key_limit is None else min(key_limit, capped)
 
         # Disable prefix caching when embed overrides are present: same token IDs
         # with different override vectors must not share cached KV values.
@@ -2633,6 +2662,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # For DP attention
     global_num_tokens: Optional[List[int]] = None
     global_num_tokens_for_logprob: Optional[List[int]] = None
+    global_cp_num_tokens: Optional[List[int]] = None
     # The draft model can use a different MoE A2A backend than the target.
     draft_global_num_tokens: Optional[List[int]] = None
     draft_global_num_tokens_for_logprob: Optional[List[int]] = None
@@ -3955,6 +3985,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             can_run_dp_draft_cuda_graph=self.can_run_dp_draft_cuda_graph,
             can_run_dp_prefill_cuda_graph=self.can_run_dp_prefill_cuda_graph,
             dp_prefill_cuda_graph_max_prefix_len=self.dp_prefill_cuda_graph_max_prefix_len,
+            global_cp_num_tokens=self.global_cp_num_tokens,
             is_extend_in_batch=self.is_extend_in_batch,
             is_prefill_only=self.is_prefill_only,
             seq_lens_cpu=self.seq_lens_cpu,

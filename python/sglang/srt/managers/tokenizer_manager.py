@@ -215,6 +215,30 @@ _REQUEST_STATE_WAIT_TIMEOUT = envs.SGLANG_REQUEST_STATE_WAIT_TIMEOUT.get()
 
 logger = logging.getLogger(__name__)
 
+_DAS_PREFETCH_TRACE_ENABLED = os.environ.get(
+    "SGLANG_DAS_PREFETCH_TRACE", ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _trace_disagg_prefill_dispatch(event: str, obj: Any) -> None:
+    if not _DAS_PREFETCH_TRACE_ENABLED:
+        return
+    requests = getattr(obj, "batch", None)
+    if requests is None:
+        requests = (obj,)
+    for req in requests:
+        if not isinstance(req, TokenizedGenerateReqInput):
+            continue
+        logger.info(
+            "DAS_PREFETCH_TRACE phase=%s rid=%s bootstrap_room=%s rank=tokenizer "
+            "wall_ns=%d monotonic_ns=%d",
+            event,
+            req.rid if req.rid is not None else "-",
+            req.bootstrap_room if req.bootstrap_room is not None else "-",
+            time.time_ns(),
+            time.monotonic_ns(),
+        )
+
 
 def _validate_watermark_request(sampling_params: SamplingParams) -> None:
     watermark = sampling_params.watermark
@@ -670,12 +694,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
+        _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         sock_send(self.send_to_scheduler, obj)
+        _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
 
     async def _async_dispatch_to_scheduler(self, obj: Any) -> None:
         if self.tokenizer_ipc_name is not None:
             stamp_http_worker_ipc(obj, self.tokenizer_ipc_name)
+        _trace_disagg_prefill_dispatch("tokenizer_send_start", obj)
         await async_sock_send(self.send_to_scheduler, obj)
+        _trace_disagg_prefill_dispatch("tokenizer_send_done", obj)
 
     def init_running_status(self):
         # Request states
@@ -895,11 +923,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
         if isinstance(obj, GenerateReqInput) and obj.routed_dp_rank is not None:
             num_dp_ranks = self.elastic_worker_count
-            if num_dp_ranks <= 1 and obj.routed_dp_rank == 0:
+            routed_dp_ranks = (
+                obj.routed_dp_rank
+                if isinstance(obj.routed_dp_rank, list)
+                else [obj.routed_dp_rank]
+            )
+            if num_dp_ranks <= 1 and all(rank == 0 for rank in routed_dp_ranks):
                 logger.debug(
                     f"routed_dp_rank={obj.routed_dp_rank} is ignored because num_dp_ranks={num_dp_ranks}"
                 )
-            elif obj.routed_dp_rank < 0 or obj.routed_dp_rank >= num_dp_ranks:
+            elif any(rank < 0 or rank >= num_dp_ranks for rank in routed_dp_ranks):
                 raise ValueError(
                     f"routed_dp_rank={obj.routed_dp_rank} out of range [0, {num_dp_ranks})"
                 )
@@ -1412,20 +1445,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
         self._validate_joint_schema_request(obj, input_ids)
-        _max_req_len = self.context_len
+        _max_req_len = min(self.context_len, self.max_req_input_len or self.context_len)
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens
 
         # Validate input length
-        if input_token_num >= self.context_len:
+        if input_token_num >= _max_req_len:
             if self.allow_auto_truncate:
                 logger.warning(
                     f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens). "
+                    f"server's maximum allowed length ({_max_req_len} tokens). "
                     "Truncating the input."
                 )
-                del input_ids[_max_req_len:]
-                input_token_num = len(input_ids)
+                max_input_tokens = max(_max_req_len - self.num_reserved_tokens - 1, 0)
+                del input_ids[max_input_tokens:]
+                input_token_num = len(input_ids) + self.num_reserved_tokens
             elif get_serving().glm_check_chat_prompt_length and isinstance(
                 obj, GenerateReqInput
             ):
@@ -1436,7 +1470,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             else:
                 raise ValueError(
                     f"The input ({input_token_num} tokens) is longer than the "
-                    f"model's context length ({self.context_len} tokens)."
+                    f"server's maximum allowed length ({_max_req_len} tokens)."
                 )
 
         # Validate total tokens (input + max_new_tokens)
@@ -1455,7 +1489,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if self.allow_auto_truncate:
                 logger.warning(
                     f"Requested token count ({input_token_num} input + {max_new_tokens} new) "
-                    f"exceeds the model's context length ({self.context_len} tokens). "
+                    f"exceeds the server's maximum allowed length ({_max_req_len} tokens). "
                     "Truncating max_new_tokens."
                 )
                 obj.sampling_params["max_new_tokens"] = max(
@@ -1472,7 +1506,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 total_tokens = max_new_tokens + input_token_num
                 error_msg = (
                     f"Requested token count exceeds the model's maximum context length "
-                    f"of {self.context_len} tokens. You requested a total of {total_tokens} "
+                    f"of {_max_req_len} tokens. You requested a total of {total_tokens} "
                     f"tokens: {input_token_num} tokens from the input messages and "
                     f"{max_new_tokens} tokens for the completion. Please reduce the number "
                     f"of tokens in the input messages or the completion to fit within the limit."
@@ -1870,8 +1904,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         - Or, if no request has text or multimodal input (all use pre-tokenized input_ids or input_embeds), batch the requests without tokenization.
         - Batch tokenization does not support DP attention yet, and it will make everything goes to the first rank currently
         """
+        explicit_dp_batch = self.server_args.enable_dp_attention and isinstance(
+            getattr(requests, "routed_dp_rank", None), list
+        )
         return batch_size > 0 and (
             get_serving().enable_tokenizer_batch_encode
+            or explicit_dp_batch
             or (
                 (not get_parallel().attn_dp_enabled)
                 and (not self._batch_has_text(batch_size, requests))

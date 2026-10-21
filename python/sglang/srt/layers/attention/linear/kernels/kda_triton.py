@@ -7,10 +7,11 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 )
 from sglang.srt.utils import get_bool_env_var, is_cpu, is_hcu, is_npu, is_xpu
 
+_is_hcu = is_hcu()
 _USE_KDA_HCU = get_bool_env_var("SGLANG_KDA_USE_HCU_OP")
 
 if not is_cpu():
-    if is_hcu() and _USE_KDA_HCU:
+    if _is_hcu and _USE_KDA_HCU:
         # HCU: use the stable boltops packed-decode implementation directly.
         # Its API consumes raw gate/beta tensors; packed_decode reshapes them
         # below without copying and returns the boltops output layout directly.
@@ -22,8 +23,20 @@ if not is_cpu():
     from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
         fused_recurrent_linear_replayssm_decode,
     )
+
+    if _is_hcu and _USE_KDA_HCU:
+        # The SGLang-compatible decode/verify ABI lives in BoltOPs fla.common.
+        # The same-named fla.gdn facade exposes the vLLM GDN decode ABI.
+        from boltops.fla.common.triton.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+    else:
+        from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+            fused_sigmoid_gating_delta_rule_update,
+        )
+    # Verify uses the in-tree ABI; HCU shares preparation across V tiles.
     from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
-        fused_sigmoid_gating_delta_rule_update,
+        fused_sigmoid_gating_delta_rule_update as _target_verify_update,
     )
     from sglang.kernels.ops.attention.fla.kda import chunk_kda
 
@@ -37,6 +50,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
     supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
     supports_track_state_snapshot: bool = True
+    verify_impl_name: str = "sglang_triton_prepared" if _is_hcu else "sglang_triton"
 
     def packed_decode(
         self,
@@ -211,7 +225,8 @@ class TritonKDAKernel(LinearAttnKernelBase):
         # the committed pool (disable_state_update=True), and handles chain + tree
         # (retrieve_parent_token). The verify kernel for the Triton / CuTe DSL KDA
         # decode backends, and the reference the KDA correctness tests assert against.
-        return fused_sigmoid_gating_delta_rule_update(
+
+        return _target_verify_update(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,

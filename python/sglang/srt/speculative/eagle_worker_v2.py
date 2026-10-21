@@ -135,6 +135,7 @@ from sglang.srt.utils.common import (
     get_available_gpu_memory,
     is_cpu,
     is_cuda,
+    is_gfx938_supported,
     is_hcu,
     is_hip,
     is_musa,
@@ -149,6 +150,7 @@ _is_cuda = is_cuda()
 _is_hcu = is_hcu()
 _is_musa = is_musa()
 _is_hip = is_hip()
+_is_gfx938 = is_gfx938_supported()
 _is_xpu = is_xpu()
 
 
@@ -340,8 +342,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             getattr(hf_config, "index_share_for_mtp_iteration", False)
             and self.topk == 1
         )
-        # GLM-5.2 MTP IndexShare: seed reused indexer top-k from draft-extend
-        # (last verified token), not draft-decode step 0.
+        # Carrying draft-extend's indexer top-k into GLM DSA's first draft
+        # step lowers EAGLE acceptance on HCU. Recompute that first top-k and
+        # still share it across the remaining draft steps.
         self.dsa_index_topk = getattr(hf_config, "index_topk", None)
         self.dsa_seed_topk_width = (
             get_dsa_mtp_topk_width(hf_config)
@@ -349,7 +352,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             else None
         )
         self.seed_dsa_topk_from_draft_extend = (
-            self.index_share_for_mtp_iteration and self.dsa_seed_topk_width is not None
+            self.index_share_for_mtp_iteration
+            and self.dsa_seed_topk_width is not None
+            and not (
+                _is_hcu and getattr(hf_config, "model_type", None) == "glm_moe_dsa"
+            )
         )
 
     def init_token_map(self):
@@ -564,7 +571,21 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # Capture draft
         decode_backend = get_exec().graph.cuda_graph_config.decode.backend
         capture_bs, _ = get_batch_sizes_to_capture(self.draft_runner)
-        if self.speculative_num_steps > 1:
+        skip_hcu_qwen4_exp_draft_graphs = False
+        if _is_hcu:
+            draft_archs = (
+                getattr(self.draft_runner.model_config.hf_config, "architectures", None)
+                or []
+            )
+            skip_hcu_qwen4_exp_draft_graphs = "Qwen4ExpForCausalLMMTP" in draft_archs
+        if skip_hcu_qwen4_exp_draft_graphs:
+            log_info_on_rank0(
+                logger,
+                "Skip HCU Qwen4Exp MTP draft CUDA graphs (decode + extend). "
+                "HIP replay cannot keep the MTP Python chain or QSA extend "
+                "indices numerically correct. Target verify graphs stay on.",
+            )
+        if self.speculative_num_steps > 1 and not skip_hcu_qwen4_exp_draft_graphs:
             tic = time.perf_counter()
             before_mem = get_available_gpu_memory(self.device, self.gpu_id)
             log_info_on_rank0(
@@ -632,6 +653,10 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 )
                 or isinstance(self.draft_extend_attn_backend, QwenSparseAttnBackend)
             )
+            supports_hip_draft_extend_graph = supports_hip_draft_extend_graph or (
+                _is_gfx938
+                and isinstance(self.draft_extend_attn_backend, TritonAttnBackend)
+            )
 
         graph_supported_backend_types = [
             TritonAttnBackend,
@@ -678,6 +703,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         # TODO: support draft extend cuda graph for more attention backends
         if (
             self.draft_extend_attn_backend
+            and not skip_hcu_qwen4_exp_draft_graphs
             and not envs.SGLANG_DISABLE_DRAFT_EXTEND_CUDA_GRAPH.get()
             and (
                 _is_npu
@@ -717,6 +743,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 f"mem usage={(before_mem - after_mem):.2f} GB, "
                 f"avail mem={after_mem:.2f} GB.",
             )
+
+        from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
+            release_hcu_flashmla_decode_h16_capture_cache,
+        )
+
+        release_hcu_flashmla_decode_h16_capture_cache(self.target_worker.model_runner)
 
     def draft(self, batch: ScheduleBatch, *, with_topology: bool = False):
         draft_input: EagleDraftInput = batch.spec_info
@@ -890,6 +922,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     out_cache_loc = out_cache_loc.contiguous()
                 forward_batch.out_cache_loc = out_cache_loc[i]
                 spec_info.hidden_states = hidden_states
+                # The current chain width is authoritative. Under attention-DP
+                # the draft LM-head may run on the execution-group padded BS
+                # (for example local BS4 while another rank temporarily has
+                # BS5 during wave admission). Its direct Top-1 and hidden-state
+                # outputs must be trimmed back before the next draft step;
+                # otherwise ``scores`` still has BS4 and the next tree-select
+                # multiplies incompatible BS4/BS5 tensors.
+                active_draft_rows = topk_index.shape[0]
 
                 canary_index_ctx = (
                     c.with_active_single_forward_manager(i)
@@ -907,18 +947,37 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     logits_output = self.draft_runner.forward(
                         forward_batch
                     ).logits_output
-                maybe_detect_nan(
-                    logits_output.next_token_logits, f"draft_forward step {i}"
-                )
-                maybe_detect_inf(
-                    logits_output.next_token_logits, f"draft_forward step {i}"
-                )
-                if (
-                    not needs_draft_probs
-                    and logits_output.draft_top1_token_ids is not None
-                ):
-                    topk_p = logits_output.draft_top1_probs
-                    topk_index = logits_output.draft_top1_token_ids
+                vp_top1_token_ids = getattr(logits_output, "draft_top1_token_ids", None)
+                direct_top1 = getattr(logits_output, "draft_topk_index", None)
+                if direct_top1 is None and vp_top1_token_ids is None:
+                    maybe_detect_nan(
+                        logits_output.next_token_logits, f"draft_forward step {i}"
+                    )
+                    maybe_detect_inf(
+                        logits_output.next_token_logits, f"draft_forward step {i}"
+                    )
+                if direct_top1 is not None:
+                    if self.topk != 1 or needs_draft_probs:
+                        raise RuntimeError(
+                            "direct draft Top-1 requires topk=1 without rejection sampling"
+                        )
+                    if direct_top1.shape[0] < active_draft_rows:
+                        raise RuntimeError(
+                            "direct draft Top-1 returned fewer rows than the "
+                            f"active chain: {direct_top1.shape[0]} < "
+                            f"{active_draft_rows}"
+                        )
+                    topk_index = direct_top1[:active_draft_rows]
+                    topk_p = torch.ones_like(topk_index, dtype=torch.float32)
+                    forward_batch.positions.add_(1)
+                elif not needs_draft_probs and vp_top1_token_ids is not None:
+                    if vp_top1_token_ids.shape[0] < active_draft_rows:
+                        raise RuntimeError(
+                            "VP draft Top-1 returned fewer rows than the active "
+                            f"chain: {vp_top1_token_ids.shape[0]} < {active_draft_rows}"
+                        )
+                    topk_p = logits_output.draft_top1_probs[:active_draft_rows]
+                    topk_index = vp_top1_token_ids[:active_draft_rows]
                     forward_batch.positions.add_(1)
                     if draft_tokens_topk1 is not None:
                         draft_tokens_topk1[:, i + 1 : i + 2].copy_(topk_index)
@@ -953,7 +1012,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch.positions.add_(1)
                 draft_vocab_size = (
                     self.draft_runner.model_config.vocab_size
-                    if logits_output.draft_top1_token_ids is not None
+                    if logits_output.next_token_logits is None
                     else logits_output.next_token_logits.shape[-1]
                 )
                 maybe_detect_oob(
@@ -965,6 +1024,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
+                if (
+                    direct_top1 is not None or vp_top1_token_ids is not None
+                ) and hidden_states is not None:
+                    if hidden_states.shape[0] < active_draft_rows:
+                        raise RuntimeError(
+                            "draft hidden states returned fewer rows than the "
+                            f"active chain: {hidden_states.shape[0]} < "
+                            f"{active_draft_rows}"
+                        )
+                    hidden_states = hidden_states[:active_draft_rows]
 
         draft_probs = (
             torch.stack(draft_probs_list, dim=1) if needs_draft_probs else None
@@ -1127,8 +1196,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         with canary_ctx:
             logits_output = self.draft_runner.forward(forward_batch).logits_output
-        maybe_detect_nan(logits_output.next_token_logits, "draft_extend_for_prefill")
-        maybe_detect_inf(logits_output.next_token_logits, "draft_extend_for_prefill")
+        direct_top1 = logits_output.draft_topk_index
+        if direct_top1 is None:
+            maybe_detect_nan(
+                logits_output.next_token_logits, "draft_extend_for_prefill"
+            )
+            maybe_detect_inf(
+                logits_output.next_token_logits, "draft_extend_for_prefill"
+            )
 
         prefill_dsa_topk = None
         if seed_from_extend:
@@ -1136,15 +1211,24 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Assemble the next-iter draft spec_info from the extend output.
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
-        probs = renorm_draft_probs(
-            logits_output.next_token_logits,
-            batch.sampling_info,
-            use_rejection_sampling,
-        )
-        if use_rejection_sampling:
-            topk_p, topk_index = fast_sample(probs, num_samples=1)
+        if direct_top1 is not None:
+            if self.topk != 1 or use_rejection_sampling:
+                raise RuntimeError(
+                    "direct draft Top-1 requires topk=1 without rejection sampling"
+                )
+            probs = None
+            topk_index = direct_top1
+            topk_p = torch.ones_like(topk_index, dtype=torch.float32)
         else:
-            topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
+            probs = renorm_draft_probs(
+                logits_output.next_token_logits,
+                batch.sampling_info,
+                use_rejection_sampling,
+            )
+            if use_rejection_sampling:
+                topk_p, topk_index = fast_sample(probs, num_samples=1)
+            else:
+                topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
         return EagleDraftInput(
             topk_p=topk_p,
             topk_index=topk_index,
@@ -1208,8 +1292,11 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             next_token_ids = batch_result.next_token_ids.to(torch.int64)
 
         # Batch 2: Draft extend
+        target_hidden = batch_result.logits_output.hidden_states
+        if target_hidden is not None:
+            target_hidden = target_hidden.detach().contiguous().clone()
         draft_extend_input = EagleDraftExtendInput(
-            hidden_states=batch_result.logits_output.hidden_states,
+            hidden_states=target_hidden,
             # accept_lens includes the bonus token; correct drafts exclude it.
             num_correct_drafts=num_correct_drafts,
             num_accept_tokens=batch_result.accept_lens,
@@ -1274,14 +1361,16 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     forward_batch
                 ).logits_output
 
-        maybe_detect_nan(
-            draft_logits_output.next_token_logits,
-            f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
-        )
-        maybe_detect_inf(
-            draft_logits_output.next_token_logits,
-            f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
-        )
+        direct_top1 = draft_logits_output.draft_topk_index
+        if direct_top1 is None:
+            maybe_detect_nan(
+                draft_logits_output.next_token_logits,
+                f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
+            )
+            maybe_detect_inf(
+                draft_logits_output.next_token_logits,
+                f"draft_extend_for_decode (cuda_graph={can_run_decode_cuda_graph})",
+            )
 
         # Gather the per-request last-position indexer top-k as the next loop's
         # seed (select_index already picks the last accepted position per req).
@@ -1296,16 +1385,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
 
         # Reorganize the spec info for the next batch
         if not can_run_decode_cuda_graph:
-            draft_logits_output.next_token_logits = (
-                draft_logits_output.next_token_logits[select_index]
-            )
+            if direct_top1 is not None:
+                direct_top1 = direct_top1[select_index]
+            else:
+                draft_logits_output.next_token_logits = (
+                    draft_logits_output.next_token_logits[select_index]
+                )
             if draft_logits_output.hidden_states is not None:
                 draft_logits_output.hidden_states = draft_logits_output.hidden_states[
                     select_index
                 ]
-        # Selected-row top-k remains worker-owned for both graph and eager
-        # paths; the graph runner only moves the row selection before lm_head.
-        if get_spec().speculative_use_rejection_sampling:
+        # Graph output rows are already selected before the LM head;
+        # eager outputs are selected above. Top-k remains worker-owned.
+        if direct_top1 is not None:
+            if self.topk != 1 or get_spec().speculative_use_rejection_sampling:
+                raise RuntimeError(
+                    "direct draft Top-1 requires topk=1 without rejection sampling"
+                )
+            ret_topk_index = direct_top1
+            ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
+            ret_draft_probs = None
+        elif get_spec().speculative_use_rejection_sampling:
             ret_draft_probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                 draft_logits_output.next_token_logits,
                 batch.sampling_info.temperatures,
@@ -1639,9 +1739,12 @@ class EAGLEWorkerV2(BaseSpecWorker):
             speculative_moe_a2a_backend_context(),
             spec_stage_span("draft_extend"),
         ):
+            target_hidden = batch_output.logits_output.hidden_states
+            if target_hidden is not None:
+                target_hidden = target_hidden.detach().contiguous().clone()
             batch_output.next_draft_input = self.draft_worker._draft_extend_for_prefill(
                 batch,
-                batch_output.logits_output.hidden_states,
+                target_hidden,
                 batch_output.next_token_ids,
                 batch_output.logits_output.mm_input_embeds,
                 kv_loc_plan=kv_loc_plan,

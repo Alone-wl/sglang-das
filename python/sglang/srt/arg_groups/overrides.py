@@ -544,6 +544,7 @@ def _step3p_overrides(server_args: Any, hf_config: Any) -> dict:
 # Keep this hybrid-model set in sync with model_hook.handle_model_specific_adjustments.
 _MAMBA_RADIX_CACHE_ARCHS = frozenset(
     {
+        "Qwen4ExpForConditionalGeneration",
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
         "BailingMoeV2_5ForCausalLM",
@@ -576,6 +577,7 @@ _MAMBA_RADIX_CACHE_ARCHS = frozenset(
 # Registry specs opt in through `support_mamba_cache_extra_buffer` instead.
 _MAMBA_EXTRA_BUFFER_ARCHS = frozenset(
     {
+        "Qwen4ExpForConditionalGeneration",
         "KimiLinearForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
@@ -692,7 +694,17 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
 
     kv_cache_dtype = view.kv_cache_dtype
     has_attention_sinks = bool(getattr(hf_config, "learnable_sink", False))
-    if has_attention_sinks and kv_cache_dtype not in ("auto", "bf16", "bfloat16"):
+    _is_hcu = is_hcu()
+    hcu_hyv4_fp8_sink = (
+        _is_hcu
+        and hf_config.architectures[0] in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN")
+        and kv_cache_dtype == "fp8_e4m3"
+    )
+    if (
+        has_attention_sinks
+        and not hcu_hyv4_fp8_sink
+        and kv_cache_dtype not in ("auto", "bf16", "bfloat16")
+    ):
         raise ValueError(
             "Learnable DSA attention sinks require a bfloat16 KV cache; "
             f"got kv_cache_dtype={kv_cache_dtype}."
@@ -810,8 +822,19 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
     )
 
     if getattr(hf_config, "learnable_sink", False):
-        backend = "flashmla_sparse"
-        for field in ("dsa_prefill_backend", "dsa_decode_backend"):
+        _is_hcu = is_hcu()
+        hcu_hyv4_fp8_sink = (
+            _is_hcu
+            and model_arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN")
+            and kv_cache_dtype == "fp8_e4m3"
+        )
+        backends = {
+            "dsa_prefill_backend": "flashmla_sparse",
+            "dsa_decode_backend": "flashmla_kv"
+            if hcu_hyv4_fp8_sink
+            else "flashmla_sparse",
+        }
+        for field, backend in backends.items():
             value = getattr(view, field)
             if value is not None and value != backend:
                 option = "--" + field.replace("_", "-")
@@ -820,9 +843,9 @@ def _dsa_split_backend_resolution(view: Any) -> dict:
                     f"{option} {backend!r}; got {value!r}"
                 )
         if not user_set_prefill:
-            declared["dsa_prefill_backend"] = backend
+            declared["dsa_prefill_backend"] = backends["dsa_prefill_backend"]
         if not user_set_decode:
-            declared["dsa_decode_backend"] = backend
+            declared["dsa_decode_backend"] = backends["dsa_decode_backend"]
         logger.warning(
             "Set DSA backends for learnable attention sinks: "
             f"prefill={declared.get('dsa_prefill_backend', view.dsa_prefill_backend)}, "

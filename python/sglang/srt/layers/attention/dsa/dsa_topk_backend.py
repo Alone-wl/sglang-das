@@ -21,6 +21,16 @@ _FLASHINFER_TIE_BREAK_VALUES = {
 }
 
 
+def _supports_topk_v2_ragged_layout(logits: torch.Tensor) -> bool:
+    """Return whether the score rows satisfy the v2 vector-load ABI."""
+    return (
+        logits.dtype == torch.float32
+        and logits.ndim == 2
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+    )
+
+
 class TopkTransformMethod(IntEnum):
     # Transform topk indices to indices to the page table (page_size = 1)
     PAGED = auto()
@@ -54,9 +64,12 @@ class DSATopKBackend(Enum):
         return self == DSATopKBackend.FLASHINFER
 
     def should_use_topk_v2(self) -> bool:
-        # topk_v2 has no HCU kernel; it stays on the paged transform.
-        return (
-            self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get() and not _is_hcu
+        # The current HIP kernel supports HCU as well as the existing ROCm path.
+        return self.is_sgl_kernel() and envs.SGLANG_OPT_USE_TOPK_V2.get()
+
+    def should_use_topk_v2_paged(self) -> bool:
+        return self.should_use_topk_v2() and (
+            not _is_hcu or envs.SGLANG_HCU_TOPK_V2_PAGED.get()
         )
 
     def topk_func(
@@ -125,7 +138,7 @@ class DSATopKBackend(Enum):
         # matches we commit to v2 and never silently fall back to the legacy
         # page_size=1 path from here.
         if (
-            self.should_use_topk_v2()
+            self.should_use_topk_v2_paged()
             and topk_transform_method == TopkTransformMethod.PAGED
             and row_starts is None
             and batch_idx_list is None
@@ -142,7 +155,10 @@ class DSATopKBackend(Enum):
         # the cluster path never applies), just a per-row window and an additive
         # output transform. `batch_idx_list` is not None only on the prefill-CP
         # path, whose `topk_indices_offset` is built from cu_seqlens_q rather
-        # than the KV bases -- leave that one on the legacy kernel.
+        # than the KV bases -- leave that one on the legacy kernel. The v2
+        # kernel also vector-loads four fp32 values from each row, so an HCU MQA
+        # score buffer whose row width is not 16-byte aligned must use the
+        # legacy LightOp transform instead of failing the v2 runtime check.
         if (
             self.should_use_topk_v2()
             and topk_transform_method == TopkTransformMethod.RAGGED
@@ -150,6 +166,7 @@ class DSATopKBackend(Enum):
             and batch_idx_list is None
             and 0 < topk <= 2048
             and lengths.shape[0] == logits.shape[0] == topk_indices_offset.shape[0]
+            and _supports_topk_v2_ragged_layout(logits)
         ):
             return _topk_transform_v2_ragged(
                 logits, lengths, topk, topk_indices_offset, row_starts
@@ -319,6 +336,33 @@ def _topk_unfused(
     return topk_indices
 
 
+def _align_topk_v2_scores(logits: torch.Tensor) -> torch.Tensor:
+    """Give top-k v2 a fp32 score matrix whose row stride is a multiple of 4.
+
+    The JIT kernel vectorizes loads on a 16-byte aligned row. DeepGEMM already
+    emits that layout. The HCU MQA logits kernel returns a tight
+    ``[rows, seq_len]`` buffer, and a short warmup sequence is often not a
+    multiple of 4. Pad only in that case; an already-aligned view is unchanged.
+    """
+    if (
+        logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+    ):
+        return logits
+    if logits.dtype != torch.float32:
+        logits = logits.to(torch.float32)
+    rows, cols = logits.shape
+    padded_cols = (cols + 3) & ~3
+    aligned = torch.empty(
+        (rows, padded_cols), device=logits.device, dtype=torch.float32
+    )
+    aligned[:, :cols].copy_(logits)
+    if padded_cols != cols:
+        aligned[:, cols:].fill_(float("-inf"))
+    return aligned
+
+
 def _topk_transform_v2_paged(
     logits: torch.Tensor,
     lengths: torch.Tensor,
@@ -359,16 +403,7 @@ def _topk_transform_v2_paged(
 
     num_rows = logits.shape[0]
 
-    # The indexer (DeepGEMM) emits fp32 scores with unit row stride and a 16B-aligned
-    # row stride (a multiple of 4), which is exactly the kernel's ABI (it checks
-    # score_stride % 4 == 0 with strides {S, 1}). This holds even though the scores
-    # may be a padded view (stride(0) > width, so not `is_contiguous()`); assert the
-    # real requirement rather than force a contiguous copy of the wide score buffer.
-    assert (
-        logits.dtype == torch.float32
-        and logits.stride(1) == 1
-        and logits.stride(0) % 4 == 0
-    ), f"v2 top-k expects fp32 scores with unit row stride and 16B-aligned score_stride, got {logits.dtype=} {logits.stride()=}"
+    logits = _align_topk_v2_scores(logits)
     assert 0 < topk <= 2048, f"v2 top-k supports 0 < topk <= 2048, got {topk=}"
 
     page_table = attn_metadata.real_page_table
@@ -378,9 +413,9 @@ def _topk_transform_v2_paged(
     # mismatched plan means the caller skipped that preprocessing -- fail loudly
     # rather than silently recompute it per layer.
     plan = attn_metadata.topk_v2_plan
-    assert (
-        plan is not None and plan.shape[0] == num_rows + 1
-    ), "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
+    assert plan is not None and plan.shape[0] == num_rows + 1, (
+        "topk_v2_plan must be preprocessed per forward (see DSAMetadata.topk_v2_plan)"
+    )
 
     page_size = attn_metadata.page_size
     out = logits.new_empty((num_rows, topk), dtype=torch.int32)
@@ -451,11 +486,14 @@ def _topk_transform_v2_ragged(
     after the top-k (see ``DSAIndexer._get_topk_ragged``).
 
     Preconditions match the paged helper: fp32 scores with unit row stride and a
-    16B-aligned row stride (DeepGEMM's contiguous-KV output satisfies this by
-    construction), int32 non-negative lengths, and ``0 < topk <= 2048``.
+    16B-aligned row stride, int32 non-negative lengths, and ``0 < topk <= 2048``.
+    The caller checks the score layout because HCU MQA may use the exact active
+    KV width as the row stride; widths that are not multiples of four stay on
+    the legacy LightOp transform.
     """
     from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
 
+    logits = _align_topk_v2_scores(logits)
     out = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
     topk_transform_ragged_v2(
         logits,

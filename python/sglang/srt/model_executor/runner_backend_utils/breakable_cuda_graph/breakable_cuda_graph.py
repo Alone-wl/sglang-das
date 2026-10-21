@@ -23,6 +23,7 @@ buffers to keep break-point tensors at stable addresses.
 """
 
 import functools
+import dataclasses
 import threading
 import warnings
 from contextvars import ContextVar
@@ -181,7 +182,13 @@ def _weak_ref_if_tensor(x):
 
         return weak_ref_tensors(x)
     if isinstance(x, tuple):
-        return tuple(_weak_ref_if_tensor(e) for e in x)
+        values = tuple(_weak_ref_if_tensor(e) for e in x)
+        # NamedTuple dispatch/combine records carry semantic properties such
+        # as ``.format``.  Rebuilding them as a plain tuple makes an eager
+        # graph-break replay lose that protocol even though capture succeeds.
+        if hasattr(x, "_fields"):
+            return type(x)(*values)
+        return values
     if isinstance(x, list):
         return [_weak_ref_if_tensor(e) for e in x]
     return x
@@ -195,6 +202,13 @@ def _copy_output(dst: Any, src: Any) -> Any:
     succeeded, otherwise returns src.
     """
     if torch.is_tensor(dst) and torch.is_tensor(src):
+        if (
+            dst.data_ptr() == src.data_ptr()
+            and dst.shape == src.shape
+            and dst.stride() == src.stride()
+            and dst.dtype == src.dtype
+        ):
+            return dst
         dst.copy_(src)
         return dst
 
@@ -204,7 +218,37 @@ def _copy_output(dst: Any, src: Any) -> Any:
         and len(dst) == len(src)
     ):
         copied = [_copy_output(d, s) for d, s in zip(dst, src)]
-        return tuple(copied) if isinstance(dst, tuple) else copied
+        if isinstance(dst, tuple):
+            if hasattr(dst, "_fields"):
+                return type(dst)(*copied)
+            return tuple(copied)
+        return copied
+
+    if (
+        dataclasses.is_dataclass(dst)
+        and dataclasses.is_dataclass(src)
+        and type(dst) is type(src)
+        and not isinstance(dst, type)
+    ):
+        for field in dataclasses.fields(src):
+            src_val = getattr(src, field.name)
+            dst_val = getattr(dst, field.name, None)
+            if torch.is_tensor(dst_val) and torch.is_tensor(src_val):
+                if (
+                    dst_val.data_ptr() == src_val.data_ptr()
+                    and dst_val.shape == src_val.shape
+                    and dst_val.stride() == src_val.stride()
+                    and dst_val.dtype == src_val.dtype
+                ):
+                    continue
+                if dst_val.shape != src_val.shape or dst_val.dtype != src_val.dtype:
+                    raise ValueError(
+                        f"Eager graph output field {field.name} changed shape or dtype"
+                    )
+                dst_val.copy_(src_val)
+            else:
+                setattr(dst, field.name, src_val)
+        return dst
 
     if hasattr(dst, "__dict__") and hasattr(src, "__dict__"):
         for key, src_val in src.__dict__.items():
@@ -310,9 +354,32 @@ def eager_on_graph(
             # captured segment. Keep a strong reference so replay can safely
             # copy fresh eager output into that bridge buffer.
             captured_output = output
+            # EAGLE draft_forward publishes a per-step child attn backend
+            # around each MTP call. Replay of this break must see that same
+            # backend: the outer graph runner only restores the multi-step
+            # container, which has no QSA indexer metadata / MTP reuse hooks.
+            try:
+                from sglang.srt.model_executor.forward_context import (
+                    get_forward_context,
+                    has_forward_context,
+                )
+
+                captured_fwd_ctx = (
+                    get_forward_context() if has_forward_context() else None
+                )
+            except Exception:
+                captured_fwd_ctx = None
 
             def replay_fn():
-                new_out = captured_inner(*captured_args, **captured_kwargs)
+                if captured_fwd_ctx is None:
+                    new_out = captured_inner(*captured_args, **captured_kwargs)
+                    return _copy_output(captured_output, new_out)
+                from sglang.srt.model_executor.forward_context import (
+                    forward_context as _forward_context,
+                )
+
+                with _forward_context(captured_fwd_ctx):
+                    new_out = captured_inner(*captured_args, **captured_kwargs)
                 return _copy_output(captured_output, new_out)
 
             capture.cuda_graph._break_fns.append(replay_fn)
