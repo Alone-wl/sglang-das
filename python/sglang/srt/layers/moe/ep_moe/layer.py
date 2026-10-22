@@ -2475,14 +2475,15 @@ class DeepEPMoE(FusedMoE):
         )
 
         if self.use_int8_w8a8_deepgemm_asm:
-            from deepgemm import m_grouped_w8a8_gemm_nt_masked
-
-            m_grouped_w8a8_gemm_nt_masked(
+            from deepgemm import m_grouped_i8_gemm_nt_masked
+            m_grouped_i8_gemm_nt_masked(
                 (hidden_states, hidden_states_scale),
                 (self.w13_weight_deepgemm_masked, self.w13_weight_scale),
                 gateup_output,
                 masked_m,
                 expected_m,
+                shuffle_unique=0,
+                backend="cooperative",
             )
         elif self.use_gfx936_w8a8_int8_deepgemm:
             from deepgemm import m_grouped_w8a8_gemm_nt_masked_gfx936
@@ -2537,14 +2538,15 @@ class DeepEPMoE(FusedMoE):
         )
 
         if self.use_int8_w8a8_deepgemm_asm:
-            from deepgemm import m_grouped_w8a8_gemm_nt_masked
-
-            m_grouped_w8a8_gemm_nt_masked(
+            from deepgemm import m_grouped_i8_gemm_nt_masked
+            m_grouped_i8_gemm_nt_masked(
                 (q_a2_all, q_a2_scale),
                 (self.w2_weight_deepgemm_masked, self.w2_weight_scale),
                 down_output,
                 masked_m,
                 expected_m,
+                shuffle_unique=0,
+                backend="cooperative",
             )
         elif self.use_gfx936_w8a8_int8_deepgemm:
             from deepgemm import m_grouped_w8a8_gemm_nt_masked_gfx936
