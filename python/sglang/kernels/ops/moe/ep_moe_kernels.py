@@ -22,7 +22,7 @@ from sglang.srt.utils import is_hcu
 import triton
 
 from sglang.srt.environ import envs
-from sglang.srt.utils import ceil_div, is_cuda, is_hip, is_musa
+from sglang.srt.utils import ceil_div, is_cuda, is_hcu, is_hip, is_musa
 
 logger = logging.getLogger(__name__)
 
@@ -1770,6 +1770,8 @@ def ep_scatter_no_scale(
     output_tensor: torch.Tensor,
     m_indices: torch.Tensor,
     output_index: torch.Tensor,
+    *,
+    hcu_use_preinitialized_expert_offsets: bool = False,
 ):
     num_warps = 8
     num_experts = num_recv_tokens_per_expert.shape[0]
@@ -1777,16 +1779,22 @@ def ep_scatter_no_scale(
     grid = num_experts
     BLOCK_E = 256
 
-    assert m_indices.shape[0] % BLOCK_E == 0
-    _fwd_kernel_ep_scatter_1_use_groupgemm[(grid,)](
-        num_recv_tokens_per_expert,
-        expert_start_loc,
-        m_indices,
-        num_experts=num_experts,
-        num_warps=num_warps,
-        BLOCK_E=BLOCK_E,
-        BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
-    )
+    if hcu_use_preinitialized_expert_offsets:
+        if not is_hcu():
+            raise RuntimeError(
+                "Preinitialized expert offsets are only supported on HCU"
+            )
+    else:
+        assert m_indices.shape[0] % BLOCK_E == 0
+        _fwd_kernel_ep_scatter_1_use_groupgemm[(grid,)](
+            num_recv_tokens_per_expert,
+            expert_start_loc,
+            m_indices,
+            num_experts=num_experts,
+            num_warps=num_warps,
+            BLOCK_E=BLOCK_E,
+            BLOCK_EXPERT_NUM=triton.next_power_of_2(num_experts),
+        )
 
     grid = min(recv_topk.shape[0], 1024 * 8)
 
@@ -3499,6 +3507,41 @@ def compute_slots_kernel(
         slot = (cnt + 255) // 256  # equivalent to ceil(cnt/256)
         tl.store(slots_ptr + i, slot)
 
+@triton.jit
+def fused_build_m_indices_kernel(
+    topk_ids_ptr,
+    num_recv_tokens_ptr,
+    m_indices_ptr,
+    numel,
+    E: tl.constexpr,
+    BLOCK: tl.constexpr = 1024,
+    BLOCK_E: tl.constexpr = 256,
+):
+    pid = tl.program_id(0)
+
+    if pid < E:
+        count = 0
+        for offset in range(0, numel, BLOCK):
+            offs = offset + tl.arange(0, BLOCK)
+            mask = offs < numel
+            val = tl.load(
+                topk_ids_ptr + offs, mask=mask, other=-1, eviction_policy="evict_last"
+            )
+            count = count + tl.sum((val == pid).to(tl.int32) & mask)
+
+        rng = tl.arange(0, BLOCK_E)
+        vals = tl.load(num_recv_tokens_ptr + rng, mask=rng < E, other=0)
+        start_pos = tl.sum(tl.where(rng < pid, vals, 0))
+        my_padded = tl.load(num_recv_tokens_ptr + pid)
+        end_pos = start_pos + my_padded
+
+        for offset in range(start_pos, end_pos, BLOCK):
+            offs = offset + tl.arange(0, BLOCK)
+            mask = offs < end_pos
+            rel_pos = offs - start_pos
+            valid = rel_pos < count
+            result = tl.where(valid, pid, -1)
+            tl.store(m_indices_ptr + offs, result, mask=mask)
 
 @triton.jit
 def build_m_indices_kernel(
