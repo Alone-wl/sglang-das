@@ -52,7 +52,10 @@ class TestCompressedTensorsPrequantizedInput(unittest.TestCase):
             input_symmetric=True,
         )
         scheme.w8a8_strategy = 1
-        layer = SimpleNamespace(weight=torch.empty((4, 3), dtype=torch.int8))
+        layer = SimpleNamespace(
+            weight=torch.empty((4, 3), dtype=torch.int8),
+            weight_scale=torch.ones(3),
+        )
         x = torch.empty((2, 4), dtype=torch.bfloat16)
         x_q = torch.empty_like(x, dtype=torch.int8)
         x_scale = torch.ones((2, 1), dtype=torch.float32)
@@ -61,6 +64,10 @@ class TestCompressedTensorsPrequantizedInput(unittest.TestCase):
         for quant_arg_name in ("input_quant_args", "silu_quant_args"):
             with self.subTest(quant_arg_name=quant_arg_name):
                 with (
+                    patch.object(
+                        w8a8_module, "W8A8_TRITONJSON",
+                        SimpleNamespace(triton_json_dict={}),
+                    ),
                     patch.object(
                         w8a8_module,
                         "per_token_quant_int8",
