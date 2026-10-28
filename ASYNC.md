@@ -69,8 +69,8 @@
 - `python3 test/registered/unit/test_sglang_model_sync_cpu.py`：9/9 通过。实际执行生产 AST 中的函数/方法，使用真实 CPU torch tensors；覆盖 scheme capability、避免重复量化、通用 factory、HiCache 指标、CPU staging、uniform/ordered/Zipf、发送排空后关闭 socket、capture batch sizes 与 slot pitches。
 - Python 3.11 对全部 20 个变更 Python 文件做 AST parse/compile；`git diff 1b0a352df3 --check` 通过。
 - 尝试完整 package 导入的量化 unittest 时，本机默认 Python 3.9 在已有 `environ.py` 的 `str | None` 注解处失败。Python 3.11 解释器存在，但该解释器没有 torch/完整 serving 依赖。portable CPU tests 避开 package import，不能代替完整模块导入验证。
-- 未运行 HCU/Triton/TileLang kernel parity、CUDA-graph capture、PD/EPD 集成、AIME25/HumanEval 或目标性能测试。没有本次目标服务的精度/收益结论。
-- 所有代码和文档仅本地提交，未推送、未创建 PR、未合并原分支；本次没有部署或修改远端运行环境。
+- 初次交付未运行 GPU/服务测试；2026-10-28 已补充下文的 DCU 验证。迁移后完整服务测试被节点驱动故障阻塞，尚无完整 A/B 结论。
+- 所有代码和文档仅本地提交，未推送、未创建 PR、未合并原分支。后续 DCU 验证已在 scnet 创建独立实验部署。
 
 ## 运行行为变化
 
@@ -78,8 +78,8 @@
 | --- | --- |
 | `SGLANG_FAKE_BOOTSTRAP_USE_RADIX` | 默认关闭；stub benchmark 可设 1。常规 warmup/health 路径仍默认不插 radix。 |
 | `SGLANG_KDA_USE_TILELANG_VERIFY` | 默认关闭；HCU KDA ReplaySSM verify 可设 1，不支持的形状/布局或 host-side kernel 异常回退现有 Triton。设备端 sticky fault 不能由此恢复。 |
-| KDA fp16 checkpoint | 参数 hook 的已有告警保留，HCU checkpoint/pool 的 fp32-only guard 已移除；g/beta 仍 FP32，精度待目标 HCU 实测。 |
-| `SGLANG_KVALLOC_KERNEL` | 默认从 true 改为 false；显式设 1 仍可选择 native allocator。没有目标性能收益实测。 |
+| KDA fp16 checkpoint | 参数 hook 的已有告警保留，HCU checkpoint/pool 的 fp32-only guard 已移除；g/beta 仍 FP32。kernel parity 已测，fp16 全服务精度尚未测。 |
+| `SGLANG_KVALLOC_KERNEL` | 默认从 true 改为 false；显式设 1 仍可选择 native allocator。微基准已测，完整服务 A/B 待节点恢复。 |
 | generated-shared-prefix | 新生成的默认 uniform 请求按组 round-robin；保留 ordered/Zipf；旧缓存保留旧顺序。warmup 仍从正式统计剔除，数量必须小于总请求数。 |
 | 共享前缀预热约定 | uniform、G 个组可使用 2*G 条不同 suffix 的预热，请保证还剩正式请求；目标保留按组大小分波发请求。缓存复用还取决于服务端配置，应从服务日志核实。 |
 
@@ -92,10 +92,50 @@
 5. 添加新批次表，记录新的源上界、目标起点、每个源 SHA 的结论和验证。仅当所有候选有结论后推进“下次游标”；本次跳过条目随账本保留，不因推进游标而遗忘。
 6. 重跑 portable tests、静态 compile/diff 检查和适用完整 package tests。涉及 KDA、量化或分布式变化时，在兼容 HCU 环境运行 GPU/服务集成后再给出部署结论。
 
-## HCU 验证 Handoff（尚未执行）
+## HCU 验证项目与覆盖边界（执行进度见下文）
 
 - 登录 `ssh scnet`，用 `squeue` 选择用户计算节点，默认容器 `dev-wl`；实验脚本/日志统一放容器 `/home/work/agent/`。保持参考启动脚本中的功能。
 - 用匹配目标依赖的 Python >=3.10 执行 `test_compressed_tensors_prequantized_input.py`，再执行 `test/registered/attention/test_kda_tilelang_verify.py`，覆盖 S=2..8、padding、fp16、strided pool/ring、真实 HcuKDAKernel dispatch；对照关闭/开启 TileLang，检查回退日志和图捕获。
 - 对 fp16 ReplaySSM 运行长序列/实际服务精度：容器内激活 `~/evalscope` 对应环境，使用 `/home/work/eval.sh`，默认 AIME25 与 HumanEval 可并行；给出实际分数与 badcase 截断/复读/事实错误归因，证据不足时标明未知。
 - 检查 PD PREBUILT merge、fake-bootstrap radix opt-in 以及 prefill 节点失效时 socket/monitor 清理，尤其在发送进行中触发失效；portable tests 只验证局部锁生命周期。
-- 若后续要求性能评估，先按项目规则抓算子 profile：`run_single_bench_d.sh` 发压，任意 rank 的 `#running-req` 达最大并发后等 30 秒，再执行 `/home/work/profile.sh`。微基准 `benchmark/kernels/kvalloc/bench_kvalloc.py` 已适配目标导入路径，但尚未运行。
+- 性能评估按项目规则先抓算子 profile：`run_single_bench_d.sh` 发压，任意 rank 的 `#running-req` 达最大并发后等 30 秒，再执行 `/home/work/profile.sh`。本次已执行 before profile 与 allocator 微基准，after 待节点恢复。
+
+## DCU 验证进度与恢复 Handoff（2026-10-28 22:36 CST）
+
+**状态：迁移前全量精度及三轮性能已完成；迁移后启动受 f14r1n15 驱动锁阻塞，完整 A/B 尚未完成。不能把局部 kernel 收益表述为整服务收益。**
+
+### 固定实验与公共修复
+
+- 容器 `dev-wl:/home/work/agent/model-sync-ab-20261028/`；宿主机 `~/agent/model-sync-ab-20261028/`。脚本、快照、依赖、manifest、日志、profiles、results 全部保留。
+- before 为 `1b0a352df3975baa40569aa4ff5d7caea11e1a6c`；after 为 `65c61d81cb38d0704c608a92871ca3d24559cce9`。两侧同加 descriptor 异步 staging 修复，已提交 `60f425ec3bd38bc338dea1ce181c178c5b24cb2a`。after runtime 等价于该提交；不能称为完全未修改的原始基线对照。旧同步拷贝会等待在途集合通信；修复保留 fused clear/copy，GPU 数据位一致和异步行为均有回归证据。
+- P=f14r1n14（CP8/TP8/EP8、INT8）；D=f14r1n15–16（TP16/DP16/EP16、GLM-5.3-Flash-Int4-ZP-format、SlimQuant W4A8）；client=a12r4n13。各节点8张 BW gfx936 DCU，约64 GiB/卡。
+- 保留 DeepEP、MTP EAGLE（5 steps/6 draft tokens）、ReplaySSM、CUDA graph、HiCache（layer_first/kernel/write_through）和 CP。主比较 float32 checkpoint、TileLang verify 关闭。文字请求不覆盖 encoder 多模态路径。
+- 两侧同用 `deps-tx/`（Transformers 5.12.1、原厂 sgl_kernel 二进制和同签名 HCU/DCU Python aliases）。HiCache D2H/H2D 的 `_hcu` 名称映射同签名 `_dcu` kernel，D2H 位一致已测；未关闭 HiCache。模型配置/tokenizer/index 哈希与权重文件大小/时间见 manifest。
+- 性能客户端固定 before 代码。before 显式 allocator=1 等价于旧默认；after 不设置 `SGLANG_KVALLOC_KERNEL`，采用新默认 false/Triton，属于待比较的默认行为变化。
+
+### 已完成的数据
+
+| 项目 | 迁移前 | 迁移后 |
+| --- | --- | --- |
+| AIME25 | 27/30，90% | 尚未运行 |
+| HumanEval | 163/164，99.39% | 尚未运行 |
+| D-only 平均输出吞吐，3轮均值 | 4570.32 token/s | 尚未运行 |
+| D-only mean TPOT，3轮均值 | 14.43 ms | 尚未运行 |
+| 满载后等待30s的 GPU/CPU profile | 16 rank trace 已采集且可解析 | 尚未采集 |
+
+精度使用 evalscope 和 `/home/work/eval.sh` 实验副本，两数据集并行、batch64、seed42、temperature1、top_p0.95、max_tokens64000、stream=true、enable_thinking=false，HumanEval review_timeout20s。真实 PD/HiCache 16并发门禁通过后运行，不复用预测缓存。AIME25 index12/13/29 与 HumanEval/130 均到64000 tokens且最终答案为空，直接归因为截断/没有最终答案。HumanEval/130 同一代码行重复51次，存在反复推演；AIME25/12反复核对，13/29仍在推导/验证，不能一律归为机械复读，也未证明量化导致错误。原始 reviews/predictions 和各数据集 `analysis.json` 保留证据。
+
+性能为 D-only fake-prefill raw IDs，input81920/shared-prefix79872/output1024/concurrency128，每轮384正式请求，独立预热，共3轮。每轮成功384、生成393216 tokens；平均输出吞吐3798.70/3910.89/6001.37 token/s，mean TPOT13.95/14.33/15.00ms。吞吐波动明显，应同时报告各轮与范围。profile rank0 热点包含 DeepEP、W4A8 GEMM、HCU KDA recurrent、sparse attention；16 rank 汇总见 `results/before/profile-summary.json`。
+
+局部验证：portable CPU9/9、完整 package量化接口3/3、TileLang GPU8/8、descriptor GPU回归2/2通过；KV allocator22/22数据一致。fp16 checkpoint相对FP32累加后转half maxAbs=0.0001220703125，未测fp16全服务精度。TileLang CUDA graph微基准（S6/HV64/K=V128/FP32，N1/4/8）1.63/1.66/1.75倍，但主服务未启用。长extend100000 tokens native/Triton为28.24/0.103ms；短extend BS16/12 tokens为0.037/0.074ms，短调用存在开销权衡。
+
+首轮缺少HiCache alias的评测0个有效样本，已归档 `*-failed-hicache`，不纳入结果。before三轮API压测完整，但运行期间修正提取器导致末尾wrapper exit2；已逐日志验证成功数、tokens及duration/tps一致后保留测量。提取器改为行首精确匹配，避免把Peak当平均吞吐，summary/CSV已重建。
+
+### 当前阻塞与续跑
+
+1. 控制器已终止。f14r1n15旧进程在 `hycu` 驱动 `evict_process_queues_cpsch` mutex 等待中处于D状态，新Python初始化也被阻塞。SIGTERM/SIGKILL不能回收；`hy-smi --hcureset -d 0` 返回 NOT_SUPPORTED；privileged容器挂载debugfs后读取各DCU `gpu_recover`，内核仅记录“HCU reset begin”，等待未解除。未重启宿主机、未删除容器。证据：`logs/after-d0-driver-hang.txt`、`logs/d0-reset-gpu0.log`。
+2. 需要先恢复/重启 f14r1n15 宿主机；目前只有停止GPU进程/容器的明确授权，尚未取得宿主机重启授权。检查 `squeue` 分配、dev-wl、GPU小张量同步及无旧D态进程后继续。
+3. P14迁移后进程保留，D1已停，D0新旧进程处于驱动等待。先确认P健康；若不健康，使用 `VARIANT=after bash /home/work/agent/model-sync-ab-20261028/scripts/p.sh` 启动并写独立日志。
+4. `transport/controller_resume_after_recovery.py` 保存续跑控制器（未执行）：启动after D0/D1→等待P/D健康→满载profile→重启D隔离profile→16并发真实PD门禁→两个数据集精度→停P→三轮D性能。运行前检查已有状态/数据避免重复覆盖，在登录节点nohup运行并保存日志。若profile后驱动再次不能回收，需要设备恢复，不能关闭参考功能绕过。
+5. 完成后容器执行 `transport/analyze_profile.py after`、`transport/collect_accuracy.py`；登录节点执行 `transport/collect_performance.py`。核对两侧194个prompt_key一致，比较逐题通过/失败转换及真实输出。profile需核对batch和kernel形状后比较，不仅按总GPU时间推因果。
+6. 更新本文并补齐完整A/B报告；说明公共修复/依赖覆盖、默认allocator变化、temperature1单次评测随机性和吞吐波动。当前没有after结果，不能用历史分数或微基准代替。
