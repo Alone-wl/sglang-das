@@ -139,3 +139,17 @@
 4. `transport/controller_resume_after_recovery.py` 保存续跑控制器（未执行）：启动after D0/D1→等待P/D健康→满载profile→重启D隔离profile→16并发真实PD门禁→两个数据集精度→停P→三轮D性能。运行前检查已有状态/数据避免重复覆盖，在登录节点nohup运行并保存日志。若profile后驱动再次不能回收，需要设备恢复，不能关闭参考功能绕过。
 5. 完成后容器执行 `transport/analyze_profile.py after`、`transport/collect_accuracy.py`；登录节点执行 `transport/collect_performance.py`。核对两侧194个prompt_key一致，比较逐题通过/失败转换及真实输出。profile需核对batch和kernel形状后比较，不仅按总GPU时间推因果。
 6. 更新本文并补齐完整A/B报告；说明公共修复/依赖覆盖、默认allocator变化、temperature1单次评测随机性和吞吐波动。当前没有after结果，不能用历史分数或微基准代替。
+
+### 用户授权替代拓扑（2026-10-28 23:20 CST，正在执行）
+
+用户明确允许关闭 E 服务，将 a12r4n13 作为 f14r1n15 的替代节点；已保存 E 的原命令/环境并停止，未删除容器。P14、a12、D1的GPU小张量及同步检查均通过。新拓扑 P=f14r1n14、D0=a12r4n13、D1=f14r1n16，客户端仍在a12运行；相同硬件型号但网络拓扑改变，必须在该拓扑重跑before/after，不能与原基线混算收益。
+
+新目录：`dev-wl:/home/work/agent/model-sync-ab-a12d0-20261028/`，宿主机同名 `~/agent/` 子目录；固定代码与依赖以符号链接复用旧目录，scripts、results、profiles、logs、manifest独立。控制器 `transport/controller_topology2.py`，状态 `manifest/controller-status.json`，日志 `logs/controller.log`。保留主比较配置，仅将D0地址换为10.1.12.73；文字评测不需要运行encoder。原异常节点不再使用，也不重启。
+
+2026-10-29 00:23：新拓扑 before 已完成，16 rank profile解析无错、16并发真实PD/HiCache门禁通过、两个精度job和三轮性能wrapper均exit0。AIME25=25/30（83.33%），HumanEval=163/164（99.39%）。AIME25 index12/14/17到64000 tokens且无最终答案；index18望远镜乘积末项错误（215而非106），index29将极小值条件误解后给出不存在有限和（标准答案240）；HumanEval/116输出完整但将负数优先排序，未通过测试，52642 tokens未达上限，不是截断或超时。这些新拓扑单次样本与旧拓扑不同，不能用旧分数代替本轮基线。
+
+新拓扑 before 三轮吞吐5971.46/4452.98/5435.07 token/s（均值5286.50、样本标准差770.06），mean TPOT14.09/14.55/14.81ms（均值14.48）；每轮成功384、生成393216 tokens。mean TTFT均值1139.19ms，p99 TTFT三轮均值7734.78ms、p99 TPOT30.74ms、p99 ITL67.06ms。结果见新目录 `results/performance-summary.json` 和 `accuracy-summary.json`；after已开始加载，尚无结果。
+
+2026-10-29 00:29：切换after时，替代节点a12r4n13也复现驱动锁：before D0进程结束后，data_parallel/detokenizer/scheduler处于D状态，`evict_process_queues_cpsch` 等待；新Python处于 `gpu_gpukfd_evict_userptr`，未进入after服务初始化。故障不只发生于f14r1n15，且本次发生在before退出阶段，不能归因为after迁移实现。`hy-smi --hcureset -d 0` 同样返回 NOT_SUPPORTED。控制器已终止，after D0/D1已发送停止信号，P14保留；没有宿主机重启或删除容器。
+
+新目录 `logs/after-d0-driver-hang.txt`、`logs/d0-reset-gpu0.log` 保存证据，`manifest/controller-status.json` 为blocked-driver。E停止前的命令和环境在原目录 `manifest/stopped-a12r4n13-*.json`；目前a12驱动阻塞，E也无法恢复。需要恢复/重启a12宿主机或提供额外健康节点。恢复同一拓扑后，核对P健康与GPU同步，再执行新目录 `transport/controller_resume_after.py`（只续after，未执行）；节点再次改变则不能直接混用本次before。注意profile后的D退出/重启也需检查驱动状态，若再次锁住应优先诊断退出路径，不得删减参考功能掩盖故障。当前没有after分数、正式吞吐或profile，不可宣称无精度损失或服务性能收益。
