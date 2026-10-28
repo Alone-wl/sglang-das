@@ -62,7 +62,6 @@ class MambaAttnBackendBase(AttentionBackend):
         self.device = model_runner.device
         self.topk = get_spec().speculative_eagle_topk or 0
         self.is_draft_worker = model_runner.is_draft_worker
-        self.model_runner = model_runner
         self.req_to_token_pool: HybridReqToTokenPool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.enable_unified_memory = get_memory().enable_unified_memory
@@ -535,7 +534,6 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=torch.int32,
             device=self.device,
         )
-
         self._precompile_tilelang_verify(max_bs, draft_token_num)
 
     def _precompile_tilelang_verify(self, max_bs: int, draft_token_num: int) -> None:
@@ -582,14 +580,14 @@ class MambaAttnBackendBase(AttentionBackend):
             # still safe: the two pre-capture warmup runs absorb their JIT.
             bs_list = None
             try:
-                from sglang.srt.model_executor.cuda_graph_runner import (
+                from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
                     get_batch_sizes_to_capture,
                 )
 
                 bs_list = [
                     bs
                     for bs in get_batch_sizes_to_capture(
-                        self.model_runner, num_tokens_per_bs=draft_token_num
+                        self._model_runner, captured_req_width=draft_token_num
                     )[0]
                     if 1 <= bs <= max_bs
                 ]
