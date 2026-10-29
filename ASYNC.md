@@ -175,3 +175,28 @@
 同理，不把默认短超时的 `docker stop` 当成安全替代方案：它超时后同样可能强杀。先确认服务资源释放及设备健康，再按需停止容器；不删除容器。恢复检查中 `mem_get_info` 曾报告异常空闲字节数，实际device properties仍为64GiB，不能据单个空闲值推断硬件容量变化或通过/失败。
 
 2026-10-29 11时恢复检查：四节点容器均可用、32张DCU逐卡运算及同步通过、无上述驱动等待进程；属性仍为gfx936、约64GiB/卡。P服务主进程SIGTERM后，跟踪到全部原子进程退出，记录 `GRACEFUL_REAP_OK`，未用SIGKILL。这只验证该次P退出；分布式D与长期避免驱动故障的效果仍需实测。after续跑已启动，精度/性能结果待补齐。
+
+### 恢复后新增观察：不能只靠“改成优雅退出”
+
+11:34 after满载profile已生成16 rank trace，全部解析成功；对齐rank/kernel/grid/block和调用次数共80条记录。profile客户端被停止后，D0两个HTTP worker仍保留41/87个请求状态；`abort_all`返回200，但未排空。D0与D1的py-spy均停在 `FutureMap.resolve_seq_lens_cpu` 的 `.cpu()` GPU同步路径，cache flush超时。受保护的父进程SIGTERM退出等待180秒后失败，**没有执行整组SIGKILL，也没有立即启动新服务**。这表明“过早强杀”不是本次异常的唯一必要条件，不能把优雅退出描述为已证明修复驱动问题。
+
+本次在驱动尚能响应时尝试本节点debugfs设备恢复：约两分钟后内核记录reset succeeded，原GPU scheduler退出；a12和D1共16卡小张量运算/同步再次通过，再对剩余CPU HTTP/controller/detokenizer进程发送SIGINT完成清理。最后检查时没有需要强杀的CPU目标（`manifest/reset-cpu-final-cleanup.json`中cpu为空），D0端口释放。没有宿主机重启，也未删除容器。恢复记录见 `logs/device-recover-*.log`、`logs/profile-recovery-dmesg-*.txt`、`manifest/post-profile-reset-health-*.json`、`logs/profile-stop-d{0,1}-stack.txt`。设备恢复仅适用于已确认独占且驱动可响应的本次环境，不保证可替代宿主机恢复；原先进入D状态后恢复失败的情况仍需区别处理。
+
+新增避坑：
+
+- profile发压应为有限任务，采集后尽量让客户端自然完成，检查所有rank排空与实际请求完成；不要在满载时直接终止客户端，再把abort_all=200或固定等待视为排空完成。
+- `/get_load`可能是旧快照，health或取消接口200也不能证明GPU同步已完成；需要结合scheduler进度、实际完成请求、进程状态和设备同步判断。
+- profile后的报错/vmfault/GPU同步挂起是项目已知风险。保留完整trace后，在恢复并验证设备健康的干净服务上做正式精度/计时；不应在已挂起的同一实例继续测量，也不必为续跑反复抓同一份profile。
+- 不把“采集完整”“优雅退出超时”“设备可恢复”“节点必须重启”混为同一状态；每次记录具体证据，保护失败后先停止自动切换。
+
+本次已改用 `transport/controller_after_profile_reset.py`：复用after已保存profile，重启干净D后直接进行真实PD/HiCache并发门禁、精度、停止P及三轮性能。当前主要依赖版本与初始manifest一致；不更改模型、参考功能或比较参数。
+
+### 当前最终检查点：基本计算恢复，不等于 NCCL 恢复
+
+设备reset后，虽然a12和D1共16卡小张量/同步通过、原GPU scheduler已退出、CPU残留和D0端口已清理，但下一次完整服务仍停在 `PyNcclCommunicator.__init__` 的 `warmup_stream.synchronize()`（`pynccl.py:134`）。尚未加载到可服务状态，更未开始after精度/正式性能。证据为 `logs/post-reset-init-stack.txt`。因此先前“可以续跑”的判断过早：**设备计算可用、端口释放与跨卡/跨节点通信可用是三个不同条件。** 当前需要完整恢复a12r4n13、f14r1n16，不能把debugfs reset成功等同宿主机完整恢复。
+
+新准备的 `transport/nccl_preflight.py` 使用服务本身的PyNcclCommunicator，在Gloo建立组后校验1/4096/1048576元素的GPU all-reduce，再销毁communicator。`nccl_preflight_d0.sh` / `nccl_preflight_d1.sh` 继承原D脚本的通信/库环境，使用16 rank和独立29929端口。必须在宿主机恢复后先运行并确认16个rank通过；阻塞设备上未再叠加该测试。健康的f14r1n15上单节点8卡对照已通过（expected sum=36，8 rank均PASS，GPU通信阶段约1.14秒、job exit0），证明脚本/依赖在该对照可用，**不能代替两节点16卡验证**。
+
+控制器已停止，当前 `manifest/controller-status.json` 为 `blocked-nccl-after-device-reset`。最新续跑入口改为 `transport/controller_after_verified_recovery.py`：先完成上述通信预检，再启动该控制器；复用profile，不再次抓取。日志轮转改用唯一session时间戳，不覆盖先前profile-session；results/logs/manifest目录权限已检查，避免root分析器建目录后登录控制器无法保存smoke结果。
+
+after profile局部对照（16 rank同kernel/grid/block且调用次数一致，仅为profile样本，不能代替正式吞吐）：W4A8 GEMM平均单次115.23→113.02µs；DeepEP dispatch152.05→134.43µs但逐rank变化-35%至+69%；combine194.37→198.15µs；KDA recurrent156.431→156.423µs。KDA没有可见变化，主测试TileLang关闭；这些路径未必受到本次迁移直接优化，不能把小幅差异或通信波动写成确定性收益。before/after profile之间隔过设备恢复，更要保留这一限制。
