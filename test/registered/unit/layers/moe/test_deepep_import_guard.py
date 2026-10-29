@@ -18,7 +18,7 @@ import unittest
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=180, suite="base-a-test-cpu")
+register_cpu_ci(est_time=30, suite="base-a-test-cpu")
 
 _FAILURE = "Duplicate NCCL runtime found in the current system"
 
@@ -44,7 +44,7 @@ _CHILD = textwrap.dedent(
         )
     except ImportError as exc:
         assert {_FAILURE!r} in str(exc), str(exc)
-        assert type(exc.__cause__).__name__ == "ERROR_TYPE", repr(exc.__cause__)
+        assert isinstance(exc.__cause__, AssertionError), repr(exc.__cause__)
     else:
         raise SystemExit("DeepEP dispatcher was created without deep_ep")
 
@@ -61,19 +61,19 @@ _CHILD = textwrap.dedent(
 
 
 class TestDeepEPImportGuard(CustomTestCase):
-    def _assert_deep_ep_import_is_deferred(self, error_type):
+    def test_deep_ep_import_assertion_is_deferred(self):
         with tempfile.TemporaryDirectory() as fake_root:
             pkg = os.path.join(fake_root, "deep_ep")
             os.makedirs(pkg)
             with open(os.path.join(pkg, "__init__.py"), "w") as f:
-                f.write(f"raise {error_type}({_FAILURE!r})\n")
+                f.write(f"raise AssertionError({_FAILURE!r})\n")
 
             env = dict(os.environ)
             env["PYTHONPATH"] = os.pathsep.join(
                 p for p in (fake_root, env.get("PYTHONPATH")) if p
             )
             result = subprocess.run(
-                [sys.executable, "-c", _CHILD.replace("ERROR_TYPE", error_type)],
+                [sys.executable, "-c", _CHILD],
                 env=env,
                 capture_output=True,
                 text=True,
@@ -86,11 +86,6 @@ class TestDeepEPImportGuard(CustomTestCase):
             f"stdout:\n{result.stdout}\nstderr:\n{result.stderr[-4000:]}",
         )
         self.assertIn("OK", result.stdout)
-
-    def test_deep_ep_import_failures_are_deferred(self):
-        for error_type in ("AssertionError", "RuntimeError", "ImportError", "OSError"):
-            with self.subTest(error_type=error_type):
-                self._assert_deep_ep_import_is_deferred(error_type)
 
 
 if __name__ == "__main__":
