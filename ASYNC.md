@@ -54,6 +54,7 @@ after三轮吞吐6166.38/5801.30/5980.41 token/s，mean TPOT14.13/14.13/14.97ms�
 | 目标原分支 | `mx_int8/main_glm53_flash_feature_cleanup_tx` |
 | 目标起点 | `1b0a352df3975baa40569aa4ff5d7caea11e1a6c` |
 | 同步分支 | `sync/sglang-model-20260915-20261028` |
+| 发布远端 | `wl`：`https://github.com/Alone-wl/sglang-das.git`，同名同步分支 |
 | 本地源快照 ref | `refs/remotes/sync-source/sglang_glm_dev` |
 | 迁移策略 | 在目标当前功能分支之上线性追加；未改为 origin/main，未 merge 两仓库历史 |
 
@@ -109,7 +110,7 @@ after三轮吞吐6166.38/5801.30/5980.41 token/s，mean TPOT14.13/14.13/14.97ms�
 - Python 3.11 对全部 20 个变更 Python 文件做 AST parse/compile；`git diff 1b0a352df3 --check` 通过。
 - 初次本机完整package量化测试受Python3.9/依赖限制；后续在远端匹配环境中完整package接口测试3/3通过。portable CPU测试9/9通过；接口测试使用mock GEMM，不能代替量化GPU数值parity。
 - 初次交付未运行 GPU/服务测试；后续恢复并完成了DCU A/B精度、三轮性能和算子profile，结果见最前的“DCU最终验收”。历史节点阻塞过程保留在后文。
-- 所有代码和文档仅本地提交，未推送、未创建 PR、未合并原分支。后续 DCU 验证已在 scnet 创建独立实验部署。
+- 本批代码和文档已于2026-10-29推送到个人远端 `wl` 的 `sync/sglang-model-20260915-20261028` 分支；`origin`（HYGON-AI/sglang-das）拒绝当前账号写入（403），未修改其分支。未创建PR、未合并原分支。DCU验证使用scnet独立实验部署。
 
 ## 运行行为变化
 
