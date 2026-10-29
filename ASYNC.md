@@ -153,3 +153,25 @@
 2026-10-29 00:29：切换after时，替代节点a12r4n13也复现驱动锁：before D0进程结束后，data_parallel/detokenizer/scheduler处于D状态，`evict_process_queues_cpsch` 等待；新Python处于 `gpu_gpukfd_evict_userptr`，未进入after服务初始化。故障不只发生于f14r1n15，且本次发生在before退出阶段，不能归因为after迁移实现。`hy-smi --hcureset -d 0` 同样返回 NOT_SUPPORTED。控制器已终止，after D0/D1已发送停止信号，P14保留；没有宿主机重启或删除容器。
 
 新目录 `logs/after-d0-driver-hang.txt`、`logs/d0-reset-gpu0.log` 保存证据，`manifest/controller-status.json` 为blocked-driver。E停止前的命令和环境在原目录 `manifest/stopped-a12r4n13-*.json`；目前a12驱动阻塞，E也无法恢复。需要恢复/重启a12宿主机或提供额外健康节点。恢复同一拓扑后，核对P健康与GPU同步，再执行新目录 `transport/controller_resume_after.py`（只续after，未执行）；节点再次改变则不能直接混用本次before。注意profile后的D退出/重启也需检查驱动状态，若再次锁住应优先诊断退出路径，不得删减参考功能掩盖故障。当前没有after分数、正式吞吐或profile，不可宣称无精度损失或服务性能收益。
+
+## DCU 退出/切换避坑项（2026-10-29 恢复后复盘）
+
+### 已确认的共同操作与证据边界
+
+- f14r1n15、a12r4n13 两次均是 D0：先做 profile、真实 PD 精度评测、长输入高并发 D-only 压测，再停止 before 服务并切换 after。故障发生于 before 的退出/设备回收阶段，after 尚未完成初始化，不能直接归因于迁移代码。
+- 两次复用的 `transport/stop_servers.py` 都对整个 PGID 发 SIGTERM，固定等8秒，再对整组发 SIGKILL；没有等待每个 scheduler 释放资源并退出，也没有在启动下一版本前检查驱动等待进程或逐卡同步。第二次虽增加 abort_all 和20秒等待，但没有逐rank排空断言，且仍保留整组信号和8秒强杀，仍复现故障。因此“加固定等待”不足以证明退出安全。
+- 相同症状：旧 data_parallel/detokenizer/scheduler 处于D状态，`evict_process_queues_cpsch` / `gpu_gpukfd_evict_userptr` 等待，新Python初始化被阻塞；SIGKILL无法回收，hy-smi reset返回NOT_SUPPORTED。
+- 源码本来有主进程排空请求、停止watchdog、发送 `ShutdownReq`、scheduler在finally中 `release_host_resources()` 的退出路径。整组信号同时作用于主进程和子进程，可能绕过/打断该路径；但尚无驱动级最小复现，不能将这一操作相关性写成已证明的内核根因。
+- 假设优先级：①整组信号/过早强杀破坏资源释放顺序；②请求完成后仍有集合通信或pinned-memory异步工作未排空；③profile延迟影响。profile之后曾正常重启并完成后续测试，未证实“单独抓profile就必然锁死”；不能把profile本身笼统列为禁用项。
+
+### 后续必须采用的切换步骤
+
+1. 保留日志、进程PID/创建时间、启动命令及选定环境变量；停止新增客户端请求，等待正常请求完成。必要时发abort_all，但不能把HTTP返回或固定sleep当作全部rank清理完毕的证据。
+2. **禁止复用“killpg TERM→8秒→killpg KILL→立即重启”的脚本。** 只向本实验 `sglang.launch_server` 的服务主进程发SIGTERM，允许其既有ShutdownReq/资源释放路径完成。分布式D先由D0协调退出，不能同时直接杀非head节点的整组scheduler。
+3. 按PID和创建时间跟踪原主进程及其子进程，等待实际退出；超时或发现GPU/evict相关D状态即停止自动切换，记录并报告，不自动升级SIGKILL，也不继续堆叠新服务进程。
+4. 下一版本启动前，核对服务端口释放、无旧GPU相关D状态进程；在容器逐卡运行小张量运算和同步。启动后仍要完成真实PD/HiCache并发门禁，不能以进程存在或health=200代替链路验证。
+5. 恢复后使用新目录 `transport/stop_parent_gracefully.py`、`transport/health_guard.py` 和 `transport/controller_recovered_20261029.py`；旧stop脚本保留为故障证据，不作为续跑入口。新停止器不发SIGKILL，超时失败即中止。D1若未随D0正常退出，也中止，不直接杀组。
+
+同理，不把默认短超时的 `docker stop` 当成安全替代方案：它超时后同样可能强杀。先确认服务资源释放及设备健康，再按需停止容器；不删除容器。恢复检查中 `mem_get_info` 曾报告异常空闲字节数，实际device properties仍为64GiB，不能据单个空闲值推断硬件容量变化或通过/失败。
+
+2026-10-29 11时恢复检查：四节点容器均可用、32张DCU逐卡运算及同步通过、无上述驱动等待进程；属性仍为gfx936、约64GiB/卡。P服务主进程SIGTERM后，跟踪到全部原子进程退出，记录 `GRACEFUL_REAP_OK`，未用SIGKILL。这只验证该次P退出；分布式D与长期避免驱动故障的效果仍需实测。after续跑已启动，精度/性能结果待补齐。
