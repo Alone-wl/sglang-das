@@ -197,6 +197,8 @@
 
 新准备的 `transport/nccl_preflight.py` 使用服务本身的PyNcclCommunicator，在Gloo建立组后校验1/4096/1048576元素的GPU all-reduce，再销毁communicator。`nccl_preflight_d0.sh` / `nccl_preflight_d1.sh` 继承原D脚本的通信/库环境，使用16 rank和独立29929端口。必须在宿主机恢复后先运行并确认16个rank通过；阻塞设备上未再叠加该测试。健康的f14r1n15上单节点8卡对照已通过（expected sum=36，8 rank均PASS，GPU通信阶段约1.14秒、job exit0），证明脚本/依赖在该对照可用，**不能代替两节点16卡验证**。
 
+随后在健康的f14r1n14＋f14r1n15上完成两节点16-rank对照（独立29930端口）：16 rank均PASS、expected sum=136、两侧job均exit0，初始化及三种大小校验约11.05秒。日志 `logs/nccl-control16-d{0,1}.log`，脚本 `transport/nccl_control16_d{0,1}.sh`。因此预检脚本/相同依赖有真实16-rank可用对照，但不能把另一组合的通过当作a12＋f14r1n16已恢复；目标组合仍须独立通过。
+
 控制器已停止，当前 `manifest/controller-status.json` 为 `blocked-nccl-after-device-reset`。最新续跑入口改为 `transport/controller_after_verified_recovery.py`：先完成上述通信预检，再启动该控制器；复用profile，不再次抓取。日志轮转改用唯一session时间戳，不覆盖先前profile-session；results/logs/manifest目录权限已检查，避免root分析器建目录后登录控制器无法保存smoke结果。
 
 after profile局部对照（16 rank同kernel/grid/block且调用次数一致，仅为profile样本，不能代替正式吞吐）：W4A8 GEMM平均单次115.23→113.02µs；DeepEP dispatch152.05→134.43µs但逐rank变化-35%至+69%；combine194.37→198.15µs；KDA recurrent156.431→156.423µs。KDA没有可见变化，主测试TileLang关闭；这些路径未必受到本次迁移直接优化，不能把小幅差异或通信波动写成确定性收益。before/after profile之间隔过设备恢复，更要保留这一限制。
