@@ -2,6 +2,16 @@
 
 下次同步先读本文件的“续同步步骤”；逐提交结论是审核账本，源码和测试是实现依据。
 
+## 当前运行约定（2026-10-29，用户明确指定，优先于下文历史操作）
+
+**需要主动结束容器内进程时，统一使用 `docker restart dev-wl`。** 不再沿用逐进程/进程组SIGTERM、SIGINT、SIGKILL、父进程优雅退出器或debugfs设备reset的清理方式；不删除容器。有限评测/压测任务自然完成退出无需额外终止。下文这些旧方法及失败记录仅为事故复盘，不是当前操作规范。
+
+继续使用a12r4n13作为D0、f14r1n16作为D1，保持已有before比较拓扑；已有32份profile（两侧各16 rank）直接复用，不再次采集。节点恢复及必要的容器restart后，先做逐卡计算和目标两节点16-rank PyNccl预检，再启动完整服务；不能只凭单卡通过认定跨节点通信恢复。正式性能前通过容器restart结束P服务；客户端、router须按容器边界安排，避免restart误停仍需运行的D或评测任务。
+
+**当前唯一续跑入口：** `dev-wl:/home/work/agent/model-sync-ab-a12d0-20261028/transport/controller_container_restart.py`（在登录节点运行，日志 `logs/controller-container-restart.log`）。该控制器已移除逐进程信号清理及profile重抓代码；旧 `controller_*recovery*.py`、`controller_after_profile_reset.py`、`stop_servers.py`、`stop_parent_gracefully.py` 均不再作为执行入口。四节点 `docker restart dev-wl` 成功记录在 `manifest/restart-user-policy-20261029.json`，随后32卡基本计算检查均通过。
+
+本轮router移到独立的f14r1n15容器，URL为 `http://10.6.14.15:31028`，评测客户端仍在a12，其他模型/配置/请求参数不变。两数据集自然完成后restart f14r1n15结束router；正式D-only性能前restart f14r1n14结束P。这样不会为结束router而restart承载D0和评测客户端的a12容器。正式性能仍由同一个a12客户端直接请求D0，router位置变化不进入其数据路径；精度单次采样仍存在调度随机性。
+
 ## 本次快照（2026-10-28，Asia/Shanghai）
 
 | 项目 | 固定值 |
@@ -164,7 +174,7 @@
 - 源码本来有主进程排空请求、停止watchdog、发送 `ShutdownReq`、scheduler在finally中 `release_host_resources()` 的退出路径。整组信号同时作用于主进程和子进程，可能绕过/打断该路径；但尚无驱动级最小复现，不能将这一操作相关性写成已证明的内核根因。
 - 假设优先级：①整组信号/过早强杀破坏资源释放顺序；②请求完成后仍有集合通信或pinned-memory异步工作未排空；③profile延迟影响。profile之后曾正常重启并完成后续测试，未证实“单独抓profile就必然锁死”；不能把profile本身笼统列为禁用项。
 
-### 后续必须采用的切换步骤
+### 当时尝试的切换步骤（已由用户后续restart约定替代，不再执行）
 
 1. 保留日志、进程PID/创建时间、启动命令及选定环境变量；停止新增客户端请求，等待正常请求完成。必要时发abort_all，但不能把HTTP返回或固定sleep当作全部rank清理完毕的证据。
 2. **禁止复用“killpg TERM→8秒→killpg KILL→立即重启”的脚本。** 只向本实验 `sglang.launch_server` 的服务主进程发SIGTERM，允许其既有ShutdownReq/资源释放路径完成。分布式D先由D0协调退出，不能同时直接杀非head节点的整组scheduler。
@@ -172,7 +182,7 @@
 4. 下一版本启动前，核对服务端口释放、无旧GPU相关D状态进程；在容器逐卡运行小张量运算和同步。启动后仍要完成真实PD/HiCache并发门禁，不能以进程存在或health=200代替链路验证。
 5. 恢复后使用新目录 `transport/stop_parent_gracefully.py`、`transport/health_guard.py` 和 `transport/controller_recovered_20261029.py`；旧stop脚本保留为故障证据，不作为续跑入口。新停止器不发SIGKILL，超时失败即中止。D1若未随D0正常退出，也中止，不直接杀组。
 
-同理，不把默认短超时的 `docker stop` 当成安全替代方案：它超时后同样可能强杀。先确认服务资源释放及设备健康，再按需停止容器；不删除容器。恢复检查中 `mem_get_info` 曾报告异常空闲字节数，实际device properties仍为64GiB，不能据单个空闲值推断硬件容量变化或通过/失败。
+当时曾记录默认短超时docker stop的风险；**当前按用户最新指示统一使用docker restart，不再据该历史判断继续尝试逐进程清理。** 恢复检查中 `mem_get_info` 曾报告异常空闲字节数，实际device properties仍为64GiB，不能据单个空闲值推断硬件容量变化或通过/失败。
 
 2026-10-29 11时恢复检查：四节点容器均可用、32张DCU逐卡运算及同步通过、无上述驱动等待进程；属性仍为gfx936、约64GiB/卡。P服务主进程SIGTERM后，跟踪到全部原子进程退出，记录 `GRACEFUL_REAP_OK`，未用SIGKILL。这只验证该次P退出；分布式D与长期避免驱动故障的效果仍需实测。after续跑已启动，精度/性能结果待补齐。
 
