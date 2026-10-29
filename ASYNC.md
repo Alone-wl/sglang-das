@@ -12,6 +12,35 @@
 
 本轮router移到独立的f14r1n15容器，URL为 `http://10.6.14.15:31028`，评测客户端仍在a12，其他模型/配置/请求参数不变。两数据集自然完成后restart f14r1n15结束router；正式D-only性能前restart f14r1n14结束P。这样不会为结束router而restart承载D0和评测客户端的a12容器。正式性能仍由同一个a12客户端直接请求D0，router位置变化不进入其数据路径；精度单次采样仍存在调度随机性。
 
+本轮14:40左右目标a12＋f14r1n16的16-rank PyNccl预检全部通过，两侧job exit0（`logs/nccl-policy-d{0,1}.log`、`manifest/job-nccl-policy-d{0,1}.exit`），随后已开始加载after完整服务。旧的blocked检查点保留在下文作为历史；本轮状态以 `manifest/controller-status.json` 为准。
+
+15:19后after精度完成，两数据集job均exit0；全部194个prompt_key与before一致。AIME25从25/30（83.33%）到26/30（86.67%），HumanEval从163/164（99.39%）到164/164（100%）。AIME25 before失败的18/17/29本次通过，before通过的13/19本次截断，12/14两侧均截断；after四个失败均64000 tokens且最终答案为空。12在推演中已得到204但继续核验直至截断；其余仍在数论/几何推导，未完成输出不能据此判定有无额外数学错误，不统称机械复读。HumanEval/116本次通过。temperature1单次采样及调度变化不能证明迁移带来确定性精度提升。
+
+精度结束后，f14r1n15（router）及f14r1n14（P）均通过 `docker restart dev-wl` 正常结束容器内服务，exit0，分别约10.8秒/17.3秒；没有执行逐进程清理。随后after三轮D-only性能测量全部完成，最终数据如下。
+
+## DCU 最终验收（2026-10-29，新拓扑，两侧测试完成）
+
+| 指标 | before | after | 本轮变化 |
+| --- | --- | --- | --- |
+| AIME25 | 25/30，83.33% | 26/30，86.67% | +3.33个百分点 |
+| HumanEval | 163/164，99.39% | 164/164，100% | +0.61个百分点 |
+| D-only平均输出吞吐，三轮均值 | 5286.50 token/s | 5982.70 token/s | +13.17% |
+| mean TPOT，三轮均值 | 14.48ms | 14.41ms | -0.51%，基本持平 |
+| mean TTFT，三轮均值 | 1139.19ms | 1145.18ms | +0.53%，基本持平 |
+| p99 TTFT，各轮p99的均值 | 7734.78ms | 7953.29ms | +2.83% |
+| p99 TPOT，各轮p99的均值 | 30.74ms | 30.16ms | -1.90% |
+| p99 ITL，各轮p99的均值 | 67.06ms | 68.90ms | +2.75% |
+
+after三轮吞吐6166.38/5801.30/5980.41 token/s，mean TPOT14.13/14.13/14.97ms；before为5971.46/4452.98/5435.07和14.09/14.55/14.81ms。六轮均成功384/384、每轮生成393216 tokens，两个性能wrapper及四个精度job均exit0。吞吐样本标准差770.06→182.55 token/s，基线与after范围重叠；mean TPOT/TTFT没有明确改善。结论为“本轮观测吞吐较高、延迟基本持平”，不能将13.2%直接视为确定性代码收益。没有做allocator开关独立消融；两侧间有设备恢复、精度temperature1且单次采样，保留这些限制。
+
+全部194个题目键匹配，after AIME25四个失败均截断，其中13/19是新增截断；17/18/29由失败转通过，12/14仍截断；HumanEval/116由实现错误转通过。原始输出、评分、token数与归因保存在各数据集 `analysis.json` 及原始reviews/predictions。不能仅以总分略高断言精度确定性提升，也不能把新增截断漏报。
+
+两侧各16 rank profile可解析，共80条对齐的rank/kernel/grid/block记录；KDA recurrent基本不变，通信kernel存在波动，详见后文。主比较保持FP32 checkpoint、TileLang关闭；fp16/TileLang只有已完成的局部GPU验证，不算开启后的全服务精度证明。before/after同加descriptor公共修复、同依赖与模型，比较代码身份见下文固定实验记录；after使用迁移后的默认Triton allocator，before为旧默认native。
+
+测试结束后，两台D也通过 `docker restart dev-wl` 清理，均exit0（约12.2/12.1秒）。清理后的目标两节点16-rank PyNccl复检再次全部通过，两侧job exit0（`logs/nccl-cleanup-d{0,1}.log`、`manifest/nccl-cleanup-d{0,1}.exit`），GPU通信校验约1.35秒；未使用逐进程清理或设备reset。E按暂停前保存的原命令和环境恢复，`http://10.1.12.73:8080/health`返回200，记录 `manifest/encoder-restoration.json`。该检查只确认恢复就绪，不代表本次做过多模态端到端精度验证。P、D、router实验服务均已结束。
+
+验收产物均在 `/home/work/agent/model-sync-ab-a12d0-20261028/`：`results/comparison.json`、`accuracy-summary.json`、`performance-summary.json`、`profile-comparison.json`；正式压测原始日志为 `results/{before,after}/timed/round{1,2,3}_benchmark_c128.log`。旧f14r1n15-D0拓扑只作历史，不混入本表。当前恢复/测量控制器为 `transport/controller_container_restart.py`，所有旧信号清理入口已废弃。复跑须使用独立结果目录或先归档整组旧结果，禁止混合预测缓存/半轮输出后推进handoff结论。
+
 ## 本次快照（2026-10-28，Asia/Shanghai）
 
 | 项目 | 固定值 |
@@ -78,8 +107,8 @@
 
 - `python3 test/registered/unit/test_sglang_model_sync_cpu.py`：9/9 通过。实际执行生产 AST 中的函数/方法，使用真实 CPU torch tensors；覆盖 scheme capability、避免重复量化、通用 factory、HiCache 指标、CPU staging、uniform/ordered/Zipf、发送排空后关闭 socket、capture batch sizes 与 slot pitches。
 - Python 3.11 对全部 20 个变更 Python 文件做 AST parse/compile；`git diff 1b0a352df3 --check` 通过。
-- 尝试完整 package 导入的量化 unittest 时，本机默认 Python 3.9 在已有 `environ.py` 的 `str | None` 注解处失败。Python 3.11 解释器存在，但该解释器没有 torch/完整 serving 依赖。portable CPU tests 避开 package import，不能代替完整模块导入验证。
-- 初次交付未运行 GPU/服务测试；2026-10-28 已补充下文的 DCU 验证。迁移后完整服务测试被节点驱动故障阻塞，尚无完整 A/B 结论。
+- 初次本机完整package量化测试受Python3.9/依赖限制；后续在远端匹配环境中完整package接口测试3/3通过。portable CPU测试9/9通过；接口测试使用mock GEMM，不能代替量化GPU数值parity。
+- 初次交付未运行 GPU/服务测试；后续恢复并完成了DCU A/B精度、三轮性能和算子profile，结果见最前的“DCU最终验收”。历史节点阻塞过程保留在后文。
 - 所有代码和文档仅本地提交，未推送、未创建 PR、未合并原分支。后续 DCU 验证已在 scnet 创建独立实验部署。
 
 ## 运行行为变化
@@ -89,7 +118,7 @@
 | `SGLANG_FAKE_BOOTSTRAP_USE_RADIX` | 默认关闭；stub benchmark 可设 1。常规 warmup/health 路径仍默认不插 radix。 |
 | `SGLANG_KDA_USE_TILELANG_VERIFY` | 默认关闭；HCU KDA ReplaySSM verify 可设 1，不支持的形状/布局或 host-side kernel 异常回退现有 Triton。设备端 sticky fault 不能由此恢复。 |
 | KDA fp16 checkpoint | 参数 hook 的已有告警保留，HCU checkpoint/pool 的 fp32-only guard 已移除；g/beta 仍 FP32。kernel parity 已测，fp16 全服务精度尚未测。 |
-| `SGLANG_KVALLOC_KERNEL` | 默认从 true 改为 false；显式设 1 仍可选择 native allocator。微基准已测，完整服务 A/B 待节点恢复。 |
+| `SGLANG_KVALLOC_KERNEL` | 默认从 true 改为 false；显式设 1 仍可选择 native allocator。微基准及上述D-only整体A/B已测，未单独隔离allocator的整服务收益。 |
 | generated-shared-prefix | 新生成的默认 uniform 请求按组 round-robin；保留 ordered/Zipf；旧缓存保留旧顺序。warmup 仍从正式统计剔除，数量必须小于总请求数。 |
 | 共享前缀预热约定 | uniform、G 个组可使用 2*G 条不同 suffix 的预热，请保证还剩正式请求；目标保留按组大小分波发请求。缓存复用还取决于服务端配置，应从服务日志核实。 |
 
@@ -108,11 +137,11 @@
 - 用匹配目标依赖的 Python >=3.10 执行 `test_compressed_tensors_prequantized_input.py`，再执行 `test/registered/attention/test_kda_tilelang_verify.py`，覆盖 S=2..8、padding、fp16、strided pool/ring、真实 HcuKDAKernel dispatch；对照关闭/开启 TileLang，检查回退日志和图捕获。
 - 对 fp16 ReplaySSM 运行长序列/实际服务精度：容器内激活 `~/evalscope` 对应环境，使用 `/home/work/eval.sh`，默认 AIME25 与 HumanEval 可并行；给出实际分数与 badcase 截断/复读/事实错误归因，证据不足时标明未知。
 - 检查 PD PREBUILT merge、fake-bootstrap radix opt-in 以及 prefill 节点失效时 socket/monitor 清理，尤其在发送进行中触发失效；portable tests 只验证局部锁生命周期。
-- 性能评估按项目规则先抓算子 profile：`run_single_bench_d.sh` 发压，任意 rank 的 `#running-req` 达最大并发后等 30 秒，再执行 `/home/work/profile.sh`。本次已执行 before profile 与 allocator 微基准，after 待节点恢复。
+- 性能评估按项目规则先抓算子profile：`run_single_bench_d.sh`发压，任意rank的`#running-req`达最大并发后等30秒，再执行`/home/work/profile.sh`。本次before/after profile、三轮性能及allocator微基准均已完成；不要为了续跑反复抓取已保存的profile。
 
 ## DCU 验证进度与恢复 Handoff（2026-10-28 22:36 CST）
 
-**状态：迁移前全量精度及三轮性能已完成；迁移后启动受 f14r1n15 驱动锁阻塞，完整 A/B 尚未完成。不能把局部 kernel 收益表述为整服务收益。**
+**当时状态：迁移前全量精度及三轮性能已完成；迁移后启动受 f14r1n15 驱动锁阻塞。此节保留历史过程，当前已完成结果见最前验收表。不能把局部kernel收益表述为整服务收益。**
 
 ### 固定实验与公共修复
 
@@ -201,7 +230,7 @@
 
 本次已改用 `transport/controller_after_profile_reset.py`：复用after已保存profile，重启干净D后直接进行真实PD/HiCache并发门禁、精度、停止P及三轮性能。当前主要依赖版本与初始manifest一致；不更改模型、参考功能或比较参数。
 
-### 当前最终检查点：基本计算恢复，不等于 NCCL 恢复
+### 历史检查点：基本计算恢复，不等于 NCCL 恢复（后续已恢复并完成测试）
 
 设备reset后，虽然a12和D1共16卡小张量/同步通过、原GPU scheduler已退出、CPU残留和D0端口已清理，但下一次完整服务仍停在 `PyNcclCommunicator.__init__` 的 `warmup_stream.synchronize()`（`pynccl.py:134`）。尚未加载到可服务状态，更未开始after精度/正式性能。证据为 `logs/post-reset-init-stack.txt`。因此先前“可以续跑”的判断过早：**设备计算可用、端口释放与跨卡/跨节点通信可用是三个不同条件。** 当前需要完整恢复a12r4n13、f14r1n16，不能把debugfs reset成功等同宿主机完整恢复。
 
